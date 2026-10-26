@@ -1,9 +1,11 @@
-/* sgl speculative decoding（draft-verify；对应 sglang srt/speculative 的 greedy 版）
- * 每轮：draft 连出 K 候选 → target 逐步 forward 候选，用【上一位置分布】验证
- * （forward 返回的是吃掉 token 后的分布，比较对象要错前一位）。
+/* sgl speculative decoding v2（draft-verify；对应 sglang srt/speculative 的 greedy 版）
+ * 每轮：draft 连出 K 候选 → target 【一次 n-token 批量前向】拿到全部候选位
+ * logits（n-outer 分块 GEMM，权重驻留复用；verify 成本 ≈ 单步×1.2 而非×K），
+ * 再逐步用【上一位置分布】验证（forward 返回的是吃掉 token 后的分布，比较
+ * 对象要错前一位；批量前向与逐 token 前向数值逐位一致，test_spec 有断言）。
  * 命中接受；首个不匹配采纳 target argmax；全接受 bonus 一个。
  * 每个最终 token 均为 target argmax ⇒ 与 target-only greedy 全等。
- * 轮末把 target/draft KV 补齐到新序列长（reject/bonus token 非 draft 自产）。 */
+ * KV 补齐（含 prompt prefill）也走批量前向；轮末作废候选只回退计数不释放页。 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/spec.h"
 
@@ -21,13 +23,26 @@ static int argmax_v(const float *lg, int n) {
   return best;
 }
 
-/* KV 从 *kv_len 补到 want（写 seq[kv_len..want)）；dl 收尾为最后位置分布 */
+/* KV 从 *kv_len 补到 want：一次 n-token 批量前向覆盖整段（含 prompt prefill），
+ * dl = 末位分布。批量与逐 token 前向数值逐位一致，语义不变。
+ * n>1 时 logits 是 [n][V]，dl 只有一行——就地借 n 行临时缓冲，末行拷回 dl
+ * （曾因直接写 dl 越界毁堆：prefill n=6 写 6*V 到 V 大小的缓冲）。 */
 static int kv_catch_up(sgl_llama *m, const int *seq, int want, int *kv_len,
                        int *pages, float *dl) {
-  while (*kv_len < want) {
-    if (sgl_llama_forward(m, &seq[*kv_len], 1, *kv_len, pages, dl) != 0) return -1;
-    (*kv_len)++;
+  int n = want - *kv_len;
+  if (n <= 0) return 0;
+  float *tmp = (n == 1) ? dl
+      : (float *)sgl_xmalloc(sizeof(float) * (size_t)n * (size_t)m->vocab);
+  if (sgl_llama_forward_n(m, seq + *kv_len, n, *kv_len, pages, tmp) != 0) {
+    if (tmp != dl) sgl_xfree(tmp);
+    return -1;
   }
+  if (tmp != dl) {
+    memcpy(dl, tmp + (size_t)(n - 1) * m->vocab,
+           sizeof(float) * (size_t)m->vocab);
+    sgl_xfree(tmp);
+  }
+  *kv_len = want;
   return 0;
 }
 
@@ -51,7 +66,7 @@ int sgl_spec_generate(sgl_llama *target, sgl_llama *draft,
   int V = target->vocab;
   float *dl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
   float *tl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
-  float *prev = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+  float *vl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V * (size_t)K); /* 批量 verify：[K][V] */
   int produced = 0, n_accepts = 0, n_drafted = 0;
 
   if (kv_catch_up(target, seq, n_prompt, &t_kv, tp, tl) != 0) goto fail;
@@ -68,16 +83,17 @@ int sgl_spec_generate(sgl_llama *target, sgl_llama *draft,
     }
     n_drafted += nk;
 
-    /* 2) target 验证：prev = 当前末位分布（对下一 token 的预测）*/
-    memcpy(prev, tl, sizeof(float) * (size_t)V);
+    /* 2) target 验证（v2）：一次 n-token 批量前向拿全部候选位 logits，
+     *    再逐步用上一位置分布比对（i=0 用 tl，i>0 用批量结果第 i-1 行）。
+     *    K 个候选一次过权重 ⇒ verify 成本 ≈ 单步×1.2 而非 ×K。 */
     int accepted = 0, reject_tok = -1;
+    if (sgl_llama_forward_n(target, cand, nk, t_kv, tp, vl) != 0) goto fail;
+    t_kv += nk; /* 批量一次写入全部候选位 KV；作废时轮末回退计数 */
     for (int i = 0; i < nk; i++) {
-      if (sgl_llama_forward(target, &cand[i], 1, t_kv, tp, tl) != 0) goto fail;
-      t_kv++;
-      int g = argmax_v(prev, V); /* 上一位置对 cand[i] 位置的预测 */
+      const float *p = (i == 0) ? tl : vl + (size_t)(i - 1) * V;
+      int g = argmax_v(p, V); /* 上一位置对 cand[i] 位置的预测 */
       if (g == cand[i]) { accepted++; n_accepts++; }
       else { reject_tok = g; break; }
-      memcpy(prev, tl, sizeof(float) * (size_t)V);
     }
 
     /* 3) 写入确认 token（拒绝时采纳 g；全接受 bonus=argmax(tl)）*/
@@ -87,7 +103,7 @@ int sgl_spec_generate(sgl_llama *target, sgl_llama *draft,
       seq[len + accepted] = reject_tok;
       n_new++;
     } else if (produced + nk < max_new) {
-      seq[len + nk] = argmax_v(tl, V);
+      seq[len + nk] = argmax_v(vl + (size_t)(nk - 1) * V, V); /* 末候选位分布 */
       n_new++;
     }
     len += n_new;
@@ -128,12 +144,12 @@ int sgl_spec_generate(sgl_llama *target, sgl_llama *draft,
   memcpy(*out_ids, seq + n_prompt, sizeof(int) * (size_t)(len - n_prompt));
   sgl_llama_pages_unref(target, tp, cap);
   sgl_llama_pages_unref(draft, dp, cap);
-  sgl_xfree(seq); sgl_xfree(tp); sgl_xfree(dp); sgl_xfree(dl); sgl_xfree(tl); sgl_xfree(prev);
+  sgl_xfree(seq); sgl_xfree(tp); sgl_xfree(dp); sgl_xfree(dl); sgl_xfree(tl); sgl_xfree(vl);
   return len - n_prompt;
 
 fail:
   if (tp) sgl_llama_pages_unref(target, tp, cap);
   if (dp) sgl_llama_pages_unref(draft, dp, cap);
-  sgl_xfree(seq); sgl_xfree(tp); sgl_xfree(dp); sgl_xfree(dl); sgl_xfree(tl); sgl_xfree(prev);
+  sgl_xfree(seq); sgl_xfree(tp); sgl_xfree(dp); sgl_xfree(dl); sgl_xfree(tl); sgl_xfree(vl);
   return -1;
 }

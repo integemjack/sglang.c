@@ -1,4 +1,4 @@
-﻿/* sgl/llama.h — Llama 系模型（Llama/TinyLlama/Qwen 同构：RoPE/RMSNorm/SwiGLU/GQA）
+/* sgl/llama.h — Llama 系模型（Llama/TinyLlama/Qwen 同构：RoPE/RMSNorm/SwiGLU/GQA）
  * 对应 sglang srt/models/llama.py 的 CPU 单流路径（prefill + 增量 decode）。
  * KV 池：分页 + 引用计数（与 gpt2 相同语义，页大小 = kv_dim）。 */
 #ifndef SGL_LLAMA_H
@@ -62,6 +62,13 @@ int sgl_llama_nfree(const sgl_llama *m);
 /* prefill / 增量单 token：tokens[n] 写位置 [pos0,pos0+n)；页表 slot_idx 长度 ≥ pos0+n */
 int sgl_llama_forward(sgl_llama *m, const int *tokens, int n, int pos0,
                       const int *slot_idx, float *logits_out);
+
+/* n-token 批量前向（Spec-v2 verify / n-outer 分块 GEMM 复用）：与 sgl_llama_forward
+ * 完全同语义（同权重复用路径、KV 一次写 [pos0,pos0+n)），但 logits_out 返回
+ * 【全部 n 个位置】的分布 [n][V]（传 NULL 则不算 logits）。数值与逐 token 前向
+ * 逐位一致（sgl_matmul_nt 分块不改每元素累加方式），test_spec 有断言。 */
+int sgl_llama_forward_n(sgl_llama *m, const int *tokens, int n, int pos0,
+                        const int *slot_idx, float *logits_all);
 
 /* 批量 decode（调度器用）：B 序列各 1 token；logits_out 需 B*vocab */
 int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx,

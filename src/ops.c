@@ -133,16 +133,23 @@ void sgl_gelu_inplace(float *row, int n) {
 void sgl_matmul_nt(const float *A, const float *W, const float *bias, float *C,
                    int M, int N, int K) {
   /* W[N,K] 行主序（PyTorch Linear）：C[m,n] = Σ_k A[m,k] * W[n,k] + bias[n]
- * K 维 SSE2 SIMD 内积 */
+   * K 维 SSE2 SIMD 内积。
+   * n-outer 分块（Spec-v2 / 批量前向复用）：按 m 块（TM 行）切，块内 n 外层——
+   * 每个 m 块 W 只从内存过一遍、被块内全部 TM 行激活复用（原来逐行各过一遍 W，
+   * M 行 = M×|W| 流量）。每个 C[m][n] 仍是独立的一次 dot_k_f32(ar,wr,K)，
+   * 浮点结果与逐行版本逐位一致（只换循环次序，不改累加方式）。 */
+#define SGL_MM_NT_TM 8
+  for (int m0 = 0; m0 < M; m0 += SGL_MM_NT_TM) {
+    const int me = m0 + SGL_MM_NT_TM < M ? m0 + SGL_MM_NT_TM : M;
 #pragma omp parallel for
-  for (int m = 0; m < M; m++) {
-    const float *ar = A + (size_t)m * K;
-    float *cr = C + (size_t)m * N;
     for (int n = 0; n < N; n++) {
       const float *wr = W + (size_t)n * K;
-      cr[n] = (float)dot_k_f32(ar, wr, K) + (bias ? bias[n] : 0.0f);
+      const float b = bias ? bias[n] : 0.0f;
+      for (int m = m0; m < me; m++)
+        C[(size_t)m * N + n] = (float)dot_k_f32(A + (size_t)m * K, wr, K) + b;
     }
   }
+#undef SGL_MM_NT_TM
 }
 
 void sgl_embedding_get(const float *table, const int *ids, int n, int d,

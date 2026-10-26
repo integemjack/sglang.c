@@ -417,8 +417,11 @@ static void proj_nt(sgl_llama *m, const float *A, const sgl_tensor *W,
   }
 }
 
-int sgl_llama_forward(sgl_llama *m, const int *tokens, int n, int pos0,
-                      const int *slot_idx, float *logits_out) {
+/* 共享实现：logits_rows==0 时只在 logits_out 返回末位分布（旧语义）；
+ * logits_rows==n 时在 logits_all 返回全部 n 位分布（sgl_llama_forward_n）。 */
+static int llama_forward_impl(sgl_llama *m, const int *tokens, int n, int pos0,
+                              const int *slot_idx, float *logits_out,
+                              int logits_rows) {
   int E = m->n_embd, H = m->n_head, HK = m->n_kv_head, D = m->head_dim;
   int total = pos0 + n;
   if (n <= 0 || total > m->n_ctx) {
@@ -557,8 +560,25 @@ int sgl_llama_forward(sgl_llama *m, const int *tokens, int n, int pos0,
   }
 
   sgl_rmsnorm(m->x, m->final_norm.data, m->h, n, E, m->rms_eps);
-  if (logits_out) llama_logits(m, m->h + (size_t)(n - 1) * E, logits_out);
+  if (logits_out) {
+    if (logits_rows == n) {
+      for (int t = 0; t < n; t++)
+        llama_logits(m, m->h + (size_t)t * E, logits_out + (size_t)t * m->vocab);
+    } else {
+      llama_logits(m, m->h + (size_t)(n - 1) * E, logits_out);
+    }
+  }
   return 0;
+}
+
+int sgl_llama_forward(sgl_llama *m, const int *tokens, int n, int pos0,
+                      const int *slot_idx, float *logits_out) {
+  return llama_forward_impl(m, tokens, n, pos0, slot_idx, logits_out, 0);
+}
+
+int sgl_llama_forward_n(sgl_llama *m, const int *tokens, int n, int pos0,
+                        const int *slot_idx, float *logits_all) {
+  return llama_forward_impl(m, tokens, n, pos0, slot_idx, logits_all, n);
 }
 
 /* batch decode: B sequences x 1 token, shared weights, one forward */
@@ -593,10 +613,12 @@ int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx
         for (int hk = 0; hk < HK; hk++)
           sgl_rmsnorm(m->k + (size_t)b * m->kv_dim + hk * D, L->k_norm.data,
                       m->k + (size_t)b * m->kv_dim + hk * D, 1, D, 1e-6f);
-    /* rope at each sequence's own position */
+    /* rope at each sequence's own position (heads = H/HK: the op rotates
+     * n head rows at one pos — passing 1 left heads 1..H-1 un-rotated,
+     * which diverged decode_batch from single-stream on the 2nd token) */
     for (int b = 0; b < B; b++) {
-      sgl_rope_inplace(m->q + (size_t)b * E, 1, D, seq_lens[b], m->rope_theta);
-      sgl_rope_inplace(m->k + (size_t)b * m->kv_dim, 1, D, seq_lens[b], m->rope_theta);
+      sgl_rope_inplace(m->q + (size_t)b * E, H, D, seq_lens[b], m->rope_theta);
+      sgl_rope_inplace(m->k + (size_t)b * m->kv_dim, HK, D, seq_lens[b], m->rope_theta);
     }
 
     if (m->kv8) {
