@@ -111,6 +111,23 @@ foreach(t ${SGL_TESTS})
   set_tests_properties(${name} PROPERTIES ENVIRONMENT "SGL_TEST_MODEL=${SGL_MODELS_DIR}/gpt2;SGL_TEST_LLAMA=${SGL_MODELS_DIR}/tiny-llama;SGL_TEST_LLAMA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_tinyllama.json;SGL_TEST_TINYLLAMA=${SGL_MODELS_DIR}/tinyllama;SGL_TEST_QWEN=${SGL_MODELS_DIR}/qwen05;SGL_TEST_LORA=${SGL_MODELS_DIR}/test-lora;SGL_TEST_LORA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora.json;SGL_TEST_LORA_S1=${SGL_MODELS_DIR}/test-lora-s1;SGL_TEST_LORA_S2=${SGL_MODELS_DIR}/test-lora-s2;SGL_TEST_LORA_REF_S1=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s1.json;SGL_TEST_LORA_REF_S2=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s2.json")
 endforeach()
 
+# ---- t9 模型族对照（models/ 下存在对应（生成或下载的）目录时才注册，防 fresh-clone 红）----
+foreach(fam mistral gemma qwen3)
+  if(EXISTS ${SGL_MODELS_DIR}/${fam}-rand/model.safetensors OR EXISTS ${SGL_MODELS_DIR}/qwen3-06/model.safetensors)
+    if(fam STREQUAL "qwen3")
+      set(_d ${SGL_MODELS_DIR}/qwen3-06)
+      set(_r ${CMAKE_CURRENT_SOURCE_DIR}/tests/_ref_qwen3.json)
+    else()
+      set(_d ${SGL_MODELS_DIR}/${fam}-rand)
+      set(_r ${CMAKE_CURRENT_SOURCE_DIR}/tests/_ref_${fam}.json)
+    endif()
+    if(EXISTS ${_d}/model.safetensors AND EXISTS ${_r})
+      add_test(NAME test_family_${fam} COMMAND test_llama ${_d} ${_r})
+      set_tests_properties(test_family_${fam} PROPERTIES DEPENDS test_llama)
+    endif()
+  endif()
+endforeach()
+
 # ---- CUDA 后端（SGL_CUDA=ON，需 MSVC + CUDA 工具链；与 MinGW 构建共存于独立目录）----
 option(SGL_CUDA "Build CUDA backend (needs VS + nvcc)" OFF)
 if(SGL_CUDA)

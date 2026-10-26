@@ -1,4 +1,4 @@
-﻿/* sgl/llama.h — Llama 系模型（Llama/TinyLlama/Qwen 同构：RoPE/RMSNorm/SwiGLU/GQA）
+/* sgl/llama.h — Llama 系模型（Llama/TinyLlama/Qwen 同构：RoPE/RMSNorm/SwiGLU/GQA）
  * 对应 sglang srt/models/llama.py 的 CPU 单流路径（prefill + 增量 decode）。
  * KV 池：分页 + 引用计数（与 gpt2 相同语义，页大小 = kv_dim）。 */
 #ifndef SGL_LLAMA_H
@@ -25,7 +25,9 @@ typedef struct {
 
 typedef struct {
   int n_layer, n_head, n_kv_head, n_embd, n_inter, n_ctx, vocab;
-  int head_dim, kv_dim;
+  int head_dim, kv_dim, q_dim; /* q_dim = n_head*head_dim (q rows & attn rows; == n_embd unless explicit head_dim, e.g. qwen3) */
+  int sliding_window;        /* t9 mistral: >0 = banded causal mask (attend max p in [pos-win+1, pos]) */
+  float gemma_scale;         /* t9 gemma: >0 = multiply embeddings by sqrt(E) (hidden normalizer) */
   float rms_eps;
   double rope_theta;
   int tie_embeddings;

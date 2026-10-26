@@ -172,6 +172,13 @@ sgl_llama *sgl_llama_load(const char *dir) {
     if (hd > 0) m->head_dim = hd;
   }
   m->kv_dim = m->head_dim * m->n_kv_head;
+  m->q_dim = m->head_dim * m->n_head;
+  m->sliding_window = sgl_json_get_int(cfg, "sliding_window", 0); /* t9 mistral: 0 = off */
+  /* t9 gemma: hidden states scaled by sqrt(E) right after embedding */
+  {
+    const char *mt = sgl_json_get_str(cfg, "model_type", "");
+    m->gemma_scale = !strcmp(mt, "gemma") ? sqrtf((float)m->n_embd) : 0.0f;
+  }
   sgl_json_free(cfg);
   if (m->n_layer <= 0 || m->n_head <= 0 || m->n_embd <= 0 || m->vocab <= 0 ||
       m->n_kv_head <= 0 || m->n_embd % m->n_head) {
@@ -189,6 +196,7 @@ sgl_llama *sgl_llama_load(const char *dir) {
   if (!m->st) { sgl_llama_free(m); return NULL; }
 
   int64_t E = m->n_embd, K = m->kv_dim, I = m->n_inter, V = m->vocab;
+  int64_t QD = (int64_t)m->n_head * m->head_dim; /* q/o width: E unless explicit head_dim (qwen3: 2048) */
   m->wte = sgl_st_get(m->st, "model.embed_tokens.weight", 2, (int64_t[]){V, E});
   m->final_norm = sgl_st_get(m->st, "model.norm.weight", 1, (int64_t[]){E});
   {
@@ -210,17 +218,17 @@ sgl_llama *sgl_llama_load(const char *dir) {
     snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", l);
     L->inp_norm = sgl_st_get(m->st, name, 1, (int64_t[]){E});
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", l);
-    L->q_w = sgl_st_get(m->st, name, 2, (int64_t[]){E, E});
+    L->q_w = sgl_st_get(m->st, name, 2, (int64_t[]){QD, E});
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", l);
     L->k_w = sgl_st_get(m->st, name, 2, (int64_t[]){K, E});
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", l);
     L->v_w = sgl_st_get(m->st, name, 2, (int64_t[]){K, E});
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", l);
-    L->o_w = sgl_st_get(m->st, name, 2, (int64_t[]){E, E});
+    L->o_w = sgl_st_get(m->st, name, 2, (int64_t[]){E, QD});
     /* qwen2: separate q/k/v biases (HF) or fused qkv bias (vLLM layout) */
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.bias", l);
     {
-      sgl_tensor b = sgl_st_get(m->st, name, 1, (int64_t[]){E});
+      sgl_tensor b = sgl_st_get(m->st, name, 1, (int64_t[]){QD});
       if (b.data) { L->q_b = b; m->has_qkv_bias = 1; }
     }
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.bias", l);
@@ -298,10 +306,10 @@ sgl_llama *sgl_llama_load(const char *dir) {
 #endif
   m->x = (float *)sgl_xmalloc(ctx * m->n_embd * sizeof(float));
   m->h = (float *)sgl_xmalloc(ctx * m->n_embd * sizeof(float));
-  m->q = (float *)sgl_xmalloc(ctx * m->n_embd * sizeof(float));
+  m->q = (float *)sgl_xmalloc(ctx * (size_t)m->q_dim * sizeof(float));
   m->k = (float *)sgl_xmalloc(ctx * (size_t)m->kv_dim * sizeof(float));
   m->v = (float *)sgl_xmalloc(ctx * (size_t)m->kv_dim * sizeof(float));
-  m->attn = (float *)sgl_xmalloc(ctx * m->n_embd * sizeof(float));
+  m->attn = (float *)sgl_xmalloc(ctx * (size_t)m->q_dim * sizeof(float));
   m->gate = (float *)sgl_xmalloc(ctx * (size_t)m->n_inter * sizeof(float));
   m->up = (float *)sgl_xmalloc(ctx * (size_t)m->n_inter * sizeof(float));
   m->scores = (float *)sgl_xmalloc((size_t)m->n_score_rows * ctx * sizeof(float));
@@ -436,19 +444,21 @@ static int llama_forward_impl(sgl_llama *m, const int *tokens, int n, int pos0,
   }
 
   sgl_embedding_get(m->wte.data, tokens, n, E, m->x);
+  if (m->gemma_scale > 0) /* t9 gemma: x *= sqrt(E) after embedding */
+    for (size_t i = 0; i < (size_t)n * E; i++) m->x[i] *= m->gemma_scale;
 
   for (int l = 0; l < m->n_layer; l++) {
     sgl_llama_layer *L = &m->layers[l];
     sgl_rmsnorm(m->x, L->inp_norm.data, m->h, n, E, m->rms_eps);
-    proj_nt(m, m->h, &L->q_w, L->q8, L->sq8, L->q_b.data, m->q, n, E, E);
+    proj_nt(m, m->h, &L->q_w, L->q8, L->sq8, L->q_b.data, m->q, n, m->q_dim, E);
     proj_nt(m, m->h, &L->k_w, L->k8, L->sk8, L->k_b.data, m->k, n, m->kv_dim, E);
     proj_nt(m, m->h, &L->v_w, L->v8, L->sv8, L->v_b.data, m->v, n, m->kv_dim, E);
     /* qwen2 qk-norm (before rope) */
     if (L->q_norm.data)
       for (int t = 0; t < n; t++)
         for (int h = 0; h < H; h++)
-          sgl_rmsnorm(m->q + (size_t)t * E + h * D, L->q_norm.data,
-                      m->q + (size_t)t * E + h * D, 1, D, 1e-6f);
+          sgl_rmsnorm(m->q + (size_t)t * m->q_dim + h * D, L->q_norm.data,
+                      m->q + (size_t)t * m->q_dim + h * D, 1, D, 1e-6f);
     if (L->k_norm.data)
       for (int t = 0; t < n; t++)
         for (int hk = 0; hk < HK; hk++)
@@ -456,7 +466,7 @@ static int llama_forward_impl(sgl_llama *m, const int *tokens, int n, int pos0,
                       m->k + (size_t)t * m->kv_dim + hk * D, 1, D, 1e-6f);
     /* rope: per-token position (rows of the same token share pos0+t) */
     for (int t = 0; t < n; t++) {
-      sgl_rope_inplace(m->q + (size_t)t * E, H, D, pos0 + t, m->rope_theta);
+      sgl_rope_inplace(m->q + (size_t)t * m->q_dim, H, D, pos0 + t, m->rope_theta);
       sgl_rope_inplace(m->k + (size_t)t * m->kv_dim, HK, D, pos0 + t, m->rope_theta);
     }
 
@@ -498,14 +508,16 @@ static int llama_forward_impl(sgl_llama *m, const int *tokens, int n, int pos0,
 #ifdef _OPENMP
         sc += (size_t)omp_get_thread_num() * m->n_ctx;
 #endif
-        const float *qrow = m->q + (size_t)t * E;
-        float *orow = m->attn + (size_t)t * E;
+        const float *qrow = m->q + (size_t)t * m->q_dim;
+        float *orow = m->attn + (size_t)t * m->q_dim;
         for (int h = 0; h < H; h++) {
           const float *qh = qrow + h * D;
           size_t hoff = (size_t)(h / (H / HK)) * D;
           int upto = pos0 + t + 1;
+          /* t9 mistral: sliding window — only p in [pos-win+1, pos] */
+          int from = m->sliding_window > 0 && upto > m->sliding_window ? upto - m->sliding_window : 0;
           float maxv = -1e30f;
-          for (int p = 0; p < upto; p++) {
+          for (int p = from; p < upto; p++) {
             int pg = slot_idx[p];
             float s = 0;
             if (kc8l) {
@@ -523,10 +535,10 @@ static int llama_forward_impl(sgl_llama *m, const int *tokens, int n, int pos0,
             if (s > maxv) maxv = s;
           }
           double sum = 0;
-          for (int p = 0; p < upto; p++) { sc[p] = expf(sc[p] - maxv); sum += sc[p]; }
+          for (int p = from; p < upto; p++) { sc[p] = expf(sc[p] - maxv); sum += sc[p]; }
           float *out = orow + h * D;
           memset(out, 0, sizeof(float) * D);
-          for (int p = 0; p < upto; p++) {
+          for (int p = from; p < upto; p++) {
             int pg = slot_idx[p];
             float w = sc[p] / (float)sum;
             if (vc8l) {
@@ -542,7 +554,7 @@ static int llama_forward_impl(sgl_llama *m, const int *tokens, int n, int pos0,
       }
     }
 
-    proj_nt(m, m->attn, &L->o_w, L->o8, L->so8, NULL, m->h, n, E, E);
+    proj_nt(m, m->attn, &L->o_w, L->o8, L->so8, NULL, m->h, n, E, m->q_dim);
     for (int t = 0; t < n; t++)
       for (int k = 0; k < E; k++)
         m->x[(size_t)t * E + k] += m->h[(size_t)t * E + k];
@@ -596,18 +608,20 @@ int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx
   }
 
   sgl_embedding_get(m->wte.data, tokens, B, E, m->x);
+  if (m->gemma_scale > 0)
+    for (size_t i = 0; i < (size_t)B * E; i++) m->x[i] *= m->gemma_scale;
 
   for (int l = 0; l < m->n_layer; l++) {
     sgl_llama_layer *L = &m->layers[l];
     sgl_rmsnorm(m->x, L->inp_norm.data, m->h, B, E, m->rms_eps);
-    proj_nt(m, m->h, &L->q_w, L->q8, L->sq8, L->q_b.data, m->q, B, E, E);
+    proj_nt(m, m->h, &L->q_w, L->q8, L->sq8, L->q_b.data, m->q, B, m->q_dim, E);
     proj_nt(m, m->h, &L->k_w, L->k8, L->sk8, L->k_b.data, m->k, B, m->kv_dim, E);
     proj_nt(m, m->h, &L->v_w, L->v8, L->sv8, L->v_b.data, m->v, B, m->kv_dim, E);
     if (L->q_norm.data)
       for (int b = 0; b < B; b++)
         for (int h = 0; h < H; h++)
-          sgl_rmsnorm(m->q + (size_t)b * E + h * D, L->q_norm.data,
-                      m->q + (size_t)b * E + h * D, 1, D, 1e-6f);
+          sgl_rmsnorm(m->q + (size_t)b * m->q_dim + h * D, L->q_norm.data,
+                      m->q + (size_t)b * m->q_dim + h * D, 1, D, 1e-6f);
     if (L->k_norm.data)
       for (int b = 0; b < B; b++)
         for (int hk = 0; hk < HK; hk++)
@@ -617,7 +631,7 @@ int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx
      * n head rows at one pos — passing 1 left heads 1..H-1 un-rotated,
      * which diverged decode_batch from single-stream on the 2nd token) */
     for (int b = 0; b < B; b++) {
-      sgl_rope_inplace(m->q + (size_t)b * E, H, D, seq_lens[b], m->rope_theta);
+      sgl_rope_inplace(m->q + (size_t)b * m->q_dim, H, D, seq_lens[b], m->rope_theta);
       sgl_rope_inplace(m->k + (size_t)b * m->kv_dim, HK, D, seq_lens[b], m->rope_theta);
     }
 
@@ -659,12 +673,14 @@ int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx
 #ifdef _OPENMP
         sc += (size_t)omp_get_thread_num() * m->n_ctx;
 #endif
-        const float *qh = m->q + (size_t)b * E + h * D;
+        const float *qh = m->q + (size_t)b * m->q_dim + h * D;
         size_t hoff = (size_t)(h / (H / HK)) * D;
         const int *idx = slot_idx[b];
         int upto = seq_lens[b] + 1;
+        /* t9 mistral: sliding window */
+        int from = m->sliding_window > 0 && upto > m->sliding_window ? upto - m->sliding_window : 0;
         float maxv = -1e30f;
-        for (int p = 0; p < upto; p++) {
+        for (int p = from; p < upto; p++) {
           int pg = idx[p];
           float s = 0;
           if (kc8l) {
@@ -682,10 +698,10 @@ int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx
           if (s > maxv) maxv = s;
         }
         double sum = 0;
-        for (int p = 0; p < upto; p++) { sc[p] = expf(sc[p] - maxv); sum += sc[p]; }
-        float *out = m->attn + (size_t)b * E + h * D;
+        for (int p = from; p < upto; p++) { sc[p] = expf(sc[p] - maxv); sum += sc[p]; }
+        float *out = m->attn + (size_t)b * m->q_dim + h * D;
         memset(out, 0, sizeof(float) * D);
-        for (int p = 0; p < upto; p++) {
+        for (int p = from; p < upto; p++) {
           int pg = idx[p];
           float w = sc[p] / (float)sum;
           if (vc8l) {
@@ -700,7 +716,7 @@ int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx
       }
     }
 
-    proj_nt(m, m->attn, &L->o_w, L->o8, L->so8, NULL, m->h, B, E, E);
+    proj_nt(m, m->attn, &L->o_w, L->o8, L->so8, NULL, m->h, B, E, m->q_dim);
     for (int b = 0; b < B; b++)
       for (int k = 0; k < E; k++)
         m->x[(size_t)b * E + k] += m->h[(size_t)b * E + k];

@@ -70,7 +70,14 @@ def rope(x, pos):  # x: [n, heads, Dh]
 def forward(ids):
     n = len(ids)
     x = f32(W["model.embed_tokens.weight"][ids])
+    if cfg.get("model_type") == "gemma":  # t9: hidden normalizer
+        x = x * np.sqrt(E, dtype=np.float32)
     mask = np.triu(np.full((n, n), -1e9, dtype=np.float32), 1)
+    # t9 mistral: sliding window banded mask (attend only p in [q-win+1, q])
+    if cfg.get("sliding_window"):
+        win = cfg["sliding_window"]
+        band = np.abs(np.subtract.outer(np.arange(n), np.arange(n))) >= win
+        mask = mask + np.where(band, -1e9, 0).astype(np.float32)
     for l in range(L):
         p = f"model.layers.{l}"
         h = rms(x, f32(W[f"{p}.input_layernorm.weight"]))
@@ -98,7 +105,7 @@ def forward(ids):
         att = att - att.max(-1, keepdims=True)
         att = np.exp(att)
         att = att / att.sum(-1, keepdims=True)
-        o = np.einsum("hqk,khd->qhd", att, v).reshape(n, E)
+        o = np.einsum("hqk,khd->qhd", att, v).reshape(n, H * Dh)  # H*D rows (qwen3: != E)
         x = x + o @ f32(W[f"{p}.self_attn.o_proj.weight"]).T
         h = rms(x, f32(W[f"{p}.post_attention_layernorm.weight"]))
         g = h @ f32(W[f"{p}.mlp.gate_proj.weight"]).T
@@ -116,7 +123,8 @@ from tokenizers import Tokenizer
 tok = Tokenizer.from_file(f"{D}/tokenizer.json")
 
 out = {"config": {"E": E, "H": H, "L": L, "KVH": KVH, "V": V}, "cases": []}
-for text in ["Hello world", "The meaning of life is", "Paris is the capital of"]:
+for text in ["Hello world", "The meaning of life is", "Paris is the capital of",
+             " ".join(["word"] * 90)]:  # t9: >sliding_window(64) tokens to exercise the band
     ids = tok.encode(text).ids
     logits = forward(ids)
     top = np.argsort(-logits)[:5]
