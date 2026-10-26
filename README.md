@@ -31,11 +31,14 @@
 | Speculative decoding v2 | `srt/speculative/` | ✅ n-token 批量 verify；160m draft 接受率 13%，spec==greedy 保证 |
 | 多 LoRA 热切换 | `srt/lora/` | ✅ 运行时 add/remove，N 卡 N 选 1 |
 | **CUDA FP16 / Graph / 长上下文** | `srt/` | ✅ 1.1B fp16 入 6GB 卡；graph 批处理 +89%；ctx 16384 |
-| **LLaVA 多模态（CLIP+融合+HTTP）** | `srt/models/llava.py` | ✅ CLIP ViT + projector + embedding 级融合 + `/v1/chat/completions` image_url（raw float base64；JPEG 解码不支持）；numpy 全等 9.3e-9，GPU 融合 vs CPU 融合 1.2e-7 |
+| **LLaVA 多模态（CLIP+融合+HTTP）** | `srt/models/llava.py` | ✅ CLIP ViT + **两层 MLP projector**（自动判层数，GELU）+ 视觉 token **按 `<image>` 位置插入** + `/v1/chat/completions` image_url（**PNG/JPEG 直收**，raw-float base64 仍兼容）；随机结构 numpy 全等 9.3e-9；**真实 CLIP-L/14-336 + 真实 llava mm_projector** 对 transformers 分段对照 rel **1.4e-05 / 1.8e-05** |
+| **Qwen3-Next（混合层 + MoE）** | `srt/models/qwen3_next.py` | ✅ linear_attention（gated deltanet）+ full 层的 q 门控 / partial rotary / `(1+w)` RMSNorm / MoE（top-k 路由 + 共享专家 + routed scaling）；随机结构 vs float64 numpy **2.5e-08–5.8e-08**；递归状态按**序列 key** 归属（前缀共享不互踩） |
 | **CPU OpenBLAS / AVX2 dot** | backend | ✅ 大 M GEMM 3.1x（195 GFLOPs），运行时分派零依赖可选 |
 | SSE 流式 | `--stream` | ✅ 流式拼接与非流式严格全等 |
 
-**未覆盖**：张量并行、真实 LLaVA 权重端到端（结构已验证）、GPU 侧 sliding window。
+**未覆盖**：张量并行、真实 LLaVA **7B 语言模型**端到端（CLIP-L/14-336 与 mm_projector
+已用真实权重分段对照，7B LM 因磁盘/显存未下）、GPU 侧 sliding window、
+Qwen3-Next 的 CUDA 路径（仅 CPU 参考实现）。
 
 ## 快速开始
 
@@ -93,9 +96,12 @@ worker；已验证：单请求正确（Paris 事实性回答）+ **两轮 8 并�
 
 ## M26：长上下文 + CUDA Graph（2026-02）
 
-**长上下文（两段式 attention 解除 4096 钳制）**：≤4096 走原 shared-scores kernel
-（数值路径不变），>4096 自动切两段式 kernel（chunk 1024 online-softmax，K 重算两遍
-换固定 shared 内存）；`SGL_CUDA_CTX` 覆盖上下文上限（默认 16384，受显存约束）；
+**长上下文（两段式 attention 解除 4096 钳制）**：当时的设计是 ≤4096 走 shared-scores
+kernel、>4096 切两段式 kernel（chunk 1024 online-softmax，K 重算两遍换固定 shared 内存）；
+**G1 之后长行走 flash，G16 又把阀值降到 64 token**，所以**默认路径下两段式核只在
+`SGL_ATTN_TWOPASS=1` 或 head_dim 无特化（不整除 32）时才用**；llama 族的 kernel 选择逻辑
+集中在 `attn_dispatch()` 一处（GPT-2 有自己的前向循环，仍只用 shared-scores 核，
+所以它的长上下文能力没被 G1/G16 抬高）。`SGL_CUDA_CTX` 覆盖上下文上限（默认 16384，受显存约束）；
 tied lm_head 在设备端别名 wte（Qwen2.5-0.5B 省 545MB）；激活 workspace 按需增长。
 验证：两段式 vs 原 kernel maxerr 2.2e-5 且 greedy 一致；4300-token prompt 批处理
 （双 KV 段 + graph 重放）与单流逐 token 全等；kernel 确定性检查（同输入两次 prefill
@@ -113,9 +119,13 @@ launch 2 次 bit-exact 破坏、偶发全 NaN；补 2 个 `__syncthreads()` 后�
 性能数字全部是**同进程 A/B**（`cuda_perf --ab`）：本卡空闲显存常常小于模型常驻量，
 WDDM 溢出会把绝对时间放大 3–20x，跨进程的数字不能直接比。详见 docs/NOTES_gaps.md。
 
-- **G1 flash prefill**：>4096 行现在走单遍分块核 `k_attn_flash`（Q 块驻 shared、K/V
-  流式、online softmax），不再把 K 重算两遍。8192-token prefill **72.4 → 8.8s（8.3x）**。
-  回退/对比开关：`SGL_ATTN_TWOPASS=1`；逐层注意力计时：`SGL_CUDA_PROF=1`。
+- **G1 flash prefill**：长行不再把 K 重算两遍，改走单遍分块核 `k_attn_flash`（Q 块驻
+  shared、K/V 流式、online softmax）。初版只在 >4096 行切换，8192-token prefill
+  72.4 → 8.8s（8.3x，**当时机器显存吃紧**）；**G16 把阀值降到 64 token**（短行上 short 核
+  只在 64 以下略快），干净状态下同进程 A/B：8192-token **66.1 → 2.7s（23.6x）**、
+  2048-token 11.8x。两个倍率不要互相引用（测量时的显存/并发状态不同）。
+  回退/对比开关：`SGL_ATTN_TWOPASS=1`；逐层注意力计时：`SGL_CUDA_PROF=1`；
+  实际用了哪个核：`SGL_ATTN_DEBUG=1`。
 - **G2 W8 大 M 走 tensor core**：int8 权重模式下 M>1 的投影改用 `cublasGemmEx` IMMA
   （int8×int8→int32，整数累加与顺序无关），M=1 仍用手写 dp4a GEMV（实测更快）。
   [2048,2048] M=8：**0.925 → 0.069ms（13.4x）**；IMMA vs dp4a prefill **maxerr = 0**。
@@ -137,10 +147,48 @@ WDDM 溢出会把绝对时间放大 3–20x，跨进程的数字不能直接比�
   `sgl_cuda_copy_kv` 搬行、只 prefill 后缀（LRU 驱逐，段被复用时先释放租让）。
   输出与无缓存**逐字一致**（`cuda_test [prefix]` maxerr 1.43e-05、greedy 6/6 全同）；
   端到端 756-token 共享前缀：0.76s → **0.34s（2.2x）**。`/health` 的 `prefix` 字段给出
-  hits/hit_rows/leased_rows。
+  hits/hit_rows/leased_rows（G15 又扩成 slots/hits/misses/hit_rate/flushes，并且租让
+  现在也覆盖**生成 token 的行**与**带图请求的 text 部分**，同 prompt 重发 0.262s → 0.103s）。
 - 新工具：`tests/cuda_perf.c`（同进程 A/B 基准）、`tests/conc_test.ps1`、
   `tests/prefix_e2e.ps1`、`tests/soak_curve.ps1`（RSS/VRAM 斜率）、`tests/g4_probe.py`、
   `tests/bom_fix.ps1`（批量补 UTF-8 BOM）。
+
+## 缺口关闭 G11–G19（2026-10-27，全部实测）
+
+数据与口径：`CHANGELOG.md` 的 `[Unreleased]` 节（每项都带实测数字与日志路径）、
+`docs/BENCH.md`（G14/G15/G16/G18 四节）、`docs/NOTES_g8.md §8`（真实 llava）、
+`docs/NOTES_g9.md §5`（Qwen3-Next）、`docs/PROGRESS_g11_g19.md`（逐轮过程）。
+
+- **G16 flash 从 64 token 起就用**（阀值原 4096）：qwen05 int8 同进程 best-of-3 下
+  128 tok 快 1.3x、512 tok 3.7x、2048 tok **11.8x**、4096 tok **20.2x**；64 tok 以下
+  short 核仍略快，保留。head_dim 新增 D=96 特化 + `D % 32` 守卫（ND=D/32 不整除会静默
+  只算前 64 维）。`SGL_ATTN_DEBUG=1` 打出实际用的核。
+- **G15 前缀租让覆盖生成 token**：登记行数从「只算 prompt」改成「段里真有有效 KV 的行」
+  （`n_prompt + n_gen - 1` → 多轮对话/续写整段复用：命中 552 → **573** 行）；带图请求也
+  登记 text 部分（以前完全跳过）。同 prompt 重发 0.262s → **0.103s（2.5x）**。
+  `/health` 的 `prefix` 字段给 `slots/hits/misses/hit_rate/hit_rows/leased_rows/flushes`；
+  `SGL_PFX_MAX=0` 彻底关缓存。
+- **G11 GPU 侧直收 PNG/JPEG**：`cuda_http` 按 data URL 的 mime 分派，走与 CPU 版同一条
+  stb_image + PIL 语义 resize/crop + CLIP + projector 路径（以前只认 raw float base64）。
+- **G12 真实 llava**：两层 MLP projector、视觉 token 按 `<image>` 位置插入（后缀文本位置
+  顺延）、支持 `mm_vision_select_layer=-2`；**顺带修了 tokenizer 只在 pre-token 边界匹配
+  added token 的 bug**（`USER: <image> ...` 里拿不到 `<image>` id）。
+- **G13 Qwen3-Next**：见上方能力表；递归状态归属键从「首 KV 页」换成 64 位序列 key
+  （radix 前缀共享时两条序列会抢同一个槽 → 状态互踩）。
+- **G14 投机解码**：流水线化（预填 np-1、prompt 末 token 挂起、固定 n=K+1 verify，
+  去掉每轮一次 target 图步）+ small-M GEMV（模板 MT=2/4/8）。K=1 **0.44x → 0.73x**，
+  **但仍净减速**：回本需 K=1 接受率 >88%，实测 39.1%（draft 太弱）。`SGL_SPEC_PROF=1`
+  打阶段分解。
+- **G17 GPU 版 HTTP 卡死（与 G4 不同病）**：`read_request` 在**未 NUL 截断**的缓冲上用
+  `strstr("Content-Length:")`，负载一大会撞上前一个 POST 留在堆里的残值，把无 body 的
+  `GET /health` 挂到客户端超时（修前 12 并发 load：**0/600**）。修后 GPU **600/600**。
+  `SGL_HTTP_TRACE=1` 可逐连接打印入口/收包/应答/退出。
+- **G18 CPU 侧性能**：MSVC 构建之前**只跑 SSE2**（AVX2 内积只有 GCC 有），同线程下比
+  GCC 慢 **10.2x**；新增单独编译单元的 AVX2 dot + CPUID 分派后 930-token prefill
+  326.2s → **33.6s（9.7x）**。8K GPU-vs-CPU 绝对对照：**maxerr 1.48e-04 < 1e-3**、
+  greedy 相同（日志 `docs/g18_8192.log`）。
+- **G19 CI 真跑模型族**：CI 自己生成 5 个随机族（与仓库夹具逐字节相同），验收判据从
+  「ctest 退码 0」改成「`test_family_*` 必须 Passed、`test_llava` 必须 all OK」。
 
 ## LoRA 适配器（M21）
 
@@ -179,6 +227,15 @@ sglc CLI ── HTTP (http.c) ── Scheduler (scheduler.c) ── RadixCache (
 
 ## 已知问题
 
-- WinLibs GCC 16.2 的 AVX2 自动向量化在本机间歇崩溃（最小复现已定位），故用 `-march=x86-64-v2` + 手写 SSE（见 CMakeLists 注释）
+- WinLibs GCC 16.2 的 AVX2 自动向量化在本机间歇崩溃（最小复现已定位），故用 `-march=x86-64-v2` + 手写 SSE（见 CMakeLists 注释）；AVX2 内积单独用函数级 target / 单文件 `/arch:AVX2` 开后运行时 CPUID 分派
 - 激活重尾 outlier（行内 maxabs/median 达 1311x）使 W8A8 不可行，采 W8A16（见 ROADMAP M12）
-- 未训练的截层 draft 接受率 ~0%（spec 加速需专门训练的小模型，M19）
+- 未训练的截层 draft 接受率 ~0%（spec 加速需专门训练的小模型，M19）；
+  llama-160m 对 tinyllama 也只有 39%（K=1）——所以 spec 目前仍净减速（G14）
+- **MSVC 构建不开 OpenMP**（`-fopenmp` 只给 GNU）：实测 CPU prefill 开 8 线程只值 2.05x，
+  数值路径完全一致，需要时再给 MSVC 加 `/openmp`（G18 补记）
+- 前缀缓存是**段级租让**（一个并发段一个槽，token 精确比对），不是 CPU 侧的 radix 树；
+  多图仍拼在**同一个** `<image>` 位置（llava 是一图一占位，G12/G15）
+- CI 不跑 CUDA 与真实 llava 权重（runner 无 NVIDIA 驱动 / 不下 1.7GB 权重）；
+  `test_llava_real` 与 `cuda_test` 只在本地有夹具时跑
+- GPT-2 路径没接 G1/G16 的 attention 优化（仍是 shared-scores 核，长上下文受 shared 上限约束）；
+  共享前缀缓存也只有 llama 族的 `cuda_http` 有（CPU 版是 radix 树）
