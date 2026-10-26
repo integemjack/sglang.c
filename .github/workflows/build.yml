@@ -24,6 +24,8 @@ jobs:
           - { name: macos-x64,        os: macos-13,         gen: ninja }
           - { name: windows-x64,      os: windows-latest,   gen: msvc }
           - { name: windows-x64-cuda, os: windows-latest,   gen: msvc-cuda }
+        # windows-latest 自 2026-06 起预装 VS2026（18\），不用 VS 生成器：
+        # msvc-dev-cmd 自动发现已装 VS 激活 cl 环境 + Ninja 生成器，未来镜像换代免疫
 
     steps:
       - uses: actions/checkout@v4
@@ -55,29 +57,35 @@ jobs:
         if: matrix.gen == 'ninja'
         run: cmake --build build -j
 
+      - name: Setup MSVC
+        if: matrix.gen == 'msvc' || matrix.gen == 'msvc-cuda'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure (MSVC)
         if: matrix.gen == 'msvc' || matrix.gen == 'msvc-cuda'
         shell: pwsh
         run: |
           $cuda = if ("${{ matrix.gen }}" -eq "msvc-cuda") { "-DSGL_CUDA=ON" } else { "" }
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+          cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded $cuda
 
       - name: Build (MSVC)
         if: matrix.gen == 'msvc' || matrix.gen == 'msvc-cuda'
-        run: cmake --build build --config Release --parallel
+        run: cmake --build build --parallel
 
       - name: Test (CPU builds)
         if: matrix.gen != 'msvc-cuda'
         shell: bash
-        run: ctest --test-dir build -C Release --output-on-failure --timeout 900
+        run: ctest --test-dir build --output-on-failure --timeout 900
 
       # CI runner 无 GPU：CUDA job 只验证编译/链接，smoke 走 usage 分支（exit 1）
       - name: Smoke (CUDA build)
         if: matrix.gen == 'msvc-cuda'
         shell: pwsh
         run: |
-          & "build/bin/Release/cuda_cli.exe" 2>&1 | Out-Null
+          & "build/bin/cuda_cli.exe" 2>&1 | Out-Null
           if ($LASTEXITCODE -ne 1) { throw "cuda_cli usage smoke failed ($LASTEXITCODE)" }
           Write-Host "cuda_cli smoke OK (usage exit 1)"
 
@@ -96,7 +104,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item build/bin/Release/sglc.exe dist/
+          Copy-Item build/bin/sglc.exe dist/
           Copy-Item README.md, ROADMAP.md dist/
           Compress-Archive -Path dist/* -DestinationPath "sglang-c-${{ matrix.name }}.zip"
           Get-ChildItem "sglang-c-*.zip"
@@ -106,9 +114,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item build/bin/Release/sglc.exe dist/
-          Copy-Item build/bin/Release/cuda_cli.exe dist/
-          Copy-Item build/bin/Release/cuda_http.exe dist/
+          Copy-Item build/bin/sglc.exe dist/
+          Copy-Item build/bin/cuda_cli.exe dist/
+          Copy-Item build/bin/cuda_http.exe dist/
           # cublas 是动态链接（cudart 已静态），分发须带 DLL
           Copy-Item "$env:CUDA_PATH/bin/cublas64_*.dll" dist/
           Copy-Item README.md, ROADMAP.md dist/
