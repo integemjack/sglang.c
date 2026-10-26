@@ -1,6 +1,9 @@
 ﻿/* _long_vcpu.c — t2 验收：8K-token 重复文本 prompt，GPU forward_seg prefill
  * logits vs CPU sgl_llama_forward 同 ids 的 maxerr（要求 < 1e-3）。
- * 一次性验收工具（不进 ctest）：CPU 8K prefill 需数分钟。 */
+ * 一次性验收工具（不进 ctest）：CPU 8K prefill 需数分钟。
+ * G16: 同时给出 GPU 内部 flash vs two-pass 的 maxerr（同进程两次前向），
+ * 配合 SGL_FORCE_LONG_ATTN=1 可在小 n 上验任何 head_dim 的 flash 核
+ * （例：D=96 随机模型 `SGL_FORCE_LONG_ATTN=1 long_vcpu ..\models\d96-rand 200`）。 */
 #define _CRT_SECURE_NO_WARNINGS
 #include <math.h>
 #include <stdio.h>
@@ -42,11 +45,31 @@ int main(int argc, char **argv) {
 
   float *lg = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
   float *lc = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+  float *l2 = (float *)sgl_xmalloc(sizeof(float) * (size_t)V); /* G16: two-pass */
 
   double t0 = now_sec();
   CHECK:;
   if (sgl_cuda_forward_seg(gpu, ids, NP, 0, 0, lg) != 0) { printf("gpu fail\n"); return 1; }
   printf("GPU prefill %d tok: %.1fs\n", NP, now_sec() - t0);
+
+  /* G16：同一个 GPU 进程里再走一遍 two-pass，直接给出两条路径的差（不依赖 CPU 侧）。 */
+  {
+    double t1 = now_sec();
+    _putenv("SGL_ATTN_TWOPASS=1");
+    int rc2 = sgl_cuda_forward_seg(gpu, ids, NP, 0, 0, l2);
+    _putenv("SGL_ATTN_TWOPASS=0");
+    if (rc2 == 0) {
+      double e = 0;
+      for (int i = 0; i < V; i++) {
+        double d = fabs((double)lg[i] - (double)l2[i]);
+        if (d > e) e = d;
+      }
+      printf("GPU two-pass %d tok: %.1fs | flash-vs-twopass maxerr = %g\n",
+             NP, now_sec() - t1, e);
+    } else {
+      printf("GPU two-pass run failed rc=%d\n", rc2);
+    }
+  }
 
   if (argc > 3 && !strcmp(argv[3], "gpu")) {
     printf("gpu-only mode, skip CPU compare\n");

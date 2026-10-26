@@ -26,8 +26,14 @@
 
 /* M26a: attention path split. upto = positions attended by the last row.
  * <= SHORT_MAX keeps the original shared-scores kernel (numerics unchanged);
- * beyond that the two-pass chunked kernel removes the shared-memory cap. */
-#define SGL_ATTN_SHORT_MAX 4096
+ * beyond that the two-pass chunked kernel removes the shared-memory cap.
+ * G16: the flash kernel is no longer just a long-row fallback. 实测（qwen05 int8,
+ * 同进程 best-of-3, cuda_perf）short 核 vs flash：64 tok 32.0/34.8ms、128 tok
+ * 44.1/33.4ms、256 tok 68.0/39.8ms、512 169/46、1024 583/76、2048 2201/187、
+ * 4096 11445/568ms —— 所以 64 个 token 以上一律走 flash（前提是 head_dim 有
+ * 特化；没有特化时仍退回 short/两遍，行为与改前一致）。 */
+#define SGL_ATTN_SHORT_MAX 4096 /* short 核的 shared 上限（不支持 flash 的 D 用）*/
+#define SGL_ATTN_FLASH_MIN 64   /* 以下 short 核略快（8%），以上 flash 全面占优 */
 #define SGL_ATTN_CHUNK 1024
 #define SGL_PROF_MAXL 64 /* G1: per-layer attention event pairs (max L) */
 /* G3: gexec[B] sentinel meaning "capturing a graph for this B failed". The
@@ -638,7 +644,11 @@ __global__ __launch_bounds__(256) void k_attn_flash(
 
 /* flash launch: TQ/TK chosen per head_dim so shared memory stays under the
  * 64 KB/SM budget (2 blocks/SM). Returns 0 on success, -1 if D is unsupported
- * (caller then falls back to the two-pass kernel). */
+ * (caller then falls back to the two-pass kernel).
+ * G16: the supported head dims are the instantiations below — the kernel needs
+ * D % 32 == 0 (ND = D/32 output dims per lane); D=80/96 were added for
+ * gemma/qwen-style models that are not 64/128 (D=96 verified numerically via
+ * tests/long_vcpu.c against the numpy-equivalent CPU path, see BENCH.md). */
 static int launch_flash(sgl_cuda_model *g, int l, int n, int pos0, int kv_base,
                         float scale) {
   int H = g->H, HK = g->HK, D = g->D, KD = g->KD;
@@ -646,18 +656,59 @@ static int launch_flash(sgl_cuda_model *g, int l, int n, int pos0, int kv_base,
   const float *vc = g->vc + (long) l * g->ctx * KD;
   int win = g->sliding_window;
   cudaStream_t s = g->stream;
+  /* G16: ND = D/32 必须是整数，否则 lane 只覆盖 D 的前 32*ND 维（D=80 就是这种：
+   * 32*2=64 < 80，用 flash 会错算且不报错）。没特化的 D 一律回退到 short/两遍。*/
+  if (D % 32 != 0) {
+    if (getenv("SGL_ATTN_DEBUG"))
+      fprintf(stderr, "[attn] flash skipped: D=%d not a multiple of 32 -> slow path\n", D);
+    return -1;
+  }
   if (D == 64) {
     const int TQ = 8 * 4;
+    if (getenv("SGL_ATTN_DEBUG"))
+      fprintf(stderr, "[attn] flash D=64 QPW=4 TK=32 n=%d pos0=%d\n", n, pos0);
     k_attn_flash<64, 4, 32><<<(n + TQ - 1) / TQ * H, 256, 0, s>>>(
         g->q, kc, vc, g->attn, pos0, kv_base, n, H, HK, scale, win);
   } else if (D == 128) {
     const int TQ = 8 * 2;
+    if (getenv("SGL_ATTN_DEBUG"))
+      fprintf(stderr, "[attn] flash D=128 QPW=2 TK=16 n=%d pos0=%d\n", n, pos0);
     k_attn_flash<128, 2, 16><<<(n + TQ - 1) / TQ * H, 256, 0, s>>>(
         g->q, kc, vc, g->attn, pos0, kv_base, n, H, HK, scale, win);
+  } else if (D == 96) {
+    /* shared = 16*(97) + 2*32*(97) floats = 30.3 KB -> 2 blocks/SM */
+    const int TQ = 8 * 2;
+    if (getenv("SGL_ATTN_DEBUG"))
+      fprintf(stderr, "[attn] flash D=96 QPW=2 TK=32 n=%d pos0=%d\n", n, pos0);
+    k_attn_flash<96, 2, 32><<<(n + TQ - 1) / TQ * H, 256, 0, s>>>(
+        g->q, kc, vc, g->attn, pos0, kv_base, n, H, HK, scale, win);
   } else {
+    if (getenv("SGL_ATTN_DEBUG"))
+      fprintf(stderr, "[attn] flash unsupported D=%d -> two-pass\n", D);
     return -1;
   }
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* G16: 单点决定走哪个 attention 核（以前这段在 prof / 非 prof 两分支里各抄一份）。
+ * 优先级：SGL_ATTN_TWOPASS=1 -> 两遍核（A/B）；否则 pos0+n > FLASH_MIN（或
+ * SGL_FORCE_LONG_ATTN）时先试 flash，flash 不支持该 head_dim 才退回：
+ *   行不长（<= SHORT_MAX）-> short 核（shared 分数，保持老行为）
+ *   行很长              -> 两遍核（shared 无上限） */
+static void attn_dispatch(sgl_cuda_model *g, int l, int n, int pos0, int kv_base,
+                          float sc, int two_pass, int force_long, int E) {
+  int D = g->D, H = g->H, HK = g->HK;
+  const float *kc = g->kc + (long) l * g->ctx * g->KD;
+  const float *vc = g->vc + (long) l * g->ctx * g->KD;
+  int long_row = two_pass || force_long || pos0 + n > SGL_ATTN_FLASH_MIN;
+  if (!long_row) {
+    k_attn<<<n * H, 256, (size_t)(pos0 + n) * sizeof(float), g->stream>>>(
+        g->q, kc, vc, g->attn, pos0, kv_base, n, H, HK, D, sc, E, g->sliding_window);
+    return;
+  }
+  if (!two_pass && launch_flash(g, l, n, pos0, kv_base, sc) == 0) return;
+  k_attn_long<<<n * H, 256, 0, g->stream>>>(
+      g->q, kc, vc, g->attn, pos0, kv_base, n, H, HK, D, sc, g->sliding_window);
 }
 
 __global__ void k_silu_mul(float *gate, const float *up, long n) {
@@ -1757,17 +1808,10 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
       CK(cudaMemcpy2DAsync((char *)vcl + dst_off, pitch, g->v, pitch,
                            row * sizeof(float), n, cudaMemcpyDeviceToDevice, g->stream));
     }
-    /* M26a: attention path split. <= SGL_ATTN_SHORT_MAX keeps the original
-     * shared-scores kernel (numerics untouched; shared sized to the real
-     * row length instead of the full ctx). Longer rows go to the flash
-     * kernel (G1: single-pass, shared-tiled KV), lifting the shared-memory
-     * context cap. Same stream as the D2D KV copies above, so no device sync
-     * is needed here.
-     * SGL_FORCE_LONG_ATTN=1 runs every prompt through the long kernel
-     * (testing: it must agree with the short kernel within fp noise).
-     * SGL_ATTN_TWOPASS=1 forces the old two-pass kernel (A/B benchmark).
-     * SGL_CUDA_PROF=1 brackets every attention launch with CUDA events and
-     * prints the attention share of the forward at the end (G1 step 1). */
+    /* M26a/G16: attention path split —— 具体选哪个核见 attn_dispatch()。
+     * SGL_FORCE_LONG_ATTN=1 把所有 prefill 都丢给长核（验证两条路径一致）。
+     * SGL_ATTN_TWOPASS=1 强制旧两遍核（A/B 基准）。
+     * SGL_CUDA_PROF=1 给每层 attention 包 CUDA event（G1 的耗时分解）。*/
     {
       const char *fe = getenv("SGL_FORCE_LONG_ATTN");
       const char *tp = getenv("SGL_ATTN_TWOPASS");
@@ -1776,26 +1820,10 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
       float sc = 1.0f / sqrtf((float)D);
       if (prof && g->L <= SGL_PROF_MAXL) {
         cudaEventRecord(g->pf0[l], g->stream);
-        if (two_pass || force_long || pos0 + n > SGL_ATTN_SHORT_MAX) {
-          if (two_pass || launch_flash(g, l, n, pos0, kv_base, sc) != 0)
-            k_attn_long<<<n * H, 256, 0, g->stream>>>(
-                g->q, g->kc + (long) l * g->ctx * KD, g->vc + (long) l * g->ctx * KD,
-                g->attn, pos0, kv_base, n, H, HK, D, sc, g->sliding_window);
-        } else {
-          k_attn<<<n * H, 256, (size_t)(pos0 + n) * sizeof(float), g->stream>>>(
-              g->q, g->kc + (long) l * g->ctx * KD, g->vc + (long) l * g->ctx * KD,
-              g->attn, pos0, kv_base, n, H, HK, D, sc, E, g->sliding_window);
-        }
+        attn_dispatch(g, l, n, pos0, kv_base, sc, two_pass, force_long, E);
         cudaEventRecord(g->pf1[l], g->stream);
-      } else if (two_pass || force_long || pos0 + n > SGL_ATTN_SHORT_MAX) {
-        if (two_pass || launch_flash(g, l, n, pos0, kv_base, sc) != 0)
-          k_attn_long<<<n * H, 256, 0, g->stream>>>(
-              g->q, g->kc + (long) l * g->ctx * KD, g->vc + (long) l * g->ctx * KD,
-              g->attn, pos0, kv_base, n, H, HK, D, sc, g->sliding_window);
       } else {
-        k_attn<<<n * H, 256, (size_t)(pos0 + n) * sizeof(float), g->stream>>>(
-            g->q, g->kc + (long) l * g->ctx * KD, g->vc + (long) l * g->ctx * KD,
-            g->attn, pos0, kv_base, n, H, HK, D, sc, E, g->sliding_window);
+        attn_dispatch(g, l, n, pos0, kv_base, sc, two_pass, force_long, E);
       }
     }
     CK(cudaGetLastError());

@@ -7,8 +7,11 @@ import numpy as np
 out = sys.argv[1] if len(sys.argv) > 1 else "models/mistral-rand"
 
 def _args(argv, default_out):
-    """G19: --out/-o 与 --tokenizer/-t 可传（CI 用仓内 tokenizer），位置参数仍兼容。"""
+    """G19: --out/-o 与 --tokenizer/-t 可传（CI 用仓内 tokenizer），位置参数仍兼容。
+    G16: 维度可覆盖（造 head_dim != 64/128 的模型验 flash 泛化）：
+      --hidden E --heads H --kv-heads KVH --layers L --interp I --window SW --vocab V"""
     out, tok, pos = default_out, "models/qwen3-06", []
+    dims = {}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -16,13 +19,23 @@ def _args(argv, default_out):
             out = argv[i + 1]; i += 2; continue
         if a in ("--tokenizer", "-t") and i + 1 < len(argv):
             tok = argv[i + 1]; i += 2; continue
+        keymap = {"--hidden": "E", "--heads": "H", "--kv-heads": "KVH",
+                  "--layers": "L", "--interp": "I", "--window": "SW",
+                  "--vocab": "V"}
+        if a in keymap and i + 1 < len(argv):
+            dims[keymap[a]] = int(argv[i + 1]); i += 2; continue
         pos.append(a); i += 1
     if pos:
         out = pos[0]
-    return out, tok, pos
+    return out, tok, pos, dims
 
-out, TOKDIR, _pos = _args(sys.argv[1:], "models/mistral-rand")
+out, TOKDIR, _pos, _dims = _args(sys.argv[1:], "models/mistral-rand")
 L, H, KVH, E, I, V, SW = 2, 4, 2, 64, 128, 151936, 64
+for _k, _i in (("L", 0), ("H", 1), ("KVH", 2), ("E", 3), ("I", 4), ("SW", 6)):
+    if _k in _dims:
+        globals()[_k] = _dims[_k]
+if "V" in _dims:
+    V = _dims["V"]
 D = E // H
 rng = np.random.default_rng(42)
 os.makedirs(out, exist_ok=True)
@@ -77,4 +90,4 @@ if os.path.exists(src_tok):
             shutil.copy(p2, f"{out}/{f2}")
 else:
     print(f"WARN: no tokenizer at {src_tok} (--tokenizer <dir> to point at one)")
-print(f"saved random mistral -> {out} (L={L} H={H} KVH={KVH} E={E} window={SW})")
+print(f"saved random mistral -> {out} (L={L} H={H} KVH={KVH} E={E} D={D} window={SW})")

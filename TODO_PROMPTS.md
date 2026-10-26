@@ -301,7 +301,7 @@ vs float64 numpy ≤8e-08；但 full_attention 层还是普通 qwen3 写法，�
 命中率/省下 prefill 行数写进 /health 与 BENCH；输出始终与无缓存逐字一致。
 ```
 
-## 任务 G16 · W8 IMMA 后重测 + flash 泛化（性能，小）
+## 任务 G16 · W8 IMMA 后重测 + flash 泛化（性能，小） ✅ 已完成（未发版，见 docs/PROGRESS_g11_g19.md）
 
 ```
 现状：G2 把 M>1 的 int8 投影切到了 cublas IMMA（[2048,2048] M=8 0.925→0.069ms，13.4x），

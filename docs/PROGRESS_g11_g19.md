@@ -91,12 +91,29 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
   （所以与仓库里的 `_ref_*.json` 对得上）；`ctest -V` 本地 23/23 全绿，log 里
   `greedy6=` 22 处、`all OK` 23 处、无 SKIP。
 
+## G16 ✅ W8 IMMA 后重测 + flash 泛化
+
+数据全在 `docs/BENCH.md` 的「G16」节。要点：
+
+- 三精度 prefill（qwen05，ctx=16384，rounds=2）：fp32 85.4/386.7/2748.9 ms、
+  fp16 52.2/198.4/1971.9 ms、int8 48.6/184.5/1923.8 ms（512/2048/8192）。
+- dp4a vs IMMA **没有拐点**：M=1 持平（decode 仍选 dp4a），M≥2 从 46.7x 输到 155x。
+- **short 核阀值 4096 → 64**（`SGL_ATTN_FLASH_MIN`）：128..4096 tok 上 flash 比 short
+  快 1.3x–20.2x；dispatch 收成单个 `attn_dispatch()`；未特化 D 行为不变。
+- head_dim：新增 D=96 特化 + `D % 32` 守卫（D=80 不加守卫会静默只算前 64 维，
+  实测 maxerr 0.83 → 加守卫后回退 7.15e-07）。
+- 新模型：`../models/d96-rand`（E=192 H=2 KVH=1 L=2 D=96）、`../models/d80-rand`
+  （E=320 H=4 D=80，验不整除 32 的回退）。
+- 验收：`cuda_test ..\models\qwen05` → `test_cuda: all OK`；[long] 三路对比
+  short(32)/default(flash@2000)/flash@4300 vs 两遍全 SAME；D=96 三长度 GPU vs CPU ≤8.4e-07。
+- 工具：`tests/bench_prefill.ps1`、`long_vcpu` 新增 flash-vs-two-pass、
+  `SGL_ATTN_DEBUG=1` 打实际用的核、`gen_random_mistral.py` 可指定维度。
+
 ## 下一轮从这里继续
 
-1. **G16**：qwen05 在 `../models/qwen05`。按文档：先跑一遍 W8 IMMA 后的 BENCH 行
-   （`SGL_CUDA_W8=1`），再看 flash 在 gemma2/qwen3next/mistral 随机模型上的泛化
-   （阈值不变、逐族记 maxerr）。
-2. **G14**：tinyllama（target）+ llama-160m（draft）都在 `../models`，直接能复跑
-   接受率与 tok/s。
-3. G15 / G13 是纯代码任务，随机模型就能验；G12 需要先下 llava-1.5 权重；
-   G18 要一段 40–60 分钟的干净时段。
+1. **G14**：tinyllama（target）+ llama-160m（draft）都在 `../models`，直接能复跑
+   接受率与 tok/s。注意本轮改了 attention 默认路径（>64 tok 走 flash），spec 的
+   verify/catchup 走同一条路径，所以 BENCH 里旧的 80.3 / 35.1 tok/s 是 short 核时代的
+   数，基准要重测。
+2. G15 / G13 是纯代码任务，随机模型就能验；G12 需要先下 llava-1.5 权重；
+   G18 要一段 40–60 分钟的干净时段（8K GPU prefill 现在 ~2s，但 CPU 侧仍要 40+ 分钟）。

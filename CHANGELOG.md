@@ -2,7 +2,42 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G17/G19
+## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G16/G17/G19
+
+### 性能
+- **G16 flash 不再只服务长行：short 核阀值 4096 → 64**（`SGL_ATTN_FLASH_MIN`）。
+  qwen05 int8 同进程 best-of-3：128 tok 1.3x、256 tok 1.7x、512 tok 3.7x、
+  1024 tok 7.7x、2048 tok **11.8x**、4096 tok **20.2x**（short 核是 O(n²) 且每行
+  重读 KV；16/32 tok 两者持平、64 tok short 快 8%，所以留着它做极短 prompt 的快路）。
+  默认路径因此变快：fp32 prefill 512/2048 tok 207.8/2385.9 ms → 44.8/200.0 ms，
+  int8 512/2048 tok 169.1/2201.0 ms → 48.6/184.5 ms。dispatch 从 prof/非 prof
+  两份抄写收成单个 `attn_dispatch()`；未特化的 head_dim 行为不变（先试 flash，
+  不成再按行长安回 short / 两遍）。
+- **G16 W8 IMMA 后重测**：int8 prefill 512/2048/8192 = 48.6 / 184.5 / 1923.8 ms
+  （10533 / 11100 / 4258 tok/s），fp16 52.2 / 198.4 / 1971.9 ms，fp32
+  85.4 / 386.7 / 2748.9 ms（ctx=16384，rounds=2）。dp4a vs IMMA 同进程 A/B：
+  n=128/256/512/1024 → 46.7x / 91.5x / 151.6x / 155.3x，**dp4a 只在 M=1 持平**
+  （decode 仍然选它），所谓“拐点”不存在：M≥2 一路输且越输越多。
+  fp32 同进程 A/B：two-pass vs flash = 8.6x / 19.3x / 33.3x（512/2048/8192）。
+
+### 功能/健壮性
+- **G16 flash 泛化**：head_dim 新增 **D=96** 特化（QPW=2/TK=32，shared 30.3KB）；
+  加 `D % 32` 守卫——ND=D/32 要求整除，否则像 D=80 会静默只算前 64 维
+  （实测：加守卫前 D=80 特化 maxerr 0.83、greedy DIFF；加守卫后回退，maxerr 7.15e-07）。
+  D=96 随机模型（`..\models\d96-rand`，L=2 H=2 KVH=1 E=192）在 n=37/200/500 上
+  flash vs two-pass ≤5.7e-07、GPU vs CPU ≤8.4e-07、greedy SAME。
+- `tests/long_vcpu.c` 多了「同进程 flash vs two-pass」一项，配 `SGL_FORCE_LONG_ATTN=1`
+  可在小 n 上验任意 head_dim；`SGL_ATTN_DEBUG=1` 会逐层打出实际用的核
+  （`[attn] flash D=96 QPW=2 TK=32`），证明确实走特化而不是静默回退。
+- `cuda_test [long]` 的三路对比修正：以前 4300 行的 "flash vs two-pass" 两边实际都是
+  flash（阀值降到 64 后 FORCE_LONG 不再等于两遍），变成自己跟自己比；现在显式设
+  `SGL_ATTN_TWOPASS=1`，并新增 short(32 tok) vs 两遍一项保证 short 核仍被覆盖。
+  实测：short vs 两遍 1.08e-05、default(flash) vs 两遍 2.00e-05、flash vs 两遍
+  @4300 1.75e-05，全 SAME；`cuda_test ..\models\qwen05` → `test_cuda: all OK`。
+- `tests/gen_random_mistral.py` 支持 `--hidden/--heads/--kv-heads/--layers/--interp/
+  --window/--vocab`，用来造任意 head_dim 的随机模型；新增 `tests/bench_prefill.ps1`
+  一键重跑三精度 prefill + dp4a/IMMA + flash/两遍 A/B。
+
 
 ### 功能
 - **G11 GPU 版收标准图片**：`cuda_http` 的 image_url 以前只认 raw float32 CHW，真实

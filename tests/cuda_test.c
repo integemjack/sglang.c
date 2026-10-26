@@ -617,9 +617,12 @@ int main(int argc, char **argv) {
       CHECK(d11 == 0.0, "long path nondeterministic %g", d11);
 
       _putenv("SGL_FORCE_LONG_ATTN=0");
-      CHECK(sgl_cuda_forward_seg(gpu, ids2, np2, 0, 0, la) == 0, "short-kernel prefill");
-      _putenv("SGL_FORCE_LONG_ATTN=1");
-      CHECK(sgl_cuda_forward_seg(gpu, ids2, np2, 0, 0, lb) == 0, "long-kernel prefill");
+      CHECK(sgl_cuda_forward_seg(gpu, ids2, np2, 0, 0, la) == 0, "default-path prefill");
+      /* G16: 2000 tok 的默认路径现在是 flash，所以对面显式设两遍核（只用
+       * FORCE_LONG 的话两边都是 flash，变成自己跟自己比）。 */
+      _putenv("SGL_ATTN_TWOPASS=1");
+      CHECK(sgl_cuda_forward_seg(gpu, ids2, np2, 0, 0, lb) == 0, "two-pass prefill");
+      _putenv("SGL_ATTN_TWOPASS=0");
       double me2 = 0;
       int nan_a = 0, nan_b = 0;
       for (int i = 0; i < V; i++) {
@@ -629,7 +632,7 @@ int main(int argc, char **argv) {
                                                 : fabs((double)la[i] - lb[i]);
         if (e > me2) me2 = e;
       }
-      printf("[long] two-pass vs shared-scores (2000 tok): maxerr = %g (NaN a=%d b=%d, lb[0..3]=%.4g %.4g %.4g %.4g)\n",
+      printf("[long] two-pass vs default path (2000 tok): maxerr = %g (NaN a=%d b=%d, lb[0..3]=%.4g %.4g %.4g %.4g)\n",
              me2, nan_a, nan_b, lb[0], lb[1], lb[2], lb[3]);
       /* fp16 mode: fp32-level kernel differences get amplified by the fp16
        * activation rounding of the GEMMs in the layers above; greedy top1
@@ -639,16 +642,42 @@ int main(int argc, char **argv) {
             "two-pass kernel greedy mismatch");
       _putenv("SGL_FORCE_LONG_ATTN=0");
 
+      /* G16: 默认路径 64 tok 以下走 short 核、以上走 flash（见 attn_dispatch），
+       * 所以上面那个 2000-tok 对比现在比的是两遍 vs flash。“short 核仍要覆盖”
+       * 另拉一段 32-token：默认 = short 核，SGL_ATTN_TWOPASS=1 = 两遍核。 */
+      {
+        int ns = 32;
+        _putenv("SGL_FORCE_LONG_ATTN=0");
+        _putenv("SGL_ATTN_TWOPASS=0");
+        CHECK(sgl_cuda_forward_seg(gpu, ids2, ns, 0, 0, la) == 0, "short 32 prefill");
+        _putenv("SGL_ATTN_TWOPASS=1");
+        CHECK(sgl_cuda_forward_seg(gpu, ids2, ns, 0, 0, lb) == 0, "twopass 32 prefill");
+        _putenv("SGL_ATTN_TWOPASS=0");
+        double me32 = 0;
+        for (int i = 0; i < V; i++) {
+          double e = fabs((double)la[i] - (double)lb[i]);
+          if (e > me32) me32 = e;
+        }
+        int g32a = sgl_sample_greedy(la, V), g32b = sgl_sample_greedy(lb, V);
+        printf("[long] short(32 tok) vs two-pass: maxerr = %g; greedy %d vs %d %s\n",
+               me32, g32a, g32b, g32a == g32b ? "SAME" : "DIFF");
+        CHECK(me32 < (FP16 ? 0.05 : 5e-3), "short vs two-pass mismatch %g", me32);
+        CHECK(g32a == g32b, "short vs two-pass greedy mismatch");
+      }
+
       int npl = 4300;
       int *idl = (int *)sgl_xmalloc(sizeof(int) * (size_t)npl);
       for (int i = 0; i < npl; i++) idl[i] = ids[i % np];
       int tref[8];
       CHECK(sgl_cuda_forward_seg(gpu, idl, npl, 0, 0, la) == 0, "4300 ss prefill");
-      /* G1: >4096 行的单流路径现在走 flash 核。把它和两遍核（t2 时在 8192 行
+      /* G1: >4096 行的单流路径走 flash 核。把它和两遍核（t2 时在 8192 行
        * 跟 CPU 对过，maxerr 1.56e-4）在同一 prompt 上对 logits：flash == 两遍
-       * 在噪声内 ⇒ 传递地 flash == CPU。写到 base 8192 避开 [0,4308) 的 KV。 */
-      _putenv("SGL_FORCE_LONG_ATTN=1");
+       * 在噪声内 ⇒ 传递地 flash == CPU。写到 base 8192 避开 [0,4308) 的 KV。
+       * G16: 这里必须显式 SGL_ATTN_TWOPASS=1 —— 只设 FORCE_LONG 的话两边都是
+       * flash（4300 > FLASH_MIN），变成自己跟自己比。 */
+      _putenv("SGL_ATTN_TWOPASS=1");
       CHECK(sgl_cuda_forward_seg(gpu, idl, npl, 0, 8192, lb) == 0, "4300 two-pass prefill");
+      _putenv("SGL_ATTN_TWOPASS=0");
       _putenv("SGL_FORCE_LONG_ATTN=0");
       {
         double me43 = 0;
