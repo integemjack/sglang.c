@@ -120,9 +120,13 @@ if ($env:SGL_CUDA_FP16 -eq "1") {
     $r = Bench-Cuda @("models/qwen05",$CudaPrompt,"$CudaTok","0")
     if ($r -and $r.tps) { Add-Row "cuda" "fp16" "qwen05" "single" "$($r.tps)" "$($r.vram)" "SGL_CUDA_FP16=1, $($r.tok) tok / $($r.sec)s (best of 2)" }
     else { Add-Row "cuda" "fp16" "qwen05" "single" "ERROR" "-" "SGL_CUDA_FP16=1 but run/parse failed" }
+    Write-Host "[bench_all] 5b/6 CUDA fp16 tinyllama-1.1B single (SGL_CUDA_FP16=1) ..."
+    $r = Bench-Cuda @("models/tinyllama",$CudaPrompt,"$CudaTok","0")
+    if ($r -and $r.tps) { Add-Row "cuda" "fp16" "tinyllama" "single" "$($r.tps)" "$($r.vram)" "1.1B fp16 ~2.2GB fits 6GB card, $($r.tok) tok / $($r.sec)s (best of 2)" }
+    else { Add-Row "cuda" "fp16" "tinyllama" "single" "ERROR" "-" "SGL_CUDA_FP16=1 but run/parse failed" }
 } else {
-    Write-Host "[bench_all] 5/6 CUDA fp16 row: placeholder (set SGL_CUDA_FP16=1 to measure)"
-    Add-Row "cuda" "fp16" "qwen05" "single" "TODO(待 t1)" "-" "set SGL_CUDA_FP16=1 and rerun"
+    Write-Host "[bench_all] 5/6 CUDA fp16 rows: placeholder (set SGL_CUDA_FP16=1 to measure)"
+    Add-Row "cuda" "fp16" "qwen05" "single" "TODO(t1)" "-" "set SGL_CUDA_FP16=1 and rerun"
 }
 if ($env:SGL_CUDA_W8 -eq "1") {
     Write-Host "[bench_all] CUDA int8 qwen05 single (SGL_CUDA_W8=1) ..."

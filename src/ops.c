@@ -2,7 +2,11 @@
 #include "sgl/ops.h"
 
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include "sgl/log.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -11,9 +15,46 @@
 #if defined(__SSE2__)
 #include <emmintrin.h> /* SSE2：f32 4-wide */
 #endif
+#if defined(__x86_64__)
+#include <immintrin.h> /* __m256/_mm256_* 类型与 intrinsics 声明（仅 target attr 函数实际发射）*/
+#endif
+
+/* ---------------- t12.2 AVX2 dot（手写 intrinsics，非自动向量化）---------------
+ * 当年 -march=avx2 全程序编译的 0xC0000005 是编译器【自动向量化】bug；这里在
+ * x86-64-v2 基线上用 target attribute 只对这一个函数启用 AVX2+FMA 指令，
+ * 运行时 __builtin_cpu_supports 检测（QEMU/老 CPU 返回 false 走 SSE2）。
+ * 8-wide、4 路累加（32 floats/迭代），尾段标量。归约顺序与 SSE2 版不同，
+ * 数值差 ~1e-6（同属 fp32 噪声）。 */
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(__INTEL_COMPILER)
+#define SGL_HAVE_AVX2_TARGET 1
+__attribute__((target("avx2,fma")))
+static double dot_k_f32_avx2(const float *a, const float *b, int K);
+static double dot_k_f32_avx2(const float *a, const float *b, int K) {
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+  int k = 0;
+  for (; k + 32 <= K; k += 32) {
+    __m256 a0 = _mm256_loadu_ps(a + k), a1 = _mm256_loadu_ps(a + k + 8);
+    __m256 a2 = _mm256_loadu_ps(a + k + 16), a3 = _mm256_loadu_ps(a + k + 24);
+    acc0 = _mm256_fmadd_ps(a0, _mm256_loadu_ps(b + k), acc0);
+    acc1 = _mm256_fmadd_ps(a1, _mm256_loadu_ps(b + k + 8), acc1);
+    acc2 = _mm256_fmadd_ps(a2, _mm256_loadu_ps(b + k + 16), acc2);
+    acc3 = _mm256_fmadd_ps(a3, _mm256_loadu_ps(b + k + 24), acc3);
+  }
+  __m256 s4 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+  float part[8];
+  _mm256_storeu_ps(part, s4);
+  double s = ((double)(part[0] + part[1]) + (double)(part[2] + part[3])) +
+             ((double)(part[4] + part[5]) + (double)(part[6] + part[7]));
+  for (; k < K; k++) s += (double)a[k] * b[k];
+  return s;
+}
+#else
+#define SGL_HAVE_AVX2_TARGET 0
+#endif
 
 /* K 维 SIMD 内积（16/迭代，4 路累加）；SSE2 基线保证可用，不受 AVX2 向量化 bug 影响 */
-static inline double dot_k_f32(const float *a, const float *b, int K) {
+static double dot_k_f32_sse2(const float *a, const float *b, int K) {
 #if defined(__SSE2__)
   __m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps();
   __m128 acc2 = _mm_setzero_ps(), acc3 = _mm_setzero_ps();
@@ -39,6 +80,63 @@ static inline double dot_k_f32(const float *a, const float *b, int K) {
   for (int k = 0; k < K; k++) s += (double)a[k] * b[k];
   return s;
 #endif
+}
+
+/* 运行时一次性选路（race 无害：各线程写入相同值）*/
+static double dot_k_f32(const float *a, const float *b, int K) {
+#if SGL_HAVE_AVX2_TARGET
+  static int has_avx2 = -1;
+  if (has_avx2 < 0)
+    has_avx2 = (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) ? 1 : 0;
+  if (has_avx2) return dot_k_f32_avx2(a, b, K);
+#endif
+  return dot_k_f32_sse2(a, b, K);
+}
+
+/* ---------------- t12.1 OpenBLAS 运行时分派 ----------------
+ * SGL_BLAS=0 强制内置；否则首次使用时尝试加载 libopenblas.dll/.so
+ * （CMake SGL_OPENBLAS=ON 会把 third_party 预编译 dll 拷到可执行文件旁；
+ * 任何 PATH 可见目录也行；SGL_OPENBLAS_PATH 指定完整路径优先）。
+ * 只用于大矩阵（M>=2 且 M*N*K >= SGL_BLAS_MINMAC，默认 4M MAC）；
+ * 小矩阵/decode GEMV 保留手写 kernel（线程与 launch 开销占主导）。
+ * cblas 常量按 cblas.h 值内联，避免头文件依赖。 */
+#define SGL_CBLAS_ROWMAJOR 101
+#define SGL_CBLAS_NOTRANS 111
+#define SGL_CBLAS_TRANS 112
+typedef void (*sgl_sgemm_fn)(int, int, int, int, int, int, float, const float *, int,
+                             const float *, int, float, float *, int);
+static sgl_sgemm_fn sgl_sgemm;
+static double sgl_blas_minmac = 4e6; /* 4M MAC */
+static int sgl_blas_state = -1;               /* -1 未初始化 0 关 1 开 */
+
+#if defined(_WIN32)
+#include <windows.h>
+static void *sgl_dlopen(const char *p) { return (void *)LoadLibraryA(p); }
+static void *sgl_dlsym(void *h, const char *n) { return (void *)(intptr_t)GetProcAddress((HMODULE)h, n); }
+#else
+#include <dlfcn.h>
+static void *sgl_dlopen(const char *p) { return dlopen(p, RTLD_NOW | RTLD_LOCAL); }
+static void *sgl_dlsym(void *h, const char *n) { return dlsym(h, n); }
+#endif
+
+static void sgl_blas_init(void) {
+  const char *off = getenv("SGL_BLAS");
+  if (off && atoi(off) == 0) { sgl_blas_state = 0; return; }
+  const char *mm = getenv("SGL_BLAS_MINMAC");
+  if (mm && *mm) sgl_blas_minmac = atof(mm);
+  void *h = NULL;
+  const char *path = getenv("SGL_OPENBLAS_PATH");
+  if (path && *path) h = sgl_dlopen(path);
+#if defined(_WIN32)
+  if (!h) h = sgl_dlopen("libopenblas.dll");
+#else
+  if (!h) h = sgl_dlopen("libopenblas.so");
+#endif
+  if (!h) { sgl_blas_state = 0; return; }
+  sgl_sgemm = (sgl_sgemm_fn)sgl_dlsym(h, "cblas_sgemm");
+  sgl_blas_state = sgl_sgemm ? 1 : 0;
+  SGL_INFO("OpenBLAS %s (sgemm dispatch, min MAC %g)",
+           sgl_blas_state == 1 ? "loaded" : "loaded but cblas_sgemm missing", sgl_blas_minmac);
 }
 
 void sgl_dot_f32(const float *a, const float *b, int n, float *out_sum);
@@ -133,7 +231,23 @@ void sgl_gelu_inplace(float *row, int n) {
 void sgl_matmul_nt(const float *A, const float *W, const float *bias, float *C,
                    int M, int N, int K) {
   /* W[N,K] 行主序（PyTorch Linear）：C[m,n] = Σ_k A[m,k] * W[n,k] + bias[n]
-   * K 维 SSE2 SIMD 内积。
+   * 大矩阵优先 OpenBLAS（t12.1 运行时分派，C[M,N] = A[M,K] @ W[N,K]^T）：
+   * CblasRowMajor 下直接传 W 为 Trans（lda=K）——OpenBLAS 文档的 [N,K] 列主
+   * Fortran 习惯由 CBLAS RowMajor 接口吸收，bias 随后广播。 */
+  if (sgl_blas_state < 0) sgl_blas_init();
+  if (sgl_sgemm && M >= 2 && (double)M * N * K >= sgl_blas_minmac) {
+    sgl_sgemm(SGL_CBLAS_ROWMAJOR, SGL_CBLAS_NOTRANS, SGL_CBLAS_TRANS,
+              M, N, K, 1.0f, A, K, W, K, 0.0f, C, N);
+    if (bias) {
+#pragma omp parallel for
+      for (int m = 0; m < M; m++) {
+        float *crow = C + (size_t)m * N;
+        for (int n = 0; n < N; n++) crow[n] += bias[n];
+      }
+    }
+    return;
+  }
+  /* K 维 SSE2 SIMD 内积。
    * n-outer 分块（Spec-v2 / 批量前向复用）：按 m 块（TM 行）切，块内 n 外层——
    * 每个 m 块 W 只从内存过一遍、被块内全部 TM 行激活复用（原来逐行各过一遍 W，
    * M 行 = M×|W| 流量）。每个 C[m][n] 仍是独立的一次 dot_k_f32(ar,wr,K)，

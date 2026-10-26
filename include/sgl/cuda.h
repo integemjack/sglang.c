@@ -1,4 +1,4 @@
-/* sgl/cuda.h — CUDA 后端（M9 v1）：llama 系模型的 GPU 单流前向
+﻿/* sgl/cuda.h — CUDA 后端（M9 v1）：llama 系模型的 GPU 单流前向
  * 权重在加载时上传设备；KV 连续存储（不分页，v1）；采样在主机。
  * 复用 llama.c 的加载器（sgl_llama*）作为权重源与配置来源。 */
 #ifndef SGL_CUDA_H

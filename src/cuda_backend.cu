@@ -1,4 +1,4 @@
-/* sgl cuda_backend.cu - llama-family GPU forward (M9 v1)
+﻿/* sgl cuda_backend.cu - llama-family GPU forward (M9 v1)
  * kernels: embed / rmsnorm / gemm_nt (block-reduce dot) / rope (precomputed
  * freqs) / attention (block per (t,h), shared scores) / silu_mul / residual.
  * Numerics match llama.c (fp32; reduction order may differ ~1e-5). */
@@ -908,16 +908,19 @@ int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
     k_rope<<<(int)(((long)n * H * D / 2 + 255) / 256), 256, 0, g->stream>>>(g->q, n * H, D, H, pos0, g->freqs);
     k_rope<<<(int)(((long)n * HK * D / 2 + 255) / 256), 256, 0, g->stream>>>(g->k, n * HK, D, HK, pos0, g->freqs);
     CK(cudaGetLastError());
-    for (int t = 0; t < n; t++) {
-      /* KV 閻㈩垰鍟惇?[L][ctx][KD]闁挎稒纰嶉惁锛勪沪閸屾碍鍊楅柛妤冨С缁旀潙鈻撶喊澶岀闁?閻犲洤顭烽崗妯跨疀閸涙番鈧繘宕濋悩鑼勾闁稿绻掍簺 l*ctx*KD */
+    /* KV scatter [L][ctx][KD] <- packed [n][KD]: rows equally strided on both
+     * sides (src pitch = KD packed, dst pitch = KD in ctx), so the whole
+     * scatter is ONE 2D memcpy instead of 2n tiny async copies per layer.
+     * (8192-token prefill did 393k WDDM submits and took 174s; now ~48.) */
+    {
       float *kcl = g->kc + (long)l * g->ctx * KD;
       float *vcl = g->vc + (long)l * g->ctx * KD;
-      cudaMemcpyAsync(kcl + ((long)(kv_base + pos0 + t) * HK) * D,
-                      g->k + ((long)t * HK) * D, sizeof(float) * (size_t)HK * D,
-                      cudaMemcpyDeviceToDevice, g->stream);
-      cudaMemcpyAsync(vcl + ((long)(kv_base + pos0 + t) * HK) * D,
-                      g->v + ((long)t * HK) * D, sizeof(float) * (size_t)HK * D,
-                      cudaMemcpyDeviceToDevice, g->stream);
+      size_t row = (size_t)HK * D, pitch = (size_t)KD * sizeof(float);
+      size_t dst_off = (size_t)(kv_base + pos0) * pitch;
+      CK(cudaMemcpy2DAsync((char *)kcl + dst_off, pitch, g->k, pitch,
+                           row * sizeof(float), n, cudaMemcpyDeviceToDevice, g->stream));
+      CK(cudaMemcpy2DAsync((char *)vcl + dst_off, pitch, g->v, pitch,
+                           row * sizeof(float), n, cudaMemcpyDeviceToDevice, g->stream));
     }
     /* M26a: attention path split. <= SGL_ATTN_SHORT_MAX keeps the original
      * shared-scores kernel (numerics untouched; shared sized to the real

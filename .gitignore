@@ -11,3 +11,6 @@ buil*/
 
 # æ¨¡å‹æƒé‡ä¸å…¥åº“ï¼ˆtests çš„ gpt2 æƒé‡ç”± CI æŒ‰éœ€ä¸‹è½½ï¼›tokenizer/config å…ƒæ•°æ®å…¥åº“ï¼‰
 **/model.safetensors
+
+# OpenBLAS é»„éæµ‚E¼ˆ51MBï¼ï¿½¼Œä¸‹è½½æ–¹æ³•è§? README ç ¢é æ±‚ç æ±‚ç?‚ç??‰ç”?Release ä¸ x64.zip æ ‡å‡† 32 ä½?int åŒ?x64_64 æ˜?64 ä½?int ABIï¼?
+third_party/openblas/

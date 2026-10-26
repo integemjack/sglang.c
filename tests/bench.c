@@ -30,6 +30,19 @@ int main(void) {
 
   /* 预热 + 3 次取最小 */
 #define BEST3(fn) ({ double best = 1e9; for (int r = 0; r < 3; r++) { double s0 = now(); fn; double d = now() - s0; if (d < best) best = d; } best; })
+
+  /* t12: 大 M（prefill）形状 [256,2048]x[2048,2048]——OpenBLAS 分派阈值(4M MAC)
+   * 以上；SGL_BLAS=0/1 各跑一次本进程对比（分派在首次调用后固定）*/
+  enum { MB = 256 };
+  float *Ab = (float *)sgl_xmalloc(sizeof(float) * (size_t)MB * E);
+  float *Cb = (float *)sgl_xmalloc(sizeof(float) * (size_t)MB * E);
+  for (int i = 0; i < MB * E; i++) Ab[i] = (float)sin(i * 0.21);
+  double dmb = BEST3(sgl_matmul_nt(Ab, W1, NULL, Cb, MB, E, E));
+  const char *bb2 = getenv("SGL_BLAS");
+  printf("matmul_nt  [%d,%d]x[%d,%d]  (SGL_BLAS=%s): %.1f ms (%.2f GFLOPs)\n",
+         MB, E, E, E, (bb2 && atoi(bb2) == 0) ? "0/builtin" : "1/allowed",
+         dmb * 1e3, 2.0 * MB * E * E / dmb / 1e9);
+
   double d1 = BEST3(sgl_matmul_nt(A, W1, NULL, C, 1, E, E));
   double d2 = BEST3(sgl_matmul_nt(A, W2, NULL, C, 1, E, I));
   double d3 = BEST3(sgl_matmul_w8a16(A, W8, s8, NULL, C, 1, E, I));

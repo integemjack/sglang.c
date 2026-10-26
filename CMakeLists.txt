@@ -52,6 +52,8 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   # NOTE: WinLibs GCC 16.2 (ucrt) 在本机 (i7-10700F) 上启用 AVX2 (-march=native/-mavx2)
   # 会间歇性 0xC0000005（最小复现：纯栈代码按值传 80B 结构体 + printf，无堆内存）。
   # 默认 SSE2 与 -march=x86-64-v2 实测 25/25 稳定。等工具链修复后再启用 AVX2。
+  # （t12.2 之后：AVX2 已由 ops.c 的手写 intrinsics + target attribute 按 DOT 单点启用，
+  #  不依赖全局 -mavx2，运行时 __builtin_cpu_supports 检测、QEMU 自动回退 SSE2。）
   # x86-64-v2 仅限 x86_64；arm64 (Apple Silicon / linux-arm64 CI) 不加架构旗标。
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
     target_compile_options(sgl PUBLIC -O2 -funroll-loops)
@@ -60,6 +62,23 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   endif()
   if(WIN32)
     target_compile_definitions(sgl PUBLIC __USE_MINGW_ANSI_STDIO=1) # %zu 等在 msvcrt printf 不支持
+  endif()
+endif()
+
+# ---- t12.1 OpenBLAS 运行时分派（可选）----
+# ops.c 在运行时 LoadLibrary libopenblas.dll（SGL_BLAS=0 可强制内置路径）；
+# SGL_OPENBLAS=ON 只把 third_party 预编译 dll 拷到可执行文件目录，方便被找到。
+option(SGL_OPENBLAS "Copy bundled OpenBLAS (third_party/openblas) next to binaries" OFF)
+if(SGL_OPENBLAS)
+  set(SGL_OPENBLAS_DLL ${CMAKE_CURRENT_SOURCE_DIR}/third_party/openblas/bin/libopenblas.dll)
+  if(EXISTS ${SGL_OPENBLAS_DLL})
+    # ALL target：每次构建都检查（copy_if_different），third_party 换包后自动同步
+    add_custom_target(openblas_dll ALL
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SGL_OPENBLAS_DLL}
+              ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+    message(STATUS "OpenBLAS: bundled dll will be copied (runtime dispatch, SGL_BLAS=0 to disable)")
+  else()
+    message(WARNING "SGL_OPENBLAS=ON but ${SGL_OPENBLAS_DLL} missing (fetch OpenBLAS-0.3.29_x64_64.zip into third_party/openblas)")
   endif()
 endif()
 
@@ -151,10 +170,12 @@ if(SGL_CUDA)
   target_link_libraries(cuda_test PRIVATE sgl_cuda)
   add_executable(cuda_cli apps/cuda_cli.c)
   target_link_libraries(cuda_cli PRIVATE sgl_cuda)
+  add_executable(long_vcpu tests/long_vcpu.c)  # t2 acceptance: 8K prefill GPU vs CPU
+  target_link_libraries(long_vcpu PRIVATE sgl_cuda)
   add_executable(cuda_http apps/cuda_http.c)
   target_link_libraries(cuda_http PRIVATE sgl_cuda ws2_32)
   if(MSVC)
-    foreach(t cuda_test cuda_cli cuda_http)
+    foreach(t cuda_test cuda_cli long_vcpu cuda_http)
       target_link_libraries(${t} PRIVATE
           "${CUDA_TOOLKIT_DIR}/lib/x64/cudart_static.lib"
           "${CUDA_TOOLKIT_DIR}/lib/x64/cublas.lib")
