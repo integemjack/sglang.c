@@ -1,6 +1,8 @@
 """gen_lora.py - build a random PEFT-format LoRA adapter for testing.
-usage: python gen_lora.py <model_dir> <out_dir> [rank=8] [alpha=16]
+usage: python gen_lora.py <model_dir> <out_dir> [rank=8] [alpha=16] [--seed N]
 Targets q/k/v/o/gate/up/down projections of llama-family models; scale=alpha/rank.
+--seed controls the adapter randomness (default 42: keeps the historical
+models/test-lora adapter bit-identical across regenerations).
 """
 import json
 import os
@@ -9,10 +11,15 @@ import sys
 
 import numpy as np
 
-MODEL = sys.argv[1]
-OUT = sys.argv[2]
-RANK = int(sys.argv[3]) if len(sys.argv) > 3 else 8
-ALPHA = float(sys.argv[4]) if len(sys.argv) > 4 else 16.0
+_args = sys.argv[1:]
+SEED = 42
+if "--seed" in _args:
+    i = _args.index("--seed")
+    SEED = int(_args[i + 1])
+    _args = _args[:i] + _args[i + 2:]
+MODEL, OUT = _args[0], _args[1]
+RANK = int(_args[2]) if len(_args) > 2 else 8
+ALPHA = float(_args[3]) if len(_args) > 3 else 16.0
 
 cfg = json.load(open(f"{MODEL}/config.json"))
 L = cfg["num_hidden_layers"]
@@ -23,7 +30,7 @@ H = cfg["num_attention_heads"]
 D = cfg.get("head_dim", E // H)
 KD = D * KVH
 
-rng = np.random.default_rng(42)
+rng = np.random.default_rng(SEED)
 tensors = {}
 shapes = {
     "self_attn.q_proj": (E, E),
@@ -59,4 +66,4 @@ with open(f"{OUT}/adapter.safetensors", "wb") as f:
 json.dump({"peft_type": "LORA", "r": RANK, "lora_alpha": ALPHA,
            "target_modules": list(shapes.keys())},
           open(f"{OUT}/adapter_config.json", "w"), indent=1)
-print(f"saved {OUT}/adapter.safetensors: {len(tensors)} tensors, rank={RANK} alpha={ALPHA}")
+print(f"saved {OUT}/adapter.safetensors: {len(tensors)} tensors, rank={RANK} alpha={ALPHA} seed={SEED}")

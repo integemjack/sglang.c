@@ -326,6 +326,23 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
   sgl_json *j = sgl_json_parse(req->body, req->body_len);
   if (!j) { respond_error(fd, 400, "invalid JSON body"); return; }
 
+  /* 可选顶层字段 "lora":"name"：路由到启动时 --lora 加载的 adapter 实例
+   * （/generate 与 /v1/chat/completions 及 /v1/completions 均支持；未知名 → 400）*/
+  char lora_name[128] = "";
+  const char *lora_req = sgl_json_get_str(j, "lora", NULL);
+  if (lora_req && *lora_req) {
+    if (sgl_sched_find_lora(srv->sched, lora_req) < 0) {
+      char msg[192];
+      snprintf(msg, sizeof(msg),
+               "unknown lora '%s' (load adapters at startup with --lora name=dir)", lora_req);
+      sgl_json_free(j);
+      respond_error(fd, 400, msg);
+      return;
+    }
+    snprintf(lora_name, sizeof(lora_name), "%s", lora_req);
+  }
+  const char *lor = lora_name[0] ? lora_name : NULL;
+
   const char *text = NULL;
   sgl_sampling_params sp;
   memset(&sp, 0, sizeof(sp));
@@ -421,8 +438,9 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
   for (int i = 0; i < n_choices; i++) {
     sgl_sampling_params spi = sp;
     if (i > 0) spi.seed = sp.seed ? sp.seed + (uint64_t)i : (uint64_t)(0x1234 + i);
-    ids[i] = is_stream ? sgl_sched_submit_stream(srv->sched, text, max_new, &spi)
-                       : sgl_sched_submit(srv->sched, text, max_new, &spi);
+    ids[i] = is_stream
+        ? sgl_sched_submit_stream_lora(srv->sched, text, max_new, &spi, lor)
+        : sgl_sched_submit_lora(srv->sched, text, max_new, &spi, lor);
     if (ids[i] < 0) break;
   }
   pthread_mutex_unlock(&srv->lock);

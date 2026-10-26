@@ -65,4 +65,23 @@ int sgl_sched_submit_stream(sgl_scheduler *s, const char *text, int max_new,
 /* 回收一个已流式取尽的请求（与 poll 同语义地标记已取走）*/
 void sgl_sched_reclaim_stream(sgl_scheduler *s, int req_id);
 
+/* ---- 多 LoRA 实例池（方案 B）----
+ * 每个 adapter 一份「base+合并 delta」的完整 sgl_model 副本（独立 KV 池），
+ * 请求按 lora 名路由到对应实例；lora=NULL 走 base 实例（下标 0）。
+ * 复用现有加载+合并代码路径（sgl_model_load 读 SGL_LORA 环境变量）。*/
+
+/* 加一个 LoRA 实例：内部临时设 SGL_LORA=lora_dir 再 sgl_model_load(model_dir)，
+ * 完成后恢复原环境。成功返回实例下标（≥1），失败 -1。 */
+int sgl_sched_add_lora(sgl_scheduler *s, const char *name, const char *model_dir,
+                       const char *lora_dir);
+
+/* lora 名 → 实例下标；NULL/"" → 0（base）；未知名 → -1 */
+int sgl_sched_find_lora(const sgl_scheduler *s, const char *name);
+
+/* 同 submit / submit_stream，但按 lora 名路由实例；未知名返回 -1 */
+int sgl_sched_submit_lora(sgl_scheduler *s, const char *text, int max_new,
+                          const sgl_sampling_params *sp, const char *lora);
+int sgl_sched_submit_stream_lora(sgl_scheduler *s, const char *text, int max_new,
+                                 const sgl_sampling_params *sp, const char *lora);
+
 #endif
