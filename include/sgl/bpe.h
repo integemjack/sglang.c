@@ -25,6 +25,11 @@ int sgl_tokenizer_style(const sgl_tokenizer *t); /* 0=gpt2 byte-level 1=llama SP
 int *sgl_tokenizer_encode(const sgl_tokenizer *t, const char *text, size_t len,
                           int *out_n);
 
+/* G12: 查一个「字面量 token」的 id（added_tokens 里的特殊 token，如 "<image>"）。
+ * 返回 -1 表示不在词表里。注意：它不是 sgl_tokenizer_encode 的逆向——只查整段
+ * 与 piece 完全相等的那一个 token。*/
+int sgl_tokenizer_piece_id(const sgl_tokenizer *t, const char *piece);
+
 /* 返回 malloc 的 NUL 结尾 UTF-8 字符串；调用方 free。 */
 char *sgl_tokenizer_decode(const sgl_tokenizer *t, const int *ids, int n);
 

@@ -223,9 +223,50 @@ void sgl_image_center_crop(const unsigned char *src, int sw, int sh,
            (size_t)cw * 3);
 }
 
+int sgl_projector_init(sgl_projector *p, const float *w1, const float *b1,
+                       int64_t n1, int64_t k1, const float *w2, const float *b2,
+                       int64_t n2, int64_t k2) {
+  if (!p || !w1) return -1;
+  memset(p, 0, sizeof(*p));
+  if (!w2) { /* 单层 linear */
+    p->w1 = w1; p->b1 = b1; p->in = (int)k1; p->out = (int)n1; p->mid = 0; p->act = 0;
+    return 0;
+  }
+  if (k2 != n1) return -1; /* 第一层输出宽度必须等于第二层输入宽度 */
+  p->w1 = w1; p->b1 = b1; p->w2 = w2; p->b2 = b2;
+  p->in = (int)k1; p->mid = (int)n1; p->out = (int)n2;
+  p->act = 1; /* llava 的 mm_projector 用 GELU（erf）*/
+  return 0;
+}
+
+void sgl_projector_apply(const sgl_projector *p, const float *x, int n, float *out) {
+  if (!p || !p->w1 || n <= 0) return;
+  if (!p->w2 || p->mid <= 0) {
+    sgl_matmul_nt(x, p->w1, p->b1, out, n, p->out, p->in);
+    return;
+  }
+  float *mid = (float *)sgl_xmalloc(sizeof(float) * (size_t)n * (size_t)p->mid);
+  sgl_matmul_nt(x, p->w1, p->b1, mid, n, p->mid, p->in);
+  if (p->act == 1) {
+    /* GELU（erf 版，同 torch.nn.functional.gelu 默认）：0.5x(1+erf(x/√2)) */
+    for (size_t i = 0; i < (size_t)n * (size_t)p->mid; i++)
+      mid[i] = 0.5f * mid[i] * (1.0f + erff(mid[i] * 0.70710678f));
+  }
+  sgl_matmul_nt(mid, p->w2, p->b2, out, n, p->out, p->mid);
+  sgl_xfree(mid);
+}
+
 int sgl_clip_project_bytes(const unsigned char *bytes, size_t n, const sgl_clip *c,
                            const float *proj_w, const float *proj_b, int e_lm,
                            float **out, int *n_out) {
+  sgl_projector pj;
+  if (sgl_projector_init(&pj, proj_w, proj_b, e_lm, c->E, NULL, NULL, 0, 0) != 0) return -1;
+  return sgl_clip_project_bytes_pj(bytes, n, c, &pj, out, n_out);
+}
+
+/* G12: 带完整 projector（单层 linear 或两层 MLP）的版本。 */
+int sgl_clip_project_bytes_pj(const unsigned char *bytes, size_t n, const sgl_clip *c,
+                              const sgl_projector *pj, float **out, int *n_out) {
   unsigned char *rgb = NULL;
   int w = 0, h = 0;
   if (sgl_image_decode_rgb(bytes, n, &rgb, &w, &h) != 0) return -1;
@@ -240,11 +281,11 @@ int sgl_clip_project_bytes(const unsigned char *bytes, size_t n, const sgl_clip 
     return -1;
   }
   sgl_xfree(chw);
-  float *lm = (float *)sgl_xmalloc(sizeof(float) * (size_t)NP * e_lm);
-  sgl_matmul_nt(feats, proj_w, proj_b, lm, NP, e_lm, E);
+  float *lm = (float *)sgl_xmalloc(sizeof(float) * (size_t)NP * (size_t)pj->out);
+  sgl_projector_apply(pj, feats, NP, lm);
   sgl_xfree(feats);
   *out = lm;
-  *n_out = NP * e_lm;
+  *n_out = NP * pj->out;
   return 0;
 }
 

@@ -82,9 +82,15 @@ feats = x[1:]                                            # [NP, E]
 pooled = ln(x[0], W["vision_model.post_layernorm.weight"],
                   W["vision_model.post_layernorm.bias"])   # [E]
 img_emb = pooled @ W["visual_projection.weight"].T          # [PROJ]
-proj = feats @ PJ["linear_1.weight"].T + PJ["linear_1.bias"]  # [NP, LM_E]
-
+proj = feats @ PJ["linear_1.weight"].T + PJ["linear_1.bias"]  # [NP, MID] 或 [NP, LM_E]
+if "linear_2.weight" in PJ:
+    # G12: 真实 llava-1.5 的两层 MLP：linear_1 -> GELU(erf) -> linear_2
+    # （torch.nn.functional.gelu 默认近似为 'none' = erf 版）
+    from math import erf, sqrt
+    act = np.vectorize(lambda v: 0.5 * v * (1.0 + erf(v / sqrt(2.0))))(proj)
+    proj = act @ PJ["linear_2.weight"].T + PJ["linear_2.bias"]
 out = {"n_patch": NP, "feat_dim": E, "proj_dim": E,
+       "projector": ("mlp" if "linear_2.weight" in PJ else "linear"),
        "feats_mean": float(feats.mean()), "feats_maxerr_base": float(np.abs(feats).mean()),
        "pooled_checksum": float(pooled.sum()), "img_emb_checksum": float(img_emb.sum()),
        "proj_first": proj[0][:8].tolist(), "proj_last": proj[-1][:8].tolist(),

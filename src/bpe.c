@@ -289,6 +289,14 @@ void sgl_tokenizer_free(sgl_tokenizer *t) {
 
 int sgl_tokenizer_vocab_size(const sgl_tokenizer *t) { return t->vocab_size; }
 int sgl_tokenizer_eos_id(const sgl_tokenizer *t) { return t->eos_id; }
+
+/* G12: 字面量 token 查 id（如 llava 的 "<image>"）*/
+int sgl_tokenizer_piece_id(const sgl_tokenizer *t, const char *piece) {
+  if (!t || !piece) return -1;
+  for (int i = 0; i < t->n_added; i++)
+    if (t->added_tokens[i] && strcmp(t->added_tokens[i], piece) == 0) return t->added_ids[i];
+  return -1;
+}
 int sgl_tokenizer_bos_id(const sgl_tokenizer *t) { return t->bos_id; }
 int sgl_tokenizer_style(const sgl_tokenizer *t) { return t->style; }
 
@@ -507,28 +515,16 @@ static int *sp_encode(const sgl_tokenizer *t, const char *text, size_t len,
   return ids;
 }
 
-int *sgl_tokenizer_encode(const sgl_tokenizer *t, const char *text, size_t len,
-                          int *out_n) {
-  if (t->style == 1) return sp_encode(t, text, len, out_n);
-  int max_tokens = (int)len * 2 + 16;
-  int *ids = (int *)sgl_xmalloc(sizeof(int) * (size_t)max_tokens);
-  int nids = 0;
-
+/* G12: 纯 BPE 编码（不处理 added token 字面量）。原 sgl_tokenizer_encode 的主体，
+ * 提出来是为了先按 added token 切文本再逐段编码 —— HF 是在 pre-tokenize 之前就
+ * 切出特殊 token 的，所以在段中间出现的 "<image>" 也必须是一个 token。
+ * （以前的实现只在「段首」匹配 added token，于是 "USER: <image> ..." 里的
+ *  "<image>" 被 "符号类" 段吃进去，变成 2 个普通 token。）*/
+static void gpt2_encode_plain(const sgl_tokenizer *t, const char *text, size_t len,
+                              int *ids, int max_tokens, int *nids_io) {
+  int nids = *nids_io;
   size_t i = 0;
   while (i < len) {
-    /* 先检测 added token 字面量（<|endoftext|> 等）*/
-    int matched = 0;
-    for (int a = 0; a < t->n_added; a++) {
-      size_t l = strlen(t->added_tokens[a]);
-      if (l && i + l <= len && memcmp(text + i, t->added_tokens[a], l) == 0) {
-        ids[nids++] = t->added_ids[a];
-        i += l;
-        matched = 1;
-        break;
-      }
-    }
-    if (matched) continue;
-
     scanner sc = {(const unsigned char *)text, len, (int)i};
     int start, end;
     if (!scan_next(&sc, &start, &end)) break;
@@ -549,6 +545,39 @@ int *sgl_tokenizer_encode(const sgl_tokenizer *t, const char *text, size_t len,
     nids += bpe_word(t, word, nword, ids + nids, max_tokens - nids, &a);
     sgl_xfree(word);
     sgl_xfree(a.buf);
+  }
+  *nids_io = nids;
+}
+
+int *sgl_tokenizer_encode(const sgl_tokenizer *t, const char *text, size_t len,
+                          int *out_n) {
+  if (t->style == 1) return sp_encode(t, text, len, out_n);
+  int max_tokens = (int)len * 2 + 16;
+  int *ids = (int *)sgl_xmalloc(sizeof(int) * (size_t)max_tokens);
+  int nids = 0;
+
+  size_t i = 0;
+  while (i < len) {
+    /* G12: 找从 i 开始最早出现的 added token 字面量（任何位置，不限段首）*/
+    size_t best = len;
+    int best_a = -1;
+    for (int a = 0; a < t->n_added; a++) {
+      size_t l = strlen(t->added_tokens[a]);
+      if (!l) continue;
+      for (size_t p = i; p + l <= len; p++) {
+        if (memcmp(text + p, t->added_tokens[a], l) == 0) {
+          if (p < best) { best = p; best_a = a; }
+          break;
+        }
+      }
+    }
+    if (best_a < 0) {
+      gpt2_encode_plain(t, text + i, len - i, ids, max_tokens, &nids);
+      break;
+    }
+    if (best > i) gpt2_encode_plain(t, text + i, best - i, ids, max_tokens, &nids);
+    ids[nids++] = t->added_ids[best_a];
+    i = best + strlen(t->added_tokens[best_a]);
   }
   *out_n = nids;
   return ids;

@@ -40,19 +40,20 @@ static double now_sec(void) {
  * http.c 收到 OpenAI vision 风格的 image_url 后，把图片字节交给这个回调：
  * 解码 → resize/crop → 归一化 → CLIP 视觉塔 → mm_projector → [n_img][E_lm]。 */
 static sgl_clip *g_clip;
-static float *g_pj_w, *g_pj_b;
-static int g_e_lm;
+static float *g_pj_w, *g_pj_b, *g_pj_w2, *g_pj_b2;
+static int g_e_lm, g_pj_mid;
+static sgl_projector g_pj; /* G12: 单层 linear 或两层 MLP（linear_1→GELU→linear_2）*/
 
 static float *vision_cb(void *ud, const unsigned char *bytes, size_t n,
                         int *n_img, int *e_lm) {
   (void)ud;
-  if (!g_clip || !g_pj_w) return NULL;
+  if (!g_clip || !g_pj.w1) return NULL;
   float *out = NULL;
   int nn = 0;
-  if (sgl_clip_project_bytes(bytes, n, g_clip, g_pj_w, g_pj_b, g_e_lm, &out, &nn) != 0)
+  if (sgl_clip_project_bytes_pj(bytes, n, g_clip, &g_pj, &out, &nn) != 0)
     return NULL;
   *n_img = g_clip->n_patch;
-  *e_lm = g_e_lm;
+  *e_lm = g_pj.out;
   return out;
 }
 
@@ -83,26 +84,61 @@ static int vision_load(const char *clip_dir, const char *proj_path, int e_lm) {
   if (!g_clip) return -1;
   sgl_st_ctx *st = sgl_st_open(proj_path);
   if (!st) { sgl_clip_free(g_clip); g_clip = NULL; return -1; }
-  sgl_tensor w = sgl_st_get(st, "linear_1.weight", 2, (int64_t[]){e_lm, g_clip->E});
-  sgl_tensor b = sgl_st_get(st, "linear_1.bias", 1, (int64_t[]){e_lm});
+  /* G12: 从权重形状自动判层数。llava 官方检查点里 mm_projector 是
+   * Sequential(Linear, GELU, Linear)，导出成 linear_1 / linear_2 两个 Linear；
+   * 也有只导一层的旧权重（t10 的随机模型）。*/
+  int E = g_clip->E;
+  int mid = 0, has2 = 0;
+  /* 先按 e_lm 试，再按「任意 2D」试（mid != e_lm 的小模型也要能认）。*/
+  sgl_tensor w2 = sgl_st_get(st, "linear_2.weight", 2, (int64_t[]){e_lm, e_lm});
+  if (!w2.data) w2 = sgl_st_get(st, "linear_2.weight", -1, NULL); /* -1 = 不限维数/形状 */
+  if (w2.data && w2.ndim == 2) has2 = 1;
+  if (has2) mid = (int)w2.shape[1];
+  sgl_tensor w = sgl_st_get(st, "linear_1.weight", 2,
+                            has2 ? (int64_t[]){mid, E} : (int64_t[]){e_lm, E});
+  if (!w.data && has2) w = sgl_st_get(st, "linear_1.weight", -1, NULL);
   if (!w.data) {
-    SGL_ERROR("vision: %s 里没 linear_1.weight [%d,%d]", proj_path, e_lm, g_clip->E);
+    SGL_ERROR("vision: %s 里没 linear_1.weight [%d,%d]", proj_path, e_lm, E);
     sgl_st_close(st);
     sgl_clip_free(g_clip);
     g_clip = NULL;
     return -1;
   }
-  g_pj_w = (float *)sgl_xmalloc(sizeof(float) * (size_t)e_lm * (size_t)g_clip->E);
-  memcpy(g_pj_w, w.data, sizeof(float) * (size_t)e_lm * (size_t)g_clip->E);
+  int rows1 = (int)w.shape[0];
+  g_pj_w = (float *)sgl_xmalloc(sizeof(float) * (size_t)rows1 * (size_t)E);
+  memcpy(g_pj_w, w.data, sizeof(float) * (size_t)rows1 * (size_t)E);
+  sgl_tensor b = sgl_st_get(st, "linear_1.bias", 1, (int64_t[]){rows1});
   if (b.data) {
-    g_pj_b = (float *)sgl_xmalloc(sizeof(float) * (size_t)e_lm);
-    memcpy(g_pj_b, b.data, sizeof(float) * (size_t)e_lm);
+    g_pj_b = (float *)sgl_xmalloc(sizeof(float) * (size_t)rows1);
+    memcpy(g_pj_b, b.data, sizeof(float) * (size_t)rows1);
   }
+  if (has2) {
+    g_pj_w2 = (float *)sgl_xmalloc(sizeof(float) * (size_t)e_lm * (size_t)mid);
+    memcpy(g_pj_w2, w2.data, sizeof(float) * (size_t)e_lm * (size_t)mid);
+    sgl_tensor b2 = sgl_st_get(st, "linear_2.bias", 1, (int64_t[]){e_lm});
+    if (b2.data) {
+      g_pj_b2 = (float *)sgl_xmalloc(sizeof(float) * (size_t)e_lm);
+      memcpy(g_pj_b2, b2.data, sizeof(float) * (size_t)e_lm);
+    }
+  }
+  if (sgl_projector_init(&g_pj, g_pj_w, g_pj_b, rows1, E,
+                         has2 ? g_pj_w2 : NULL, has2 ? g_pj_b2 : NULL,
+                         has2 ? e_lm : 0, has2 ? mid : 0) != 0) {
+    SGL_ERROR("vision: projector 形状不匹配 ([%d,%d] + [%d,%d])", rows1, E, e_lm, mid);
+    sgl_st_close(st);
+    sgl_clip_free(g_clip);
+    g_clip = NULL;
+    return -1;
+  }
+  g_pj_mid = has2 ? mid : 0;
   sgl_st_close(st);
-  g_e_lm = e_lm;
-  SGL_INFO("vision ready: CLIP E=%d L=%d P=%d img=%d NP=%d quick_gelu=%d, projector [%d,%d]",
+  g_e_lm = g_pj.out;
+  SGL_INFO("vision ready: CLIP E=%d L=%d P=%d img=%d NP=%d quick_gelu=%d, "
+           "projector %s %d->%s%d",
            g_clip->E, g_clip->L, g_clip->P, g_clip->img, g_clip->n_patch,
-           g_clip->act == SGL_CLIP_ACT_QUICK, e_lm, g_clip->E);
+           g_clip->act == SGL_CLIP_ACT_QUICK,
+           has2 ? "MLP(linear_1-gelu-linear_2)" : "linear", E,
+           has2 ? "(mid " : "(", has2 ? mid : g_e_lm);
   return 0;
 }
 

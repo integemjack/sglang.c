@@ -68,8 +68,10 @@ typedef struct {
   int eos;
   int seg_len; /* ctx / MAX_CONC */
   sgl_clip *clip;      /* t10: vision tower, NULL when model dir has no clip_config.json */
-  float *pj_w, *pj_b;  /* mm_projector linear [E_lm][proj_in] + [E_lm] */
-  int pj_in;
+  float *pj_w, *pj_b;  /* mm_projector linear_1 [mid][proj_in] + [mid] */
+  float *pj_w2, *pj_b2; /* G12: linear_2 [E_lm][mid] + [E_lm]（NULL = 单层 linear）*/
+  int pj_in, pj_mid;
+  sgl_projector pj;    /* G12: 统一走这个（单层/两层自动）*/
   request *reqs[MAX_CONC];
   int n_active;
   request *waitq_head, *waitq_tail; /* t5: queue beyond ACTIVE_CONC */
@@ -249,8 +251,7 @@ static float *vision_feats(const char *url, int *n_out) {
     if (sgl_base64_decode(p, strlen(p), &bytes, &bn) != 0) return NULL;
     float *out = NULL;
     int nn = 0;
-    int rc = sgl_clip_project_bytes(bytes, bn, E.clip, E.pj_w, E.pj_b,
-                                    E.cpu->n_embd, &out, &nn);
+    int rc = sgl_clip_project_bytes_pj(bytes, bn, E.clip, &E.pj, &out, &nn);
     sgl_xfree(bytes);
     if (rc != 0 || !out) {
       sgl_xfree(out);
@@ -1070,11 +1071,22 @@ int main(int argc, char **argv) {
      if (E.clip) {
        snprintf(cpath, sizeof(cpath), "%s/projector.safetensors", dir);
        sgl_st_ctx *pst = sgl_st_open(cpath);
-       sgl_tensor w1 = {0}, b1 = {0};
+       sgl_tensor w1 = {0}, b1 = {0}, w2 = {0}, b2 = {0};
        if (pst) {
+         /* G12: 自动判层数 —— 有 linear_2 就是两层 MLP（linear_1→GELU→linear_2）。
+          * llava-1.5 的真实 mm_projector 就是两层：[4096,4096] + [4096,4096]。*/
          int64_t lm_e = E.cpu->n_embd;
-         w1 = sgl_st_get(pst, "linear_1.weight", 2, (int64_t[]){lm_e, E.clip->proj_dim});
-         b1 = sgl_st_get(pst, "linear_1.bias", 1, (int64_t[]){lm_e});
+         w2 = sgl_st_get(pst, "linear_2.weight", -1, NULL);
+         if (w2.data && w2.ndim == 2) {
+           int64_t mid = w2.shape[0];
+           w1 = sgl_st_get(pst, "linear_1.weight", 2, (int64_t[]){mid, E.clip->proj_dim});
+           b1 = sgl_st_get(pst, "linear_1.bias", 1, (int64_t[]){mid});
+           b2 = sgl_st_get(pst, "linear_2.bias", 1, (int64_t[]){lm_e});
+         } else {
+           w2 = (sgl_tensor){0};
+           w1 = sgl_st_get(pst, "linear_1.weight", 2, (int64_t[]){lm_e, E.clip->proj_dim});
+           b1 = sgl_st_get(pst, "linear_1.bias", 1, (int64_t[]){lm_e});
+         }
        }
        if (!w1.data || !b1.data) {
          fprintf(stderr, "[mm] projector.safetensors missing/mismatched — vision disabled\n");
@@ -1084,9 +1096,22 @@ int main(int argc, char **argv) {
                               (never closed — server lifetime) */
          E.pj_b = b1.data;
          E.pj_in = E.clip->proj_dim;
-         printf("[mm] vision tower ON: CLIP E=%d L=%d patch=%d NP=%d proj=%d -> lm E=%d\n",
-                E.clip->E, E.clip->L, E.clip->P, E.clip->n_patch, E.clip->proj_dim,
-                E.cpu->n_embd);
+         if (w2.data) {
+           E.pj_w2 = w2.data;
+           E.pj_b2 = b2.data;
+           E.pj_mid = (int)w2.shape[0];
+         }
+         if (sgl_projector_init(&E.pj, E.pj_w, E.pj_b, w2.data ? E.pj_mid : E.cpu->n_embd,
+                                E.clip->proj_dim, E.pj_w2, E.pj_b2,
+                                w2.data ? E.cpu->n_embd : 0, E.pj_mid) != 0) {
+           fprintf(stderr, "[mm] projector shape mismatch — vision disabled\n");
+           sgl_clip_free(E.clip); E.clip = NULL;
+         } else {
+           printf("[mm] vision tower ON: CLIP E=%d L=%d patch=%d NP=%d proj=%d -> lm E=%d "
+                  "(%s projector)\n",
+                  E.clip->E, E.clip->L, E.clip->P, E.clip->n_patch, E.clip->proj_dim,
+                  E.cpu->n_embd, w2.data ? "2-layer MLP" : "1-layer linear");
+         }
        }
      }
    }

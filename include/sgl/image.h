@@ -8,8 +8,19 @@
 #define SGL_IMAGE_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "sgl/clip.h"
+
+/* G12: llava 的 mm_projector。真实 llava-1.5 是两层 MLP：
+ *   x = linear_1(clip_feat) -> GELU -> linear_2(...)
+ * 老的单层 linear 写法保留（w2 == NULL 时退化成单层）。
+ * w1: [mid][in]，b1: [mid]；w2: [out][mid]，b2: [out]；均为行主序（PyTorch Linear 布局）。
+ * act: 0 = 无激活，1 = GELU（erf 版，llava 的 ACT2FN["gelu"]）。 */
+typedef struct sgl_projector {
+  const float *w1, *b1, *w2, *b2;
+  int in, mid, out, act;
+} sgl_projector;
 
 /* CLIP 默认均值/方差（HF preprocessor_config.json 的 image_mean/std）*/
 extern const float sgl_clip_mean[3];
@@ -37,13 +48,28 @@ void sgl_image_center_crop(const unsigned char *src, int sw, int sh,
 void sgl_clip_preprocess(const unsigned char *rgb, int w, int h, int size,
                          const float *mean, const float *stdv, float *chw);
 
-/* G8 一站式（CPU）：图片字节（JPEG/PNG）→ 解码 → resize/crop → 归一化
+/* 从 mm_projector 的权重形状自动判层数：
+ *   w2 == NULL                 → 单层 linear（w1: [out][in]）
+ *   w1: [mid][in] + w2: [out][mid] → 两层 MLP（act = GELU）
+ * 返回 0 成功，-1 形状不匹配（w2 的列数必须等于 w1 的行数）。 */
+int sgl_projector_init(sgl_projector *p, const float *w1, const float *b1,
+                       int64_t n1, int64_t k1, const float *w2, const float *b2,
+                       int64_t n2, int64_t k2);
+
+/* 把 [n][in] 特征过 projector → [n][out]（out 由调用方分配）*/
+void sgl_projector_apply(const sgl_projector *p, const float *x, int n, float *out);
+
+/* G8 一站式（CPU，单层 linear）：图片字节（JPEG/PNG）→ 解码 → resize/crop → 归一化
  * → CLIP 视觉塔（last_hidden_state 的 patch 行）→ mm_projector → LM 空间特征。
- * proj_w: [e_lm][clip_E] 行主序（llava-1.5 的 linear_1，单层简化）；proj_b 可为 NULL。
+ * proj_w: [e_lm][clip_E] 行主序；proj_b 可为 NULL。
  * out: sgl_xmalloc 的 [n_img][e_lm]（调用方 sgl_xfree），*n_out = n_img * e_lm。
  * 返回 0 成功。 */
 int sgl_clip_project_bytes(const unsigned char *bytes, size_t n, const sgl_clip *c,
                            const float *proj_w, const float *proj_b, int e_lm,
                            float **out, int *n_out);
+
+/* G12: 完整 projector 版（单层 linear 或两层 MLP，见 sgl_projector）。*/
+int sgl_clip_project_bytes_pj(const unsigned char *bytes, size_t n, const sgl_clip *c,
+                              const sgl_projector *pj, float **out, int *n_out);
 
 #endif

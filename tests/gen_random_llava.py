@@ -1,7 +1,9 @@
-"""t10: 随机权重 LLaVA 结构模型（小 CLIP + 单层 projector），验证多模态融合路径。
+"""t10/G12: 随机权重 LLaVA 结构模型（小 CLIP + mm_projector）。
 权重布局/语义与真实 HF CLIPVisionModel 一致（G8）：双向 attention、learnable pos emb、
 pre_layrnorm 带仿射、quick_gelu MLP、post_layernorm 只作用 pooled cls、encode 输出 patch 行。
-用法: python gen_random_llava.py <out_dir>
+G12: projector 默认两层 MLP（linear_1 → GELU → linear_2，MU=LM_E），与真实 llava-1.5 一致；
+`--mlp 0` 可生成旧的单层 linear 变体（t10 兼容）。
+用法: python gen_random_llava.py <out_dir> [--mlp 0|1] [--lm-e N] [--mid N]
 产物: clip_config.json + clip_model.safetensors + projector.safetensors + image.raw"""
 import json, os, struct, sys
 import numpy as np
@@ -14,6 +16,13 @@ if "--out" in _argv and _argv.index("--out") + 1 < len(_argv):
     out = _argv[_argv.index("--out") + 1]
 elif "-o" in _argv and _argv.index("-o") + 1 < len(_argv):
     out = _argv[_argv.index("-o") + 1]
+
+def _opt(name, default):
+    if name in _argv and _argv.index(name) + 1 < len(_argv):
+        return int(_argv[_argv.index(name) + 1])
+    return default
+
+USE_MLP = _opt("--mlp", 1)
 E, H, L, P, IMG, I, PROJ = 64, 4, 2, 8, 32, 128, 32   # n_patch=16
 rng = np.random.default_rng(7)
 os.makedirs(out, exist_ok=True)
@@ -64,14 +73,22 @@ def save_st(path, tensors):
             f.write(v.tobytes())
 
 save_st(f"{out}/clip_model.safetensors", W)
-# mm_projector: single linear E -> LM_E（真实语义：视觉塔输出 [n_patch][hidden_size]，
-# visual_projection 只作用于 pooled cls，不作用于 patch 行；G8 对齐）
-# 真实 llava-1.5 是 1024->4096 两层 MLP，这里单层。
-LM_E = 64
-save_st(f"{out}/projector.safetensors",
-        {"linear_1.weight": r(LM_E, E), "linear_1.bias": r(LM_E, s=0.001)})
+# mm_projector: 真实语义是「视觉塔 patch 行 [n_patch][hidden_size] → LM 空间」
+# （visual_projection 只作用于 pooled cls，不作用于 patch 行；G8 对齐）。
+# 真实 llava-1.5 是两层 MLP：linear_1(1024→4096) → GELU → linear_2(4096→4096)。
+LM_E = _opt("--lm-e", 64)
+MID = _opt("--mid", LM_E * 2 if USE_MLP else 0)
+if USE_MLP:
+    save_st(f"{out}/projector.safetensors", {
+        "linear_1.weight": r(MID, E), "linear_1.bias": r(MID, s=0.001),
+        "linear_2.weight": r(LM_E, MID), "linear_2.bias": r(LM_E, s=0.001),
+    })
+else:
+    save_st(f"{out}/projector.safetensors",
+            {"linear_1.weight": r(LM_E, E), "linear_1.bias": r(LM_E, s=0.001)})
 
 # 固定测试图（CHW）
 img = rng.normal(0, 1, (3, IMG, IMG)).astype(np.float32)
 img.tofile(f"{out}/image.raw")
-print(f"saved random llava -> {out} (CLIP E={E} L={L} patch={P} img={IMG} NP={NP} proj={PROJ})")
+print(f"saved random llava -> {out} (CLIP E={E} L={L} patch={P} img={IMG} NP={NP} proj={PROJ}; "
+      f"projector={'MLP %d->%d->%d' % (E, MID, LM_E) if USE_MLP else 'linear %d->%d' % (E, LM_E)})")

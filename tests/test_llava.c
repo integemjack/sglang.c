@@ -121,15 +121,22 @@ int main(int argc, char **argv) {
   printf("[dbg] C feats[0][:4] = %g %g %g %g  feats[NP-1][0] = %g\n",
          feats[0], feats[1], feats[2], feats[3], feats[(size_t)(NP - 1) * PROJ]);
 
-  /* projector: linear_1 [LM_E, E]（输入 = 视觉塔 patch 特征）*/
+  /* projector: G12 自动判层数（linear_1 可能是 [mid, PROJ]，两层 MLP 再加 linear_2）*/
   snprintf(path, sizeof(path), "%s/projector.safetensors", dir);
   sgl_st_ctx *pst = sgl_st_open(path);
   CHECK(pst != NULL, "projector open");
-  sgl_tensor w1 = sgl_st_get(pst, "linear_1.weight", 2, (int64_t[]){64, PROJ});
-  sgl_tensor b1 = sgl_st_get(pst, "linear_1.bias", 1, (int64_t[]){64});
+  sgl_tensor w1 = sgl_st_get(pst, "linear_1.weight", -1, NULL);
+  sgl_tensor b1 = sgl_st_get(pst, "linear_1.bias", -1, NULL);
+  sgl_tensor w2 = sgl_st_get(pst, "linear_2.weight", -1, NULL);
+  sgl_tensor b2 = w2.data ? sgl_st_get(pst, "linear_2.bias", -1, NULL) : sgl_tensor_null();
   CHECK(w1.data && b1.data, "projector tensors");
-  float *proj_c = (float *)sgl_xmalloc(sizeof(float) * (size_t)NP * 64);
-  sgl_matmul_nt(feats, w1.data, b1.data, proj_c, NP, 64, PROJ);
+  int LM_E = w2.data ? (int)w2.shape[0] : (int)w1.shape[0];
+  sgl_projector pj;
+  CHECK(sgl_projector_init(&pj, w1.data, b1.data, w1.shape[0], PROJ,
+                           w2.data, b2.data, w2.data ? w2.shape[0] : 0,
+                           w2.data ? w2.shape[1] : 0) == 0, "projector init");
+  float *proj_c = (float *)sgl_xmalloc(sizeof(float) * (size_t)NP * (size_t)LM_E);
+  sgl_projector_apply(&pj, feats, NP, proj_c);
 
   /* 分层对照：feats（patch 行）与 numpy 全等 */
   {
@@ -183,11 +190,12 @@ int main(int argc, char **argv) {
   const float *rproj = (const float *)(nb + 10 + hlen);
   printf("[dbg] npy hlen=%u first8 = %g %g %g %g\n", hlen, rproj[0], rproj[1], rproj[2], rproj[3]);
   double maxerr = 0;
-  for (size_t i = 0; i < (size_t)NP * 64; i++) {
+  for (size_t i = 0; i < (size_t)NP * (size_t)LM_E; i++) {
     double e = fabs((double)proj_c[i] - rproj[i]);
     if (e > maxerr) maxerr = e;
   }
-  printf("[llava] CLIP+projector vs numpy: maxerr = %.3g over %d x 64\n", maxerr, NP);
+  printf("[llava] CLIP+projector(%s) vs numpy: maxerr = %.3g over %d x %d\n",
+         w2.data ? "2-layer MLP" : "1-layer linear", maxerr, NP, LM_E);
   CHECK(maxerr < 2e-4, "llava numerics diverge: %g", maxerr);
 
   /* ---------- G8 图片解码：真实 JPEG/PNG 字节 → 解码 → 与 PIL 期望像素对照 ----------

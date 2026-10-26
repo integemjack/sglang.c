@@ -16,6 +16,7 @@
 #include "sgl/cuda.h"
 #include "sgl/cuda_spec.h"
 #include "sgl/gpt2.h"
+#include "sgl/image.h" /* G12: sgl_projector（mm_projector 单层/两层）*/
 #include "sgl/json.h"
 #include "sgl/llama.h"
 #include "sgl/ops.h"
@@ -75,16 +76,28 @@ static void mm_gpu_check(void) {
   if (fread(img, sizeof(float), npx, f) != npx) { fclose(f); sgl_xfree(img); sgl_clip_free(cp); sgl_llama_free(lm); return; }
   fclose(f);
   sgl_st_ctx *pst = sgl_st_open("models/llava-rand/projector.safetensors");
-  sgl_tensor w1 = pst ? sgl_st_get(pst, "linear_1.weight", 2, (int64_t[]){lm->n_embd, cp->proj_dim})
-                      : sgl_tensor_null();
-  sgl_tensor b1 = pst ? sgl_st_get(pst, "linear_1.bias", 1, (int64_t[]){lm->n_embd})
-                      : sgl_tensor_null();
+  /* G12: linear_1 的宽度可能是 mid（两层 MLP）而不是 n_embd，所以先宽松取形状 */
+  sgl_tensor w1 = pst ? sgl_st_get(pst, "linear_1.weight", -1, NULL) : sgl_tensor_null();
+  sgl_tensor b1 = pst ? sgl_st_get(pst, "linear_1.bias", -1, NULL) : sgl_tensor_null();
   if (!w1.data || !b1.data) { printf("[mm] projector missing, skip\n"); sgl_xfree(img); sgl_clip_free(cp); sgl_llama_free(lm); if (pst) sgl_st_close(pst); return; }
 
   float *feats = (float *)sgl_xmalloc(sizeof(float) * (size_t)cp->n_patch * cp->proj_dim);
   float *fp2 = (float *)sgl_xmalloc(sizeof(float) * (size_t)cp->n_patch * lm->n_embd);
   CHECK(sgl_clip_encode(cp, img, feats) == 0, "mm clip encode");
-  sgl_matmul_nt(feats, w1.data, b1.data, fp2, cp->n_patch, lm->n_embd, cp->proj_dim);
+  /* G12: 走统一的 projector（单层/两层 MLP 自动）*/
+  {
+    sgl_projector pj;
+    sgl_tensor w2 = pst ? sgl_st_get(pst, "linear_2.weight", -1, NULL) : sgl_tensor_null();
+    if (w2.data && w2.ndim == 2) {
+      sgl_tensor b2 = sgl_st_get(pst, "linear_2.bias", 1, (int64_t[]){lm->n_embd});
+      CHECK(sgl_projector_init(&pj, w1.data, b1.data, w2.shape[0], cp->proj_dim,
+                               w2.data, b2.data, lm->n_embd, w2.shape[0]) == 0, "mm pj init");
+    } else {
+      CHECK(sgl_projector_init(&pj, w1.data, b1.data, lm->n_embd, cp->proj_dim,
+                               NULL, NULL, 0, 0) == 0, "mm pj init 1-layer");
+    }
+    sgl_projector_apply(&pj, feats, cp->n_patch, fp2);
+  }
 
   int ids3[4] = {9707, 1879, 4321, 100};
   int npg[512];

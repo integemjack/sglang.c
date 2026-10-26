@@ -40,6 +40,10 @@ typedef struct {
   int inst;       /* 路由到的实例下标（0=base，≥1=lora）*/
   float *feats;   /* G8: 视觉 token embedding [n_img][E_lm]（sgl_xmalloc，prefill 后释放）*/
   int n_img;      /* G8: 视觉 token 数（0 = 纯文本）*/
+  /* G12: `<image>` 占位符在 prompt 里的位置。>=0 → 视觉 token 插在这里（原占位符
+   * 那个 token 丢掉，位置 = img_at），其后的文本 token 顺延；-1 → 旧行为（接在
+   * prompt 末尾，仅在没有占位符 token 时用）。 */
+  int img_at;
 } sgl_req;
 
 struct sgl_scheduler {
@@ -47,6 +51,7 @@ struct sgl_scheduler {
   int n_insts, cap_insts;
   sgl_tokenizer *tok;
   int eos_id;
+  int img_tok;       /* G12: "<image>" 占位符的 token id（-1 = 词表里没有）*/
   sgl_req *reqs;
   int n_reqs, cap_reqs;
   int next_id;
@@ -85,6 +90,9 @@ sgl_scheduler *sgl_sched_new(const char *model_dir, uint64_t seed) {
   if (!s->tok) { sgl_model_free(s->insts[0].model); sgl_xfree(s->insts); sgl_xfree(s); return NULL; }
   s->insts[0].radix = sgl_radix_new(s->insts[0].model);
   s->eos_id = sgl_tokenizer_eos_id(s->tok);
+  /* G12: llava 的 "<image>" 是词表里的 added token（单 token）；有它就能把视觉 token
+   * 插到占位符位置，而不是老式的“接在 prompt 末尾”。*/
+  s->img_tok = sgl_tokenizer_piece_id(s->tok, "<image>");
   s->next_id = 1;
   s->cap_reqs = 16;
   s->reqs = (sgl_req *)sgl_xmalloc(sizeof(sgl_req) * s->cap_reqs);
@@ -179,6 +187,27 @@ static int req_sample_append(sgl_scheduler *s, sgl_req *r, const float *logits) 
   return 0;
 }
 
+/* G12: 把视觉 token 插到 `<image>` 占位符位置的关键一步。
+ * 设题（占位符在 prompt 内、位置 img_at）：
+ *   [0, img_at)             文本已算过
+ *   [img_at, img_at+n_img)  视觉 emb（丢掉占位符那个 token）
+ *   [img_at+n_img, ...)     占位符之后的文本 token（位置顺延，RoPE 跟着变）
+ * 无占位符（img_at < 0）时保持旧行为：尾巴为空，视觉 token 接在 prompt 末尾。*/
+typedef struct { int tail_from, tail_pos, vis_pos; } img_plan;
+static img_plan plan_img_insert(const sgl_req *r) {
+  img_plan p;
+  if (r->img_at >= 0) {
+    p.vis_pos = r->img_at;
+    p.tail_from = r->img_at + 1;
+    p.tail_pos = r->img_at + r->n_img;
+  } else {
+    p.vis_pos = r->n_prompt;
+    p.tail_from = r->n_prompt; /* 尾巴为空 */
+    p.tail_pos = r->n_prompt + r->n_img;
+  }
+  return p;
+}
+
 /* prefill 一个等待请求：RadixCache 命中部分借用页，仅对剩余后缀计算 */
 static int step_prefill(sgl_scheduler *s, sgl_req *r) {
   sgl_inst *in = &s->insts[r->inst];
@@ -210,15 +239,30 @@ static int step_prefill(sgl_scheduler *s, sgl_req *r) {
   int from = matched < r->n_prompt ? matched : r->n_prompt - 1;
   float *lg = s->b_logits;
   int n_suf = r->n_prompt - from;
-  if (sgl_model_prefill(m, r->prompt + from, n_suf, from, r->pages, lg) != 0) return -1;
-  s->stats.prefill_tokens += n_suf;
-  r->kv_len = r->n_prompt;
-  /* G8: 视觉 token 接在 prompt 后面进同一页表，首 token 的 logits 取最后一个视觉 token */
+  /* G12: 有 `<image>` 占位符时，文本前段只算到占位符之前（占位符 token 本身不进 KV，
+   * 它被 n_img 个视觉 token 顶替）；无占位符保持旧行为（整个 prompt 先算完）。*/
+  if (r->n_img > 0 && r->img_at >= 0 && from < r->img_at) n_suf = r->img_at - from;
+  if (n_suf > 0) {
+    if (sgl_model_prefill(m, r->prompt + from, n_suf, from, r->pages, lg) != 0) return -1;
+    s->stats.prefill_tokens += n_suf;
+  }
+  r->kv_len = from + n_suf;
+  /* G8/G12: 视觉 token 进同一页表；G12 插到占位符位置，并把占位符后的文本尾巴
+   * 在视觉 token 之后接着算（位置 = img_at + n_img 起），这样 RoPE 位置与
+   * llava「把 <image> 换成一个视觉 token 块」完全一致。*/
   if (r->n_img > 0) {
-    if (sgl_model_prefill_emb(m, r->feats, r->n_img, r->n_prompt, r->pages, lg) != 0)
+    img_plan pl = plan_img_insert(r);
+    if (sgl_model_prefill_emb(m, r->feats, r->n_img, pl.vis_pos, r->pages, lg) != 0)
       return -1;
     s->stats.prefill_tokens += r->n_img;
-    r->kv_len += r->n_img;
+    r->kv_len = pl.vis_pos + r->n_img;
+    if (pl.tail_from < r->n_prompt) {
+      int ntail = r->n_prompt - pl.tail_from;
+      if (sgl_model_prefill(m, r->prompt + pl.tail_from, ntail, pl.tail_pos, r->pages, lg) != 0)
+        return -1;
+      s->stats.prefill_tokens += ntail;
+      r->kv_len = pl.tail_pos + ntail;
+    }
     sgl_xfree(r->feats);
     r->feats = NULL;
     r->n_img = 0;
@@ -442,6 +486,16 @@ int sgl_sched_submit_img(sgl_scheduler *s, const char *text, int max_new,
   if (!r) { sgl_xfree(feats); return -1; }
   r->feats = feats;
   r->n_img = n_img;
+  /* G12: 找 `<image>` 占位符 -> 视觉 token 插在那里。多个占位符时只用第一个（
+   * 多图仍然按顺序拼给同一个占位位置，同 llava 的一图一占位不同；见文档）。 */
+  r->img_at = -1;
+  if (s->img_tok >= 0) {
+    for (int i = 0; i < r->n_prompt; i++)
+      if (r->prompt[i] == s->img_tok) { r->img_at = i; break; }
+  }
+  if (getenv("SGL_IMG_DEBUG"))
+    SGL_INFO("img insert: img_tok=%d n_prompt=%d img_at=%d n_img=%d", s->img_tok,
+             r->n_prompt, r->img_at, n_img);
   int need = r->n_prompt + n_img + r->max_new + 1;
   if (need > sgl_model_pool_pages(s->insts[inst].model)) {
     SGL_ERROR("submit_img: need %d pages > pool %d", need,

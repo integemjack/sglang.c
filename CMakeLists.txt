@@ -163,6 +163,15 @@ else()
   set_tests_properties(test_lin_seq PROPERTIES ENVIRONMENT "SGL_TEST_QNEXT=")
 endif()
 
+# ---- G12 占位符位置插入 visual token（需 g12-mlp：LM + 2层 MLP projector + <image>）----
+if(EXISTS ${SGL_MODELS_DIR}/g12-mlp/projector.safetensors AND
+   EXISTS ${SGL_MODELS_DIR}/g12-mlp/clip_model.safetensors)
+  set_tests_properties(test_g12_place PROPERTIES DEPENDS test_llama
+    ENVIRONMENT "SGL_TEST_G12=${SGL_MODELS_DIR}/g12-mlp")
+else()
+  set_tests_properties(test_g12_place PROPERTIES ENVIRONMENT "SGL_TEST_G12=")
+endif()
+
 # ---- CUDA 后端（SGL_CUDA=ON，需 MSVC + CUDA 工具链；与 MinGW 构建共存于独立目录）----
 option(SGL_CUDA "Build CUDA backend (needs VS + nvcc)" OFF)
 if(SGL_CUDA)
