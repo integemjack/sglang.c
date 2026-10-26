@@ -108,6 +108,40 @@ graph-safe KV 写 kernel 从 device 数组算地址，lens 每步变化无需重
 之间缺 barrier —— compute-sanitizer racecheck 定位（39 万 hazards），复现 10 次
 launch 2 次 bit-exact 破坏、偶发全 NaN；补 2 个 `__syncthreads()` 后消除。
 
+## 缺口关闭 G1–G6（2026-10-27）
+
+性能数字全部是**同进程 A/B**（`cuda_perf --ab`）：本卡空闲显存常常小于模型常驻量，
+WDDM 溢出会把绝对时间放大 3–20x，跨进程的数字不能直接比。详见 docs/NOTES_gaps.md。
+
+- **G1 flash prefill**：>4096 行现在走单遍分块核 `k_attn_flash`（Q 块驻 shared、K/V
+  流式、online softmax），不再把 K 重算两遍。8192-token prefill **72.4 → 8.8s（8.3x）**。
+  回退/对比开关：`SGL_ATTN_TWOPASS=1`；逐层注意力计时：`SGL_CUDA_PROF=1`。
+- **G2 W8 大 M 走 tensor core**：int8 权重模式下 M>1 的投影改用 `cublasGemmEx` IMMA
+  （int8×int8→int32，整数累加与顺序无关），M=1 仍用手写 dp4a GEMV（实测更快）。
+  [2048,2048] M=8：**0.925 → 0.069ms（13.4x）**；IMMA vs dp4a prefill **maxerr = 0**。
+  强制旧路径：`SGL_W8_DP4A=1`。
+- **G3 decode graph 默认开启**：捕获前先跑一次 plain step 预热（CUDA 13 默认 lazy 内核
+  加载、cuBLAS 首次选算法都不能发生在 capture 里），失败只标记**这一个 batch 尺寸**
+  （旧版一个进程级开关会让所有尺寸永久走 plain）；`cuda_http` 起服务前 `prewarm`
+  把工作区/镜像撑到位并预捕获 B=1..conc。fp16 decode：B=1 23.0→9.7ms、B=4
+  36.6→8.9ms、B=8 38.5→11.3ms（3–4x）。`SGL_CUDA_GRAPH=0` 仍可关。
+- **G4 HTTP 卡死修复**：`active_conns` 从 `srv->lock` 拆出独立 `conns_lock`——之前
+  acceptor 登记连接要和 worker 的每步计算抢同一把锁，高负载下饿死（连接已握手但
+  长时间不建线程）。复验：12 并发负载下 600/600 次 GET /health 无超时。
+- **G5 显存预检**：上传前先算账（权重+KV+工作区+logits+workspace），不够就**降级
+  服务**而不是进程退出：`/health` 返回 `{"ok":false,"gpu":false,"degraded":true,
+  "reason":"..."}`，`/generate` 直接 503 + 建议（降 `SGL_CUDA_CTX` 或开
+  `SGL_CUDA_FP16=1`/`SGL_CUDA_W8=1`）。
+- **G6 GPU 前缀缓存**：同一段 system prompt 的后续请求不再重算前缀——请求结束后它的
+  KV 段被「租让」给前缀缓存，新请求按 token 精确比对最长公共前缀，命中部分用
+  `sgl_cuda_copy_kv` 搬行、只 prefill 后缀（LRU 驱逐，段被复用时先释放租让）。
+  输出与无缓存**逐字一致**（`cuda_test [prefix]` maxerr 1.43e-05、greedy 6/6 全同）；
+  端到端 756-token 共享前缀：0.76s → **0.34s（2.2x）**。`/health` 的 `prefix` 字段给出
+  hits/hit_rows/leased_rows。
+- 新工具：`tests/cuda_perf.c`（同进程 A/B 基准）、`tests/conc_test.ps1`、
+  `tests/prefix_e2e.ps1`、`tests/soak_curve.ps1`（RSS/VRAM 斜率）、`tests/g4_probe.py`、
+  `tests/bom_fix.ps1`（批量补 UTF-8 BOM）。
+
 ## LoRA 适配器（M21）
 
 ```bash

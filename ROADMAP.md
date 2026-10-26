@@ -74,6 +74,28 @@ ctest --test-dir sglang-c/build --output-on-failure
 
 ## 构建约定
 
-- 语言标准 C11，编译选项 `-O2 -march=native -fopenmp -Wall -Wextra`
+- 语言标准 C11，编译选项 `-O2 -march=x86-64-v2 -fopenmp -Wall -Wextra`（AVX2/-march=native 仍禁用，见下 G10 实测）
 - CUDA（M10 起）通过 `-DSGL_CUDA=ON` 开关；nvcc 需要 MSVC 宿主，MinGW 仅编译 CPU 路径
 - 不依赖任何第三方库：JSON、BPE、safetensors、HTTP 全部自实现
+
+## G10 AVX2 重试实测记录（2026-10-26）——结论：仍然崩，维持 x86-64-v2，关闭
+
+环境：i7-10700F，WinLibs GCC **16.2.0-14.0.0-r3**（ucrt posix seh）；`-march=native` 解析为 skylake。
+winget `BrechtSanders.WinLibs.POSIX.UCRT` 最新可用版本 = **16.2.0-14.0.0-r3**（与已装相同），**无 GCC≥16.3 包**，
+G10 的前置条件（新版工具链）不成立。以下为本机实测：
+
+1. **最小复现**（纯栈 + 按值传 80B 结构体 + printf，`build-g10/repro/repro.c`）：`-march=native` 与 `-mavx2 -O2`
+   各 25 次 **25/25 干净**（退出码全 0）——CMakeLists 注释里那个最小案例单独已不复现；native 版确认含 AVX
+   `vmovaps` 栈溢出指令（x86-64-v2 对照无）。
+2. **整库**（`build-g10`：同源码同配置，仅把 build.ninja 的 `-march=x86-64-v2` 换成 `-march=native`）：
+   ctest **25 轮全部有崩溃（25/25 轮），99/500 个测试实例失败**——0xC0000005 SEGFAULT 85 次
+   （test_scheduler 25/25 轮、test_llava 21、test_http 10、test_tensor 10、test_gpt2 10、test_radix 9），
+   0xc0000409 fastfail 14 次（test_family_qwen3 6、test_w8 4、test_spec 3、test_tinyllama 1）。
+   每轮失败数 1–8 不等（均值 ~4）。同配置 x86-64-v2 对照 **20/20 全绿**，唯一变量即 AVX2 旗标。
+3. **根因**（gdb）：SIGSEGV 于 `main+424: vmovdqa %ymm9,0x2d0(%rsp)`——GCC 在 AVX 下按 32B 对齐假设做 ymm
+   栈溢出，而进程入口栈实际只有 16B 对齐（0x2d0≡16 mod 32）。**间歇机制已实证**：入口栈对齐随进程环境块
+   大小变化——同一 test_tensor.exe 变更 SGL_PAD 环境变量长度跑 12 次：9 崩 3 好；环境不变则结果确定。
+4. **部分旁路**（`build-g10-sr`：native + `-mstackrealign`）：test_tensor 同环境垫 12/12 干净（vmovdqa 仍在，
+   但序言已把栈对齐到 32B），ctest 一轮 21/23——**test_w8、test_family_qwen3 仍 0xc0000409**，旁路不完整，不采纳。
+5. 处置：CMakeLists 维持 `-march=x86-64-v2` 默认不变（未加开关：AVX2 无可靠启用路径）。复测资产：
+   `build-g10/{repro/repro.c, run25.ps1, run25b.ps1, rounds25.log}`、`build-g10-sr/`。
