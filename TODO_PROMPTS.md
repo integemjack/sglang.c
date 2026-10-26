@@ -7,23 +7,27 @@
 > v0.3（2026-10-27）：G1–G10 全部处理完毕（G7 净减速如实记录、G10 条件不成立关闭）。
 > 数据见 docs/NOTES_gaps.md、NOTES_g8.md、NOTES_g9.md、NOTES_t7.md、ROADMAP.md，CHANGELOG 有总结。
 > v0.4（2026-10-27，tag v0.3.0）：G1–G10 已发布；本文件改为记录**验收时明确留下、
-> 本批没做的遗留**，重编为 G11–G18。每条都写了「现状证据出处 + 为什么没做 + 怎么做 + 验收」。
+> 本批没做的遗留**，重编为 G11–G19。每条都写了「现状证据出处 + 为什么没做 + 怎么做 + 验收」。
+> v0.5（2026-10-27）：**G11–G19 全部处理完毕**（含验收数据与日志路径，见文末索引）；
+> 过程记录在 docs/PROGRESS_g11_g19.md，数据在 CHANGELOG / docs/BENCH.md / NOTES_*.md。
+> 未做的三项均为文档允许的可选项，且各有实测依据（G12 的 7B LM 端到端：磁盘不够；
+> G13 的 CUDA 路径：任务写明可选；G15 的跳段共享：证明上界就是最长的一条登记）。
 
-## 状态速查（v0.4）
+## 状态速查（v0.5，全部完成）
 
-G1–G10 已全部完成并发版，结果见文末「已完成索引」。下面是**尚未做的**：
+G1–G19 已全部完成；结果见文末「已完成索引」。下表是 v0.4 列出的 G11–G19 的最终状态：
 
-| 任务 | 类别 | 现状证据 | 一句话 |
-|---|---|---|---|
-| G11 GPU 版图片解码 | 功能缺口 | NOTES_g8 §7-1 | cuda_http 只收 raw-float CHW base64，不收 PNG/JPEG |
-| G12 真实 llava-1.5 链路 | 功能缺口 | NOTES_g8 §7-2/3/5 | projector 单层 linear、`<image>` 不按位置插入、无真实端到端 |
-| G13 Qwen3-Next full 层 + 递归状态 | 模型广度 | NOTES_g9 §4 | full_attn 缺 q 门控/partial rotary/(1+w)/MoE；lin 状态按首页归属 |
-| G14 投机解码正收益路径 | 性能 | NOTES_t7 G7 补记 | 只支持 greedy；verify 不可图化；现为 0.27–0.44x 净减速 |
-| G15 前缀缓存升 radix | 性能 | NOTES_gaps “未完成”2 | 段级租让，跳段共享/显存回收/带图请求都没覆盖 |
-| G16 W8 IMMA 后端到端重测 + flash 泛化 | 性能/广度 | NOTES_gaps G2、G1 | BENCH int8 行还是 dp4a 时代的数；flash 只特化 D=64/128 |
-| G17 G4 修复的 GPU 版复验 + soak 误报 | 健壮性 | NOTES_t5 G4、soak_curve.ps1 | g4_probe 只在 CPU 版跑过；soak_curve 把 INFO 当错误报 |
-| G18 8K GPU-vs-CPU 绝对对照 | 验收补齐 | NOTES_gaps “未完成”1 | long_vcpu 本批没跑完，用了传递论证代替 |
-| G19 CI 覆盖随机模型族 | 基础设施 | .github/build.yml 与 CMake 条件注册 | CI 只下载 gpt2，模型族/多模态测试全部走 SKIP |
+| 任务 | 类别 | 结果 |
+|---|---|---|
+| G11 GPU 版图片解码 | 功能缺口 | ✅ cuda_http 收 `data:image/png\|jpeg`（走与 CPU 版同一条 stb_image+PIL 语义路径）|
+| G12 真实 llava-1.5 链路 | 功能缺口 | ✅ 两层 MLP projector + 视觉 token 按 `<image>` 位置插入；真实 CLIP-L/14-336 + 真实 mm_projector 对照 rel 1.4e-05 / 1.8e-05 |
+| G13 Qwen3-Next full 层 + 递归状态 | 模型广度 | ✅ q 门控 / partial rotary / (1+w) / MoE 全实现（maxerr 2.5–5.8e-08）；递归状态改按序列 key |
+| G14 投机解码正收益路径 | 性能 | ⚠️ 结构成本已砍（K=1 0.44x→**0.73x**），但仍净减速——回本需接受率 >88%，实测 39.1%；如实记录 |
+| G15 前缀缓存升 radix | 性能 | ✅ 租让覆盖生成 token（552→**573** 行）与带图 text；同 prompt 重发 **2.5x**；4 组 e2e 全 PASS |
+| G16 W8 IMMA 后端到端重测 + flash 泛化 | 性能/广度 | ✅ 三精度重测；flash 阀值 4096→**64**（2048 tok 提速 11.8x）+ D=96 特化 + `D%32` 守卫 |
+| G17 G4 修复的 GPU 版复验 + soak 误报 | 健壮性 | ✅ 找到 GPU 侧**另一个**真根因（`strstr` 在未 NUL 截断缓冲上）并修掉；600/600 无超时（修前 0/600） |
+| G18 8K GPU-vs-CPU 绝对对照 | 验收补齐 | ✅ **PASS**：maxerr 1.47581e-04 < 1e-3，greedy 同（日志 docs/g18_8192.log）|
+| G19 CI 覆盖随机模型族 | 基础设施 | ✅ CI 生成 5 个族（与仓库夹具逐字节相同），验收判据改成「必须 Passed 而不是 SKIP」 |
 
 小事不单独立项（做上面任一任务时顺手）：`test_clip_real` 只在 `models/clip-vit-base-patch32/ref/`
 存在时注册；G3 的 prewarm 会向段 0 写一次 64-token 垃圾 KV（首个真实 prefill 会覆盖，
@@ -382,7 +386,24 @@ SKIP。结果是 CI 实际只验了「能编译 + 不依赖模型的几个测试
 
 ---
 
-## 已完成索引（v0.3.0，2026-10-27）
+## 已完成索引（按批次）
+
+### G11–G19（v0.5 批，2026-10-27；过程见 docs/PROGRESS_g11_g19.md）
+
+| 任务 | 结果（全部为实测值） |
+|---|---|
+| G11 GPU 版图片解码 | `cuda_http` 按 data URL 的 mime 分派：`image/{png,jpeg}` → `sgl_clip_project_bytes_pj`（stb_image + PIL 语义 resize/crop + CLIP + projector），否则走 t10 的 raw-float 兼容支。e2e：jpeg/png/text 全 200、坏 base64 400、**与 CPU 版输出逐 token 前缀相同**；`cuda_test [mm]` 1.19e-07 |
+| G12 真实 llava-1.5 | ① `sgl_projector` 从权重形状自动判层数（`[out][in]` 单层 / `[mid][in]+[out][mid]` 两层，GELU=erf）；② 视觉 token 插在 `<image>` 占位位置（尾巴文本位置顺延），test_g12_place：调度器 == 等价路径、≠ 旧末尾拼接（logits 差 0.85）；③ 修 tokenizer 只在 pre-token 边界匹配 added token 的 bug；④ 真实权重分段对照：预处理 rel 1.15e-07、CLIP patch 行 rel **1.41e-05**（第 22 层，`mm_vision_select_layer=-2`）、mm_projector rel **1.78e-05** |
+| G13 Qwen3-Next full 层 | q 门控（q_proj 2×、按头交错、sigmoid 半幅）、partial rotary（rot_dim 分母）、(1+w) RMSNorm、MoE（router softmax→topk→norm_topk、gate_up/down、共享专家 sigmoid 门、routed_scaling、mlp_only_layers/sparse_step）；config 兼容 `layer_types` 与 `full_attention_interval`。vs numpy maxerr **2.5e-08–5.8e-08**（要求 <1e-6）。递归状态归属键由「首 KV 页」改为 64 位序列 key：新 test_lin_seq 共享前缀并发 decode **逐位相同**，并带反向对照 |
+| G14 投机解码 | 流水线化（预填 np-1、prompt 末 token 挂起、固定 n=K+1 verify，去掉每轮 target 图步）+ small-M GEMV（模板 MT=2/4/8、warp shuffle 归约）。K=1 **0.44x→0.73x**（35.1→60.5 tok/s）、K=2 0.35x→0.64x、K=4 0.27x→0.40x。**仍净减速**：回本需 K=1 a>88% / K=2 a>69.5%，实测 39.1% / 28.6%（d=3.35ms、t=11.4ms）|
+| G15 前缀缓存 | 租让行数从「只算 prompt」改为「段里真有有效 KV 的行」：`n_prompt+(n_gen-1)`，多轮续写命中 **552→573 行**；带图请求登记 text 部分（同文本不同图命中 130–135 行，以前 0）；`/health` 加 `prefix.{slots,hits,misses,hit_rate,hit_rows,leased_rows,flushes}`；`SGL_PFX_MAX=0` 可关。e2e：同 prompt 重发 0.262s→**0.103s（2.5x）**，四组全 PASS |
+| G16 W8/flash | 三精度 prefill（qwen05，ctx=16384）512/2048/8192：fp32 85.4/386.7/2748.9 ms、fp16 52.2/198.4/1971.9、int8 48.6/184.5/1923.8；two-pass vs flash 8.6x/19.3x/33.3x；dp4a vs IMMA n=128..1024 输 46.7x–155x（M=1 持平，故 decode 仍选 dp4a）。**把 flash 阀值从 4096 降到 64**（128/512/2048 tok 快 1.3x/3.7x/11.8x）；新增 D=96 特化 + `D%32` 守卫（D=80 不加守卫会静默只算前 64 维，maxerr 0.83）|
+| G17 GPU 版复验 | **根因不是 CPU 版那个 acceptor 饿死**：`read_request` 在未 NUL 截断的缓冲上用 `strstr("Content-Length:")`，负载一大会撞上前一个 POST 在堆里的残留，把无 body 的 `/health` 挂到客户端超时（修前 12 并发 load：**0/600**）。修后 GPU **600/600**、CPU 600/600 无超时；另修 soak_curve 把 INFO 当 ERROR 的误报（2 分钟 soak RSS 斜指 0.020 MB/min，PASS）。加 `SGL_HTTP_TRACE=1` 逐连接诊断、`g4_probe --port/--host` |
+| G18 8K 绝对对照 | `SGL_POOL_SLOTS=8208 long_vcpu ..\models\qwen05 8192`：GPU **2.8s** / two-pass 66.1s / CPU 3733.0s / **maxerr 1.47581e-04 < 1e-3**、greedy 5562 SAME。顺带查明 CPU 慢的根因是 MSVC 跑 SSE2（同线程比 GCC 慢 10.2x）、已修 AVX2：930-token 326.2s→33.6s（9.7x），8192 侧 3733.0s→**611.8s**（重跑 maxerr 1.43409e-04 仍 PASS，日志 docs/g18b_8192.log） |
+| G19 CI 模型族 | `gen_random_*` 加 `--out/--tokenizer`（`--variant dynamic` 出 gemma2），CI 先生成 mistral/gemma/gemma2/qwen3next/llava → CMake「模型存在才注册」的条件全部成立；验收判据改成正向（`test_family_*` 均 Passed、`greedy6=一致` ≥4、`test_llava: all OK`），不再只看 ctest 退出码。本地核验：新参数生成的 6 个 safetensors 与仓库夹具**逐字节相同** |
+
+收尾验收（两个构建都从 HEAD 重编重跑）：CPU `ctest` **26/26**；GPU `cuda_test ..\models\qwen05`
+→ `test_cuda: all OK`；`prefix_e2e.ps1` 4 组 ALL PASS；`http_image_e2e.py` E2E OK。
 
 ### G1–G10（缺口关闭批）
 
