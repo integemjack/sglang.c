@@ -1,0 +1,13 @@
+# 构建树（含一个名字损坏的历史残留目录）
+buil*/
+
+# 构建产物
+*.exe
+*.obj
+*.o
+*.a
+*.lib
+*.pdb
+
+# 模型权重不入库（tests 的 gpt2 权重由 CI 按需下载；tokenizer/config 元数据入库）
+**/model.safetensors

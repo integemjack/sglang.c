@@ -1,0 +1,68 @@
+﻿/* sgl/scheduler.h — 多请求调度器：连续批处理（prefill 优先 + 批量 decode）
+ * 对应 sglang srt/managers/scheduler.py 的单机同步核心路径：
+ *   - 到达的请求进等待队列（FIFO）
+ *   - 每步优先 prefill 一个等待请求（对应 sglang 默认 prefill 优先策略）
+ *   - 无等待请求时，把所有运行中请求组成一个 batch 一次 decode 前向 */
+#ifndef SGL_SCHEDULER_H
+#define SGL_SCHEDULER_H
+
+#include <stdint.h>
+
+#include "sgl/bpe.h"
+#include "sgl/gpt2.h"
+#include "sgl/sampling.h"
+
+typedef struct sgl_scheduler sgl_scheduler;
+
+/* 统计（对应 sglang 的 decode throughput 日志字段）*/
+typedef struct {
+  long prefill_tokens;   /* 已 prefill 的 prompt token 总数（不含缓存命中部分）*/
+  long cache_hit_tokens; /* RadixCache 命中复用的 token 总数 */
+  long decode_tokens;    /* 已生成的 token 总数 */
+  int  n_finished;       /* 已完成请求数 */
+  int  n_running;        /* 当前运行中 */
+  int  n_waiting;        /* 当前等待中 */
+  int  pool_pages;       /* KV 池总页数 */
+} sgl_sched_stats;
+
+sgl_scheduler *sgl_sched_new(const char *model_dir, uint64_t seed);
+void sgl_sched_free(sgl_scheduler *s);
+
+/* 提交请求（文本会立刻 tokenize），返回请求 id（从 1 递增）；失败 -1 */
+int sgl_sched_submit(sgl_scheduler *s, const char *text, int max_new,
+                     const sgl_sampling_params *sp);
+
+/* 推进一步：优先 prefill 一个等待请求，否则批量 decode 全部运行中请求。
+ * 返回这一步完成的请求数（0 = 无进展或仍在跑）*/
+int sgl_sched_step(sgl_scheduler *s);
+
+/* 取一个已完成请求的产物。返回 1 且填充输出（text/ids 由 malloc 分配，
+ * 调用方负责 free(ids) 和 sgl_xfree(text)；n_prompt/n_hit 可为 NULL（n_hit 为
+ * RadixCache 命中的前缀长度）；没有已完成的返回 0）*/
+int sgl_sched_poll(sgl_scheduler *s, int *req_id, char **text, int **ids,
+                   int *n_ids, int *n_prompt, int *n_hit);
+
+/* 运行中 + 等待中的请求总数（=0 表示全部做完）*/
+int sgl_sched_nactive(sgl_scheduler *s);
+
+sgl_sched_stats sgl_sched_get_stats(const sgl_scheduler *s);
+
+/* ---- 流式（SSE 用）---- */
+typedef enum {
+  SGL_STREAM_MORE = 0,  /* 运行中，暂无新 token */
+  SGL_STREAM_TOKEN,     /* *piece（malloc，sgl_xfree 释放）/*tok_id 是新 token */
+  SGL_STREAM_DONE,      /* 结束（新 token 已在前几次全部交出）*/
+} sgl_stream_ev;
+
+/* 非阻塞取一个新 token；同一请求可反复调用直到 DONE（失败的请求直接 DONE）*/
+sgl_stream_ev sgl_sched_stream_next(sgl_scheduler *s, int req_id,
+                                    char **piece, int *tok_id);
+
+/* 同 submit，但标记为流式：poll 不回收，由 stream_next 取尽后 reclaim */
+int sgl_sched_submit_stream(sgl_scheduler *s, const char *text, int max_new,
+                            const sgl_sampling_params *sp);
+
+/* 回收一个已流式取尽的请求（与 poll 同语义地标记已取走）*/
+void sgl_sched_reclaim_stream(sgl_scheduler *s, int req_id);
+
+#endif
