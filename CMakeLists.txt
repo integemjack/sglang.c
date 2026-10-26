@@ -202,6 +202,7 @@ if(SGL_CUDA)
   set(SGL_CORE_SRC
       src/alloc.c src/log.c src/json.c src/tensor.c src/safetensors.c
       src/bpe.c src/ops.c src/quant.c src/llama.c src/gpt2.c src/sampling.c src/clip.c
+      src/image.c # G11: PNG/JPEG 解码 + CLIP 预处理（cuda_http 现在收真实图片）
       src/cuda_spec.c) # G7: GPU 侧投机解码（纯 host C，调 sgl_cuda_* API）
   add_library(sgl_cuda STATIC ${SGL_CORE_SRC} ${SGL_CUDA_OBJ})
   target_include_directories(sgl_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include

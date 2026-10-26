@@ -20,6 +20,7 @@
 #include "sgl/bpe.h"
 #include "sgl/clip.h"
 #include "sgl/cuda.h"
+#include "sgl/image.h" /* G11: PNG/JPEG 解码 + CLIP 预处理（与 CPU 版同一条路径）*/
 #include "sgl/json.h"
 #include "sgl/llama.h"
 #include "sgl/ops.h"
@@ -179,16 +180,36 @@ static void req_free(request *r) {
   free(r);
 }
 
-/* t10: image (base64 raw float CHW) -> CLIP encode -> projector -> [n_img][E_lm]
- * features (sgl_xmalloc'd). Returns NULL on any mismatch. The data URI
- * payload format is raw float32 [3*img*img] little-endian — JPEG/PNG decode
- * is out of scope (HF preprocess equivalent must happen client-side). */
-static float *vision_feats(const char *b64, int *n_out) {
+/* t10/G11: image URL -> CLIP encode -> projector -> [n_img][E_lm] features
+ * (sgl_xmalloc'd). Returns NULL on any mismatch. 两种载荷格式：
+ *  - data:image/{png,jpeg};base64,... （G11）：stb_image 解码 + PIL 语义
+ *    resize/crop → 走的正是 CPU 版那条 sgl_clip_project_bytes（真实客户端发的
+ *    就是 JPEG/PNG，以前这里只认 raw float，等于真实图片全用不了）；
+ *  - 裸 base64 的 raw float32 [3*img*img] CHW（t10 兼容分支，端到端老脚本在用）。*/
+static float *vision_feats(const char *url, int *n_out) {
   *n_out = 0;
-  if (!E.clip || !b64) return NULL;
+  if (!E.clip || !url) return NULL;
   /* strip the data:...;base64, prefix if present */
-  const char *comma = strrchr(b64, ',');
-  const char *p = comma ? comma + 1 : b64;
+  const char *comma = strrchr(url, ',');
+  const char *p = comma ? comma + 1 : url;
+  /* G11: 按 data URL 的 mime 分派（image/png、image/jpeg、image/jpg）*/
+  if (!strncmp(url, "data:image/png", 14) || !strncmp(url, "data:image/jpeg", 15) ||
+      !strncmp(url, "data:image/jpg", 14)) {
+    unsigned char *bytes = NULL;
+    size_t bn = 0;
+    if (sgl_base64_decode(p, strlen(p), &bytes, &bn) != 0) return NULL;
+    float *out = NULL;
+    int nn = 0;
+    int rc = sgl_clip_project_bytes(bytes, bn, E.clip, E.pj_w, E.pj_b,
+                                    E.cpu->n_embd, &out, &nn);
+    sgl_xfree(bytes);
+    if (rc != 0 || !out) {
+      sgl_xfree(out);
+      return NULL;
+    }
+    *n_out = E.clip->n_patch;
+    return out;
+  }
   size_t cap = strlen(p) * 3 / 4 + 4;
   unsigned char *raw = (unsigned char *)sgl_xmalloc(cap);
   size_t nraw = 0;
@@ -454,6 +475,8 @@ static DWORD WINAPI worker(LPVOID unused) {
 
 typedef struct { char *body; size_t body_len; char method[8]; char path[128]; } http_req;
 
+static int trace_on(void); /* G17 诊断开关（定义在 conn_thread 上方）*/
+
 static int read_request(SOCKET fd, http_req *req) {
   size_t cap = 8192, len = 0;
   char *buf = (char *)malloc(cap);
@@ -464,22 +487,37 @@ static int read_request(SOCKET fd, http_req *req) {
       for (size_t i = 0; i + 3 < len; i++)
         if (buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n') { hdr_end = i + 4; break; }
     if (hdr_end) break;
-    if (len + 1024 > cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
-    int n = recv(fd, buf + len, 1024, 0);
+    if (len + 1 >= cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
+    int n = recv(fd, buf + len, (int)(cap - len - 1), 0);
+    if (trace_on()) fprintf(stderr, "[trace] recv fd=%llu n=%d len=%zu\n",
+                           (unsigned long long)fd, n, len);
     if (n <= 0) { free(buf); return -1; }
     len += (size_t)n;
+    buf[len] = 0; /* G17 修复：必须 NUL 截断，否则下面的 sscanf/strstr 会跑到
+                   * len 之后的未初始化（或回收重用）堆内存里去。*/
     if (len > 4 * 1024 * 1024) { free(buf); return -1; }
   }
+  buf[len] = 0;
+  if (trace_on()) fprintf(stderr, "[trace] hdr fd=%llu len=%zu hdr_end=%zu\n",
+                         (unsigned long long)fd, len, hdr_end);
   /* method + path */
   if (sscanf(buf, "%7s %127s", req->method, req->path) != 2) { free(buf); return -1; }
-  /* content-length body */
+  /* G17 根因修复：Content-Length 只能在**本请求的 header 段**里找。
+   * 以前用 strstr(buf, ...)：buf 不是 C 字符串，负载一大就会撞上前一个 POST 请求
+   * 在堆里残留的 "Content-Length: 105" 并把 cl 当成 105，然后 body 循环一直等
+   * 永不会来的字节，导致 GET /health 挂到客户端超时断开为止（实测 g4_probe：
+   * 12 并发 load 下 100% timeout_read，且挂的时长恰好等于客户端超时；空闲时
+   * 因为堆是新拿的、恰好为 0 才看不出来）。CPU 版 src/http.c 早就是有界搜索。*/
   long cl = 0;
-  const char *clh = strstr(buf, "Content-Length:");
-  if (!clh) clh = strstr(buf, "content-length:");
-  if (clh) cl = atol(clh + 15);
+  for (char *p = buf; p < buf + hdr_end; ) {
+    char *eol = strchr(p, '\n');
+    if (!eol || eol >= buf + hdr_end) break;
+    if (_strnicmp(p, "content-length:", 15) == 0) cl = atol(p + 15);
+    p = eol + 1;
+  }
   while ((long)(len - hdr_end) < cl) {
-    if (len + 1024 > cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
-    int n = recv(fd, buf + len, 1024, 0);
+    if (len + 1 >= cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
+    int n = recv(fd, buf + len, (int)(cap - len - 1), 0);
     if (n <= 0) break;
     len += (size_t)n;
   }
@@ -539,6 +577,8 @@ static void respond(SOCKET fd, int code, const char *ctype, const char *body) {
     memcpy(pkt, head, (size_t)hl);
     memcpy(pkt + hl, body, (size_t)bl);
     send_all(fd, pkt, hl + bl);
+    if (trace_on()) fprintf(stderr, "[trace] sent fd=%llu bytes=%d t=%llu\n", (unsigned long long)fd,
+                           hl + bl, (unsigned long long)GetTickCount64());
     free(pkt);
   } else {
     send_all(fd, head, hl);
@@ -759,7 +799,7 @@ static int route(SOCKET fd, const http_req *req) {
       free(img_url);
       if (!feats) {
         free(prompt); sgl_json_free(j);
-        respond_error(fd, 400, "bad image (need base64 raw float32 [3*img*img] CHW)");
+        respond_error(fd, 400, "bad image (need data:image/png|jpeg;base64,... or raw float32 CHW)");
         return 0;
       }
       int id2 = submit2(prompt, max_new, &sp, feats, n_img);
@@ -860,6 +900,15 @@ static int finish_request(SOCKET fd, int id, int is_stream, int chat, int openai
 
 typedef struct { SOCKET fd; } conn_ctx;
 
+/* G17 诊断：SGL_HTTP_TRACE=1 时把每个连接的进/出打一行。
+ * 用来区分「/health 偶发不响应」到底是 conn_thread 没建起来（只有 accept 行、
+ * 没有 conn enter），还是它卡在 read_request/route 里（有 enter 没 done）。*/
+static int trace_on(void) {
+  static int on = -1;
+  if (on < 0) on = getenv("SGL_HTTP_TRACE") ? 1 : 0;
+  return on;
+}
+
 static DWORD WINAPI conn_thread(LPVOID arg) {
   conn_ctx *c = (conn_ctx *)arg;
   http_req req;
@@ -870,12 +919,16 @@ static DWORD WINAPI conn_thread(LPVOID arg) {
   DWORD sto = 5000; /* t5: a blocked send() must not park the thread forever */
   setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&sto, sizeof(sto));
   setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&(int){1}, sizeof(int));
+  if (trace_on()) fprintf(stderr, "[trace] conn enter fd=%llu t=%llu\n", (unsigned long long)c->fd,
+                         (unsigned long long)GetTickCount64());
   if (read_request(c->fd, &req) == 0) {
     route(c->fd, &req);
     free(req.body);
   } else {
     fprintf(stderr, "[http] read_request failed (wsa=%d)\n", WSAGetLastError());
   }
+  if (trace_on()) fprintf(stderr, "[trace] conn done  fd=%llu t=%llu\n", (unsigned long long)c->fd,
+                         (unsigned long long)GetTickCount64());
   closesocket(c->fd);
   free(c);
   return 0;
@@ -1030,8 +1083,12 @@ int main(int argc, char **argv) {
     }
     conn_ctx *ctx = (conn_ctx *)malloc(sizeof(*ctx));
     ctx->fd = c;
+    if (trace_on()) fprintf(stderr, "[trace] accept fd=%llu t=%llu\n", (unsigned long long)c,
+                           (unsigned long long)GetTickCount64());
     HANDLE t = CreateThread(NULL, 0, conn_thread, ctx, 0, NULL);
     if (t) CloseHandle(t);
+    else fprintf(stderr, "[http] CreateThread failed (fd=%llu, wsa=%d)\n",
+                 (unsigned long long)c, WSAGetLastError());
   }
   E.stop = 1;
   WakeAllConditionVariable(&E.cv_work);
