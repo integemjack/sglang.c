@@ -13,6 +13,7 @@
 #include "sgl/json.h"
 #include "sgl/log.h"
 #include "sgl/alloc.h"
+#include "sgl/port.h"
 #include "sgl/http.h"
 #include "sgl/safetensors.h"
 #include "sgl/scheduler.h"

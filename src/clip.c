@@ -24,6 +24,7 @@
 #include "sgl/json.h"
 #include "sgl/log.h"
 #include "sgl/ops.h"
+#include "sgl/port.h"
 #include "sgl/safetensors.h"
 #include "sgl/tensor.h"
 

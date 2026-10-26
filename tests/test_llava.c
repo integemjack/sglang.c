@@ -14,6 +14,7 @@
 #include "sgl/llama.h"
 #include "sgl/log.h"
 #include "sgl/ops.h"
+#include "sgl/port.h"
 #include "sgl/safetensors.h"
 
 static int FAILURES = 0;

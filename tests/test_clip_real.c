@@ -12,6 +12,7 @@
 
 #include "sgl/alloc.h"
 #include "sgl/clip.h"
+#include "sgl/port.h"
 
 static int FAILURES = 0;
 #define CHECK(cond, ...)                                                        \
