@@ -47,8 +47,33 @@ RATIO = NH // NK
 KEYD, VALD = NK * KD, NH * VD
 CONVD = 2 * KEYD + VALD
 
+# ---- G13: full_attention 的真实特性（对齐 HF modeling_qwen3_next.py）----
+RP = cfg.get("rope_parameters") or {}
+theta = RP.get("rope_theta", cfg.get("rope_theta", 10000000.0))
+PARTIAL = RP.get("partial_rotary_factor", cfg.get("partial_rotary_factor", 1.0))
+ROT = int(Dh * PARTIAL)          # partial rotary：只旋转头维的前 ROT 维
+NEXP = cfg.get("num_experts", 0)
+TOPK = cfg.get("num_experts_per_tok", 0)
+MOE_I = cfg.get("moe_intermediate_size", 0)
+SH_I = cfg.get("shared_expert_intermediate_size", 0)
+SPARSE = cfg.get("decoder_sparse_step", 1)
+MLP_ONLY = cfg.get("mlp_only_layers", []) or []
+NORM_TOPK = cfg.get("norm_topk_prob", False)
+ROUTED = cfg.get("routed_scaling_factor", 1.0)
+
+
+def is_moe(l):
+    return NEXP > 0 and (l not in MLP_ONLY) and ((l + 1) % SPARSE == 0)
+
 
 def rms(x, w, e=None):
+    """Qwen3NextRMSNorm：(1+w) * x / sqrt(var+eps)（HF：w 初值 0，前向用 1+w）"""
+    e = eps if e is None else e
+    return (1.0 + w) * x / np.sqrt((x * x).mean(-1, keepdims=True) + e)
+
+
+def rms_plain(x, w, e=None):
+    """普通 RMSNorm（linear_attn 的 Qwen3NextRMSNormGated 用：w 是正向权重，无 1+）"""
     e = eps if e is None else e
     return x / np.sqrt((x * x).mean(-1, keepdims=True) + e) * w
 
@@ -57,13 +82,16 @@ def l2norm(x, e=1e-6):
     return x / np.sqrt((x * x).sum(-1, keepdims=True) + e)
 
 
-def rope(x, pos):  # x: [n, heads, Dh]
-    half = Dh // 2
-    inv = theta ** (-np.arange(0, half) * 2 / Dh)
+def rope(x, pos):  # x: [n, heads, Dh]；只旋转前 ROT 维（partial rotary）
+    dim = ROT if ROT > 0 else Dh
+    half = dim // 2
+    inv = theta ** (-np.arange(0, half) * 2 / dim)
     ang = np.arange(pos, pos + x.shape[0])[:, None] * inv[None, :]
     cos, sin = np.cos(ang)[:, None, :], np.sin(ang)[:, None, :]
-    x0, x1 = x[..., :half], x[..., half:]
-    return np.concatenate([x0 * cos - x1 * sin, x0 * sin + x1 * cos], -1)
+    xr, xp = x[..., :dim], x[..., dim:]
+    x0, x1 = xr[..., :half], xr[..., half:]
+    rot = np.concatenate([x0 * cos - x1 * sin, x0 * sin + x1 * cos], -1)
+    return np.concatenate([rot, xp], -1)
 
 
 def silu(x):
@@ -123,22 +151,25 @@ def linear_attn(h, l):
             delta = (vn[t, hh] - mem) * beta[t, hh]
             S[hh] += np.outer(kh, delta)
             out[t, hh] = S[hh].T @ qh
-    # gated RMSNorm（先 norm 后 * silu(z)）+ out_proj
+    # gated RMSNorm（先 norm 后 * silu(z)）+ out_proj（普通权重，无 (1+w)）
     var = (out * out).mean(-1, keepdims=True)
-    out = out / np.sqrt(var + eps) * W[f"{p}.norm.weight"] * silu(zn)
+    out = rms_plain(out, W[f"{p}.norm.weight"]) * silu(zn)
     return out.reshape(n, VALD) @ W[f"{p}.out_proj.weight"].T
 
 
 def full_attn(h, l):
     p = f"model.layers.{l}"
     n = h.shape[0]
-    q = (h @ W[f"{p}.self_attn.q_proj.weight"].T).reshape(n, H, Dh)
+    qg = h @ W[f"{p}.self_attn.q_proj.weight"].T          # [n, H*Dh*2]
+    # G13(a): q_proj 输出按头交错的 [q | gate]，chunk 在最后一维上切
+    qg = qg.reshape(n, H, Dh * 2)
+    q, gate = qg[..., :Dh], qg[..., Dh:]
     k = (h @ W[f"{p}.self_attn.k_proj.weight"].T).reshape(n, KVH, Dh)
     v = (h @ W[f"{p}.self_attn.v_proj.weight"].T).reshape(n, KVH, Dh)
     if f"{p}.self_attn.q_norm.weight" in W:
-        q = rms(q, W[f"{p}.self_attn.q_norm.weight"], 1e-6)
+        q = rms(q, W[f"{p}.self_attn.q_norm.weight"], 1e-6)   # G13(c): (1+w)
         k = rms(k, W[f"{p}.self_attn.k_norm.weight"], 1e-6)
-    q, k = rope(q, 0), rope(k, 0)
+    q, k = rope(q, 0), rope(k, 0)                              # G13(b): partial rotary
     k = np.repeat(k, H // KVH, axis=1)
     v = np.repeat(v, H // KVH, axis=1)
     mask = np.triu(np.full((n, n), -np.inf), 1)
@@ -146,8 +177,41 @@ def full_attn(h, l):
     att = att - att.max(-1, keepdims=True)
     att = np.exp(att)
     att = att / att.sum(-1, keepdims=True)
-    o = np.einsum("hqk,khd->qhd", att, v).reshape(n, H * Dh)
-    return o @ W[f"{p}.self_attn.o_proj.weight"].T
+    o = np.einsum("hqk,khd->qhd", att, v)
+    o = o * (1.0 / (1.0 + np.exp(-gate)))                      # G13(a): sigmoid 门控
+    return o.reshape(n, H * Dh) @ W[f"{p}.self_attn.o_proj.weight"].T
+
+
+def dense_mlp(h, l):
+    p = f"model.layers.{l}"
+    return silu(h @ W[f"{p}.mlp.gate_proj.weight"].T) * (h @ W[f"{p}.mlp.up_proj.weight"].T) \
+        @ W[f"{p}.mlp.down_proj.weight"].T
+
+
+def moe_mlp(h, l):
+    """G13(d): Qwen3NextSparseMoeBlock（router softmax+topk+norm、专家 gate_up/down、
+    共享专家 + sigmoid 共享门控、routed_scaling_factor）。"""
+    p = f"model.layers.{l}.mlp"
+    n = h.shape[0]
+    logits = h @ W[f"{p}.gate.weight"].T                       # [n, NEXP]
+    e = np.exp(logits - logits.max(-1, keepdims=True))
+    probs = e / e.sum(-1, keepdims=True)
+    idx = np.argsort(-probs, axis=-1)[:, :TOPK]
+    wgt = np.take_along_axis(probs, idx, axis=-1)
+    if NORM_TOPK:
+        wgt = wgt / wgt.sum(-1, keepdims=True)
+    out = np.zeros((n, E))
+    for t in range(n):
+        for j in range(TOPK):
+            ex = idx[t, j]
+            gu = h[t] @ W[f"{p}.experts.gate_up_proj"][ex].T   # [2*MOE_I]
+            g2, u2 = gu[:MOE_I], gu[MOE_I:]
+            out[t] += (silu(g2) * u2) @ W[f"{p}.experts.down_proj"][ex].T * wgt[t, j] * ROUTED
+    sh = silu(h @ W[f"{p}.shared_expert.gate_proj.weight"].T) * \
+        (h @ W[f"{p}.shared_expert.up_proj.weight"].T)
+    sh = sh @ W[f"{p}.shared_expert.down_proj.weight"].T
+    sg = 1.0 / (1.0 + np.exp(-(h @ W[f"{p}.shared_expert_gate.weight"].T)))  # [n,1]
+    return out + sh * sg
 
 
 def forward(ids):
@@ -159,9 +223,8 @@ def forward(ids):
                  if LT[l] == "linear_attention"
                  else full_attn(rms(x, W[f"{p}.input_layernorm.weight"]), l))
         h = rms(x, W[f"{p}.post_attention_layernorm.weight"])
-        g = h @ W[f"{p}.mlp.gate_proj.weight"].T
-        u = h @ W[f"{p}.mlp.up_proj.weight"].T
-        x = x + silu(g) * u @ W[f"{p}.mlp.down_proj.weight"].T
+        mx = moe_mlp(h, l) if is_moe(l) else dense_mlp(h, l)
+        x = x + mx
     x = rms(x, W["model.norm.weight"])
     lm = W["lm_head.weight"] if "lm_head.weight" in W else W["model.embed_tokens.weight"]
     return x[-1] @ lm.T

@@ -26,6 +26,13 @@ typedef struct {
   sgl_tensor lin_out_w;                      /* [E, value_dim] */
   float *lin_a_log, *lin_dt_bias;            /* [nvh]（堆拷贝，sgl_xfree）*/
   int lin_idx;                               /* 递归状态池的层内序号；非 linear = -1 */
+  /* ---- G13 Qwen3-Next full_attention 真实特性 ---- */
+  sgl_tensor router_w;                       /* [n_experts, E] MoE 路由器（is_moe 层）*/
+  sgl_tensor exp_gate_up;                    /* [n_experts, 2*moe_inter, E] 专家 gate|up 融合 */
+  sgl_tensor exp_down;                       /* [n_experts, E, moe_inter] */
+  sgl_tensor sh_gate_w, sh_up_w, sh_down_w;  /* 共享专家（inter=shared_expert_intermediate_size）*/
+  sgl_tensor sh_gate;                        /* [1, E] 共享专家 sigmoid 门控 */
+  int is_moe;                                /* 1 = 本层 MLP 走 MoE（dense 权重那么为空）*/
   /* int8 权量化（SGL_W8=1）：与上面 f32 权重并存，前向二选一 */
   int8_t *q8, *k8, *v8, *o8, *g8, *u8, *d8;  /* 同布局 [N,K] */
   float *sq8, *sk8, *sv8, *so8, *sg8, *su8, *sd8; /* per-channel scale 数组 [N]，量化时分配 */
@@ -70,12 +77,25 @@ typedef struct {
   int n_lin, n_lin_slots;
   float *lin_state;          /* [n_lin][slot][nh*kd*vd] 每 v-head 递归状态 S[kd][vd] */
   float *lin_hist;           /* [n_lin][slot][conv_dim*(K-1)] conv 输入历史（旧→新）*/
-  int *lin_owner;            /* [slot] 归属首页第号（-1=空闲）*/
-  int *lin_pos;              /* [slot] 下一个期望位置 */
+  long long *lin_owner;      /* [slot] 归属序列 key（G13：序列 id，不再用首 KV 页）*/
+  int *lin_pos;              /* [n_lin][slot] 下一个期望位置 */
   int *lin_free;             /* 空闲槽栈 */
   int lin_nfree;
   float *ls_qkvz, *ls_ba, *ls_conv, *ls_o; /* 单 token scratch（递归本身串行）*/
   float *ls_qn, *ls_kn;                    /* l2norm 后的 q/k（各 [key_dim]）*/
+  /* ---- G13 Qwen3-Next full_attention / MoE ---- */
+  int norm_p1;               /* 1 = RMSNorm 用 (1+w)（Qwen3NextRMSNorm）*/
+  int q_gate;                /* 1 = full 层 q_proj 输出 2*q_dim，半幅 sigmoid 门控 */
+  int rot_dim;               /* partial rotary 的旋转维数（0 = 整个 head_dim）*/
+  double *rot_invf;          /* [n_layer][rot_dim/2] partial rotary 的每层逆频率（rot_dim<D 时）*/
+  int n_experts, n_exp_topk, moe_inter, shared_inter, sparse_step;
+  int norm_topk;             /* norm_topk_prob：top-k 权重再归一化 */
+  float routed_scale;        /* routed_scaling_factor（真实 80B config 为 None → 1.0）*/
+  int n_mlp_only; int *mlp_only; /* mlp_only_layers：这些层走 dense MLP */
+  float *qg;                 /* [n_ctx][2*q_dim] q_proj 2x 输出（含 gate 半幅）*/
+  float *qgate;              /* [n_ctx][q_dim] 重排后的 gate（q_gate_apply 用）*/
+  float *moe_gu, *moe_mid, *moe_out; /* MoE scratch：gate_up / 激活后 / 累加行 */
+  float *moe_rl;             /* [n_experts] 路由 logits/probs */
 } sgl_llama;
 
 sgl_llama *sgl_llama_load(const char *model_dir);
@@ -106,6 +126,19 @@ int sgl_llama_forward_emb(sgl_llama *m, const float *emb, int n, int pos0,
 /* 批量 decode（调度器用）：B 序列各 1 token；logits_out 需 B*vocab */
 int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx,
                            const int *seq_lens, int B, float *logits_out);
+
+/* ---- G13：递归状态（linear_attention）按序列归属，不再按首 KV 页 ----
+ * 旧实现用 slot_idx[0] 当归属键，radix 前缀共享时两条序列共用首页 0 → 互踩状态。
+ * 现在改成 64 位序列 key：传了 seq_id 用 seq_id，不传则用 slot_idx 指针
+ * （每个序列一份页表，实际调用里天然唯一）。序列结束时调 sgl_llama_lin_release
+ * 归还槽位（否则 SGL_LIN_SLOTS 用完会报错）。*/
+int sgl_llama_forward_seq(sgl_llama *m, const int *tokens, int n, int pos0,
+                          const int *slot_idx, long long seq_id, float *logits_out);
+int sgl_llama_decode_batch_seq(sgl_llama *m, const int *tokens, int *const *slot_idx,
+                               const long long *seq_ids, const int *seq_lens, int B,
+                               float *logits_out);
+void sgl_llama_lin_release(sgl_llama *m, long long seq_id);
+int sgl_llama_lin_slots_in_use(sgl_llama *m);
 
 /* ---- beam search ---- */
 typedef struct {

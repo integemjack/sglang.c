@@ -33,6 +33,11 @@ void sgl_silu_inplace(float *row, int n);
 void sgl_rmsnorm(const float *x, const float *weight, float *y, int M, int N,
                  float eps);
 
+/* G13 Qwen3-Next：y = x / sqrt(mean(x²)+eps) * (1 + weight)。HF 的 Qwen3NextRMSNorm
+ * 权重初值是 0、前向用 (1+w)（所有 layernorm / q_norm / k_norm / final_norm 都是）。*/
+void sgl_rmsnorm_p1(const float *x, const float *weight, float *y, int M, int N,
+                    float eps);
+
 /* RoPE（Llama 推理）：对 q/k 的每个头（head_dim=D）按位置 pos 旋转。
  * 旋转式（HF llama 标准式）：对 (2i, 2i+1) 对应用
  *   out[2i]   = in[2i] * cos(θ) - in[2i+1] * sin(θ)

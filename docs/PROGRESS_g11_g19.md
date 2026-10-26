@@ -31,7 +31,7 @@
 | G14 投机正收益 | 已做完（未达 ≥1.0x，如实记“仍净减速”） | 见下 |
 | G12 真实 llava-1.5 | 未开始 | 需下 ~4GB 权重（`../models/llava-1.5-7b` 之类） |
 | G15 前缀缓存 radix | ✅ 完成（租让覆盖生成 token + 带图 text；四组全 PASS） | 见下 |
-| G13 Qwen3-Next full 层 | 未开始 | 纯代码 + 随机模型可验 |
+| G13 Qwen3-Next full 层 | ✅ 完成（q 门控 / partial rope / (1+w) / MoE；递归状态按序列） | 见下 |
 | G18 8K GPU-vs-CPU 绝对对照 | 未开始 | qwen05 在，需 40–60 分钟干净时段 |
 
 ## G11 ✅ GPU 版收标准 JPEG/PNG
@@ -136,8 +136,20 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 回归：`cuda_test ..\models\qwen05` → `test_cuda: all OK`（[prefix] reuse vs full
   maxerr 1.4e-05、greedy 6/6 SAME、prefill 33.4ms vs 68.8ms）；CPU ctest 23/23。
 
+### 新增（G13）
+- **Qwen3-Next full 层真实特性**（`src/llama.c`/`src/ops.c`）：q 门控（q_proj 2×、
+  sigmoid 半幅门）、partial rotary（0.25 维）、(1+w) RMSNorm、MoE（4 专家 top-2 +
+  共享专家 + routed_scaling）。config 同时支持 `layer_types` 与 `full_attention_interval`。
+  验证：随机模型 prefill top5 maxerr **2.5e-08 – 5.8e-08**（要求 <1e-6）、greedy6 全一致、
+  decode_batch 一致；`test_llama: all OK`；全量 ctest **24/24**。
+- **递归状态按序列分配**：64 位 seq key（旧实现用首 KV 页 → radix 前缀共享时互踩）；
+  新 ctest **test_lin_seq**：共享前缀 + 不同后缀并发 decode 与单独跑**逐位相同**，
+  并且带反向对照（故意共用 key → 结果不同）证明测试有鉴别力。
+- 新 API：`sgl_llama_forward_seq` / `sgl_llama_decode_batch_seq` /
+  `sgl_llama_lin_release` / `sgl_llama_lin_slots_in_use`（调度器接入时要用 release 归还槽）。
+
 ## 下一轮从这里继续
 
-1. **G13**（Qwen3-Next full 层与递归状态）：纯代码 + 随机模型（`qwen3next-rand`）可验。
-2. G12（需下 llava-1.5 权重）、G18（8K 绝对对照，要 40–60 分钟干净时段；8K GPU prefill
-   现在 ~2s，CPU 侧仍要 40+ 分钟）。
+1. **G12**（真实 llava-1.5 链路）：需下 ~4GB 权重（CLIP ViT-L + projector + 7B LM）；
+   本机 6GB 显存/磁盘够，但下载耗时长——建议单独一轮只做这件事。
+2. **G18**（8K GPU-vs-CPU 绝对对照）：要 40–60 分钟 CPU 侧算力，建议放最后一轮。

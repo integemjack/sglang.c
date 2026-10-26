@@ -293,6 +293,19 @@ void sgl_rmsnorm(const float *x, const float *weight, float *y, int M, int N,
   }
 }
 
+void sgl_rmsnorm_p1(const float *x, const float *weight, float *y, int M, int N,
+                    float eps) {
+#pragma omp parallel for
+  for (int m = 0; m < M; m++) {
+    const float *xr = x + (size_t)m * N;
+    float *yr = y + (size_t)m * N;
+    double ss = 0;
+    for (int i = 0; i < N; i++) ss += (double)xr[i] * xr[i];
+    float inv = (float)(1.0 / sqrt(ss / N + eps));
+    for (int i = 0; i < N; i++) yr[i] = xr[i] * inv * (1.0f + weight[i]);
+  }
+}
+
 void sgl_rope_inplace(float *qk, int n, int head_dim, int pos0, double theta) {
   /* HF llama 标准式（GPT-NeoX 风格 rotate_half，配对 (i, i+D/2)，双精度频率）。
  * n 行是【同一位置的 n 个头】（或 n 个 token 的同一头——调用方保证），

@@ -154,6 +154,15 @@ foreach(fam mistral gemma gemma2 qwen3 qwen3next)
   endif()
 endforeach()
 
+# ---- G13 递归状态按序列归属（radix 前缀共享下两条序列不能互踩）----
+# test_lin_seq.c 已被上面的 glob 注册为 test_lin_seq，这里只补模型路径环境变量
+if(EXISTS ${SGL_MODELS_DIR}/qwen3next-rand/model.safetensors)
+  set_tests_properties(test_lin_seq PROPERTIES DEPENDS test_llama
+    ENVIRONMENT "SGL_TEST_QNEXT=${SGL_MODELS_DIR}/qwen3next-rand")
+else()
+  set_tests_properties(test_lin_seq PROPERTIES ENVIRONMENT "SGL_TEST_QNEXT=")
+endif()
+
 # ---- CUDA 后端（SGL_CUDA=ON，需 MSVC + CUDA 工具链；与 MinGW 构建共存于独立目录）----
 option(SGL_CUDA "Build CUDA backend (needs VS + nvcc)" OFF)
 if(SGL_CUDA)

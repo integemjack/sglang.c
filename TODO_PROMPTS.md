@@ -241,7 +241,7 @@ t12 时 winget 最新 WinLibs 16.2（16.3 不存在），当年 25 次 0xC000000
    （greedy 前 16 步允许 top1/top2 gap < 1e-2 的可解释翻转）；no-image 时行为与纯文本全等。
 ```
 
-## 任务 G13 · Qwen3-Next full 层与递归状态（模型广度，中大）
+## 任务 G13 · Qwen3-Next full 层与递归状态（模型广度，中大） ✅ 已完成（a–e 全做；CUDA 未支持 = 文档允许的选项。见 docs/NOTES_g9.md 第 5 节）
 
 ```
 现状（docs/NOTES_g9.md §4）：linear_attention（Gated DeltaNet）已按 HF 真实公式实现并

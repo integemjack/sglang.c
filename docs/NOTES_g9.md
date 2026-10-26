@@ -76,14 +76,78 @@ linear 层不占 KV 页；递归状态按（层，序列首 KV 页号）归属�
 - test_family_qwen3（真实 qwen3-06 + 旧参考 _ref_qwen3.json）maxerr 不变
   （Hello world 2.71501e-06 < 5e-3），证明 rope 重构逐位等价。
 
-## 4. 与真实模型的差距（已知限制）
+## 4. 与真实模型的差距（G13 已关闭，见第 5 节）
 
-- linear_attention 已按真实 Qwen3-Next 公式实现，但 **full_attention 层是简化版**：
-  真实 Qwen3-Next 的 full 层还有 q 门控（q_proj 输出 2×，半幅 sigmoid 门）、
-  partial rotary（rope 只作用 25% 维）、output norm 为 `(1+w)*x/sqrt(var+1)`、
-  MoE 专家层、共享专家 + routed scaling —— 本实现均按普通 qwen3 full attention 走，
-  且无 MoE。加载真实 Qwen3-Next 权重会缺张量而报错（不会静默算错）。
+- ~~full_attention 层是简化版~~ → **G13 已补齐**：q 门控、partial rotary、(1+w) 归一化、
+  MoE（专家 + 共享专家 + routed scaling）都已实现并 vs numpy 验证。
 - dynamic rope 取静态 NTK 形式，非 HF 的 dynamic_rope_update 逐步插值。
-- 递归状态按序列首页归属：两条序列共享同一首页（radix 前缀复用）会互相踩状态；
-  槽位耗尽报错。CPU 参考路径可接受，调度器接入真实 Qwen3-Next 前需改按序列分配。
+- ~~递归状态按序列首页归属~~ → **G13 已改成按序列 key 分配**（见第 5 节）。
 - CUDA 路径未动（cuda_backend.cu 不属于本任务）。
+
+## 5. G13：Qwen3-Next full 层真实特性 + 递归状态按序列（2026-10-27）
+
+公式来源仍是 HF `modeling_qwen3_next.py`（已下载核对：Qwen3NextAttention /
+Qwen3NextRMSNorm / Qwen3NextSparseMoeBlock / Qwen3NextTopKRouter / Qwen3NextExperts）
+与真实 80B config.json（`partial_rotary_factor=0.25` 与 `rope_theta` 在**顶层**，
+没有 `layer_types`，改由 `full_attention_interval=4` 生成）。
+
+### 实现（src/llama.c + src/ops.c）
+
+| 特性 | 实现 | 验证 |
+|---|---|---|
+| a) q 门控 | `q_proj` 宽 2*q_dim，按头交错 `[q(D)\ | gate(D)]`（同 HF chunk），attn 输出逐元素 ×sigmoid(gate)（o_proj 之前） | 随机模型 vs numpy |
+| b) partial rotary | `rot_dim = head_dim*partial_rotary_factor`，只旋转每头前 rot_dim 维，
+配对 (i, i+rot_dim/2)，逆频率分母用 rot_dim；每层预算 `rot_invf` | 同上 |
+| c) (1+w) 归一化 | `sgl_rmsnorm_p1()`：所有 layernorm / q_norm / k_norm / final_norm 都走它
+（模型级开关 `norm_p1`，只有 qwen3_next 开）；linear 层的 gated RMSNorm 仍是普通权重 | 同上 |
+| d) MoE | 层选择同 HF（`(l+1)%decoder_sparse_step==0` 且不在 `mlp_only_layers`）；
+router softmax→top-k→可选 `norm_topk_prob` 重归一化；专家 `gate_up_proj`（门/上沿宽切）
+→silu×up→`down_proj`，权重 ×(topk 权重)×`routed_scaling_factor`；再叠共享专家
+（`shared_expert_{gate,up,down}_proj` × sigmoid(`shared_expert_gate`)） | 同上 |
+| config 兼容 | `layer_types` 或 `full_attention_interval` 都支持；`partial_rotary_factor`
+在 `rope_parameters` 或顶层都读；`routed_scaling_factor` 缺省（真实 config 为 null）→ 1.0 | 同上 |
+
+新增 API（include/sgl/llama.h）：`sgl_llama_forward_seq` / `sgl_llama_decode_batch_seq`
+（显式 64 位序列 key）、`sgl_llama_lin_release`（归还递归槽）、`sgl_llama_lin_slots_in_use`。
+
+### 递归状态按序列分配（替代“首 KV 页”归属）
+
+旧实现 `lin_owner[slot] = slot_idx[0]`：radix 前缀共享时两条序列共用首页 → 抢同一个槽。
+现在归属键是 64 位：显式 `seq_id`，不传则退化为 `slot_idx` 数组地址（每序列一份页表）。
+位置不连续仍自动清零；新增 `sgl_llama_lin_release` 归还槽位（不归还的话 64 个槽会耗尽）。
+
+**验收：`tests/test_lin_seq.c`（新 ctest：test_lin_seq）** —— 两条序列共享前 8 个物理页
+（首页相同）、后缀不同：
+
+- 并发 decode 4 步，两条序列每一步 logits 与「各自单独跑」**逐位相同**（maxerr = 0）；
+- 槽位占用：单独跑 A/B 后 = 2，共享前缀的两条序列 = 2（旧实现会是 1），release 后 = 0；
+- **反向对照**：故意让两条序列共用同一 seq key，结果必须不同 —— 实测不同，证明这个
+  测试真能抓住“状态互踩”（不是白跑）；
+- 不共享页（首页不同）时结果同样与单独跑一致。
+
+### 随机模型与对照数字
+
+`tests/gen_random_qwen3next.py` 重写成带全部特性的小模型（字段布局与真实 80B config
+对齐）：L=4、layer_types=[linear, full, linear, full]、E=64/D=16（rot_dim=4）、
+**所有 norm 权重 ~N(0,0.3)（不是 HF 的 0 初值，故意的：这样 (1+w) 写错就会被抓住）**、
+MoE 4 专家 top-2、moe_inter=32、shared_inter=32、`mlp_only_layers=[0]`、
+`routed_scaling_factor=1.5`。`tests/ref_qwen3next.py` 同步实现（float64）。
+
+| case | prefill top5 maxerr | greedy6 | 阈值 |
+|---|---|---|---|
+| Hello world | 2.51e-08 | 一致 | <5e-3（任务要求 MoE 模型 <1e-6，实测 ~1e-8） |
+| The meaning of life is | 4.02e-08 | 一致 | 同上 |
+| Paris is the capital of | 4.84e-08 | 一致 | 同上 |
+| word ×100 | 5.75e-08 | 一致 | 同上 |
+
+`test_llama: all OK`（含 decode_batch B=2 一致性）；全量 `ctest`：**24/24 通过**
+（含 test_family_{mistral,gemma,gemma2,qwen3,qwen3next} 与新增 test_lin_seq），
+真实 qwen3-06 回归（test_qwen / test_family_qwen3）数值不变。
+
+### 仍未做（如实记录）
+
+- CUDA 路径仍未支持 Qwen3-Next（cuda_backend.cu 只有 llama 族 attention），任务里
+  “CUDA 可选”允许只保证 CPU。
+- 真实 80B 权重没有下载（~160GB，超出本机 6GB 显存与磁盘预算）；验证用的是等价结构的
+  随机模型（同权重名、同 config 字段、同公式）。
+

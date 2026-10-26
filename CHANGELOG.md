@@ -2,7 +2,35 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G14/G15/G16/G17/G19
+## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G13/G14/G15/G16/G17/G19
+
+### 模型广度
+- **G13 Qwen3-Next full 层补齐**（`src/llama.c` + `src/ops.c`，对照 HF
+  `modeling_qwen3_next.py` 与真实 80B config）：
+  - (a) **q 门控**：`q_proj` 宽 2*q_dim，按头交错 `[q(D)|gate(D)]`（同 HF chunk），
+    attention 输出逐元素 ×sigmoid(gate)（在 o_proj 之前）；
+  - (b) **partial rotary**：只旋转每头前 `head_dim*partial_rotary_factor` 维，
+    逆频率分母用旋转维数（每层预计算 `rot_invf`）；
+  - (c) **`(1+w)` 归一化**：新增 `sgl_rmsnorm_p1()`，所有 layernorm / q_norm /
+    k_norm / final_norm 走它（模型级开关，只有 qwen3_next 开）；
+  - (d) **MoE**：层选择同 HF（`(l+1)%decoder_sparse_step==0` 且不在 `mlp_only_layers`）；
+    router softmax→top-k→`norm_topk_prob` 重归一化；专家 `gate_up_proj`→silu×up→`down_proj`
+    按权重 ×`routed_scaling_factor` 累加；叠共享专家（×sigmoid(shared_expert_gate)）；
+  - (e) **config 兼容**：`layer_types` 或 `full_attention_interval` 都支持（真实 80B 用后者），
+    `partial_rotary_factor` 在 `rope_parameters` 或顶层都读。
+  W8 量化跳过 MoE 层（它们没有 dense gate/up/down 张量）。
+  验证（随机模型重写成带全部特性的等价结构）：prefill top5 maxerr **2.5e-08 – 5.8e-08**
+  （任务要求 <1e-6），greedy6 全一致，decode_batch 一致。
+- **G13 递归状态按序列分配**（`include/sgl/llama.h` + `src/llama.c`）：归属键从
+  「首个 KV 页号」换成 64 位序列 key（显式 `seq_id`，缺省用页表地址），于是 radix
+  前缀共享（两条序列同首页）不再互踩状态；新增 `sgl_llama_forward_seq` /
+  `sgl_llama_decode_batch_seq` / `sgl_llama_lin_release` / `sgl_llama_lin_slots_in_use`。
+  新 ctest **test_lin_seq**（`tests/test_lin_seq.c`）：共享前缀 + 不同后缀并发 decode，
+  每一步 logits 与单独跑**逐位相同（maxerr=0）**；槽位占用 2/释放后 0；并带一个
+  **反向对照**（故意共用 seq key → 结果必须不同，证明测试真能抓住互踩）。
+- `tests/gen_random_qwen3next.py` / `tests/ref_qwen3next.py` 重写（字段布局与真实 80B
+  config 对齐；norm 权重取 ~N(0,0.3) 而不是 HF 的 0 初值，这样 (1+w) 写错就会被抓住）；
+  `tests/_ref_qwen3next.json` 重新生成。全量 `ctest` **24/24 通过**，真实 qwen3-06 回归不变。
 
 ### 性能
 - **G15 前缀缓存扩容**（`apps/cuda_http.c`）：租让登记的 **行数从「只有 prompt」改成
