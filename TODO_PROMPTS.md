@@ -2,6 +2,8 @@
 
 > 用法：新会话里先粘贴「公共上下文」块，再粘贴某条任务提示词。
 > 按价值排序；任务间无强依赖，可任意顺序（标注除外）。
+> v0.2（2026-10-27）：原 t1–t13 已全部完成并验收，见文末索引；本文件现列出
+> 验收时发现但未修的性能/健壮性/广度缺口。
 
 ---
 
@@ -9,220 +11,195 @@
 
 ```
 继续开发 sglang-c：把 sglang（LLM 推理框架）用纯 C 重写的项目，位于
-C:/Users/ultra/Desktop/works/sglang/sglang-c/（约 5800 行 C+CUDA，M0–M25 已完成）。
+C:/Users/ultra/Desktop/works/sglang/sglang-c/（约 1.2 万行 C+CUDA，M0–M26 + t1–t13 已完成，tag v0.2.0）。
 现状：
-- CPU 栈（MinGW GCC 16.2 / Ninja / x86-64-v2）：三后端 gpt2 / llama(含 tinyllama、qwen2
-  含 qkv-bias 与 QK-Norm) / 模型抽象 sgl_model；连续批处理调度器；HTTP（/health
-  /generate /v1/completions /v1/chat/completions，含 ChatML、SSE 流式、stop、n）；
-  RadixCache 分页 KV + LRU 驱逐；W8A16 权重量化；int8 KV；SSE2/SSE4.1 手写 SIMD；
-  beam search；speculative 框架；LoRA 加载时合并。15 套 ctest 全绿。
-- CUDA 栈（VS2022 BuildTools + nvcc 13.3，sm_75 = RTX 2060 4GB，build-cuda 目录，
-  CMake 用自定义命令直驱 nvcc——MSBuild 的 CUDA 集成不稳勿用）：kernels 含
-  rmsnorm/rope/attention(GQA+shared softmax)/silu；GEMM 自适应分派（M=1 手写 k_gemm_nt，
-  M>1 cuBLAS，helper gemm_nt_cublas）；decode_batch（B≤32，KV 段隔离 forward_seg/decode_batch）；
-  cuda_cli（单发）与 cuda_http（8 并发 HTTP 服务）。
-- 实测：GPU 单流 45.7 tok/s、批处理 105-118 tok/s（qwen2.5-0.5B）；CPU 7.4 tok/s（tinyllama W8+KV8+SIMD）。
-- 磁上模型：models/gpt2(124M f32)、models/tinyllama(1.1B bf16)、models/qwen05(0.5B bf16,
-  qwen2)、models/tiny-llama(2层随机,数值测试)、models/llama-160m(draft)、models/test-lora*
-  （LoRA 测试适配器，gen_lora.py 可再生）。
-铁律（历史踩坑，务必遵守）：
-1) sgl_xmalloc 是 _aligned_malloc——只能 sgl_xfree 释放，绝不 free()；反过来 _strdup/malloc
-   的指针绝不 sgl_xfree。两处都犯过堆损坏。
-2) CPU 编译 -march=x86-64-v2（本机 WinLibs GCC 16.2 的 AVX2 自动向量化有间歇崩溃 bug）。
-3) 头文件带 UTF-8 BOM；MSVC 加 /utf-8；.cu 源文件注释纯 ASCII（GBK 误读会吞代码行）。
-4) RoPE 位置必须按 token 计，行号不是位置（CPU/GPU 各犯过一次）；KV 多层布局 [L][ctx][KD]
-   的读写都要层偏移 l*ctx*KD，分配要乘 L（两个互掩 bug）。
-5) 每次改完必跑：CPU `ctest --test-dir sglang-c/build`（15 套）+ CUDA
-   `cuda_test.exe models/qwen05`（三方数值 GPU/CPU/numpy + 批处理不变量）。
-   数值验证一律用 numpy 独立参考（tests/ref_llama.py 模式），不信旧输出。
-6) HuggingFace 直连可用（hf-mirror 反而常挂）；ModelScope 国内源备选。
-构建命令：
-- CPU：PATH 加 …WinLibs…/mingw64/bin 后 cmake --build sglang-c/build
-- CUDA：PATH 加 CUDA/v13.3/bin 后 cmake --build sglang-c/build-cuda --config Release --target cuda_test cuda_cli cuda_http
-- 一键：build_all.bat；性能快照：powershell -File bench_all.ps1
+- CPU 栈（MinGW GCC 16.2 / Ninja / x86-64-v2）：gpt2 / llama族(gpt2、llama、qwen2、qwen3、
+  mistral 滑窗、gemma 归一化) / sgl_model 抽象；连续批处理调度器；HTTP（CPU http.c + GPU
+  cuda_http.c 双实现：/health /generate /v1/completions /v1/chat/completions，ChatML、SSE、
+  排队、finish_reason 如实、多模态 image_url）；RadixCache 分页 KV + LRU；W8A16 权重 +
+  int8 KV；SSE2/SSE4.1 手写 + AVX2 dot（运行时检测）+ OpenBLAS 运行时分派（大 M GEMM 3.1x）；
+  beam search；spec v2（n-token 批量 verify，160m draft 接受率 13%，spec==greedy 保证）；
+  多 LoRA 热切换（plan B 实例池）；CLIP ViT 编码器 + mm_projector + embedding 级融合前向。
+  20 套 ctest 全绿（含 t9 三族随机结构 numpy 对照、t10 llava 随机结构对照）。
+- CUDA 栈（VS2022 BuildTools + nvcc 13.3，sm_75 = RTX 2060 6GB，build-cuda 目录，
+  CMake 自定义命令直驱 nvcc）：llama 族 + gpt2 双后端；三精度（fp32 / fp16 SGL_CUDA_FP16 /
+  W8A8 dp4a SGL_CUDA_W8，显存最优档 free VRAM 3947MB）；CUDA Graph（cuda_cli 场景 B=1 +174%/
+  B=4 +89%；cuda_http 场景默认关——动态 batch 不稳定）；两遍式长上下文 attention（ctx 16384，
+  KV scatter 2D memcpy）；滑窗（4 kernel 全带 win 参数）；sgl_cuda_forward_seg_emb
+  （视觉 embedding 直进层循环，GPU vs CPU 融合 1.2e-7）。
+- 实测（docs/BENCH.md 终版快照）：qwen05 GPU 单流 fp32 33.5 / fp16 36.3 / int8 33.8 tok/s、
+  批处理 540.8 tok/s（B=4）；tinyllama-1.1B fp16 39.4 tok/s 入 6GB 卡；CPU 4.1 tok/s（OpenBLAS
+  大 M GEMM 195 GFLOPs）。
+- 磁上模型：真实权重 gpt2(124M)/tinyllama(1.1B)/qwen05(0.5B qwen2)/qwen3-06(0.6B)/
+  llama-160m(draft)/tiny-llama(2层随机)；随机结构 mistral-rand/gemma-rand/llava-rand
+  （tests/gen_random_*.py 可再生，含 numpy 参考生成器）；mm-test=mistral-rand+llava-rand 组合。
+- 构建铁律（历史踩坑，务必遵守）：
+  1) sgl_xmalloc/_aligned_malloc 只能配 sgl_xfree；malloc/_strdup 只能配 free。混用即堆损坏。
+  2) 所有 .c/.h/.cu 必须带 UTF-8 BOM——MSVC/nvcc 按 GBK 读无 BOM 的中文注释会吞结构体
+     声明（报 has no member）。CMake configure 阶段有自检警告；edit_file 改完可能丢 BOM，
+     重编前查第一字节 EF BB BF。
+  3) CMake 自定义命令编的 cuda_backend.obj 不跟踪头文件依赖——改 include/sgl/*.h 后必须
+     删 build-cuda/cuda_backend.obj 强制重编，否则旧偏移访问新 struct = cuda_http 启动即崩。
+  4) CUDA graph 捕获绑定设备指针和 pinned host 地址：任何 buffer realloc（reserve/ensure_io）
+     必须先 invalidate_graphs()（已有 helper）。
+  5) 数值问题先写独立 numpy 参考（tests/ref_*.py 模式）裁决，不猜；随机小模型
+     （gen_random_*.py）优先于下载大权重。
+  6) edit_file 的 old_text 必须与文件原文一字不差（缩进、空格、换行）；先 read_file 看准再改。
 ```
 
 ---
 
-## 任务 1 · CUDA FP16 权重与计算（性能，首选，大）
+## 任务 G1 · GPU 长上下文 prefill 提速（性能，中大）
 
 ```
-为 sglang-c CUDA 后端加 FP16 路径（现在全 fp32，4GB 显存只能装 0.5B 模型）：
-1) cuda_backend.cu：新增 half 权重上传（上传时 fp32→fp16），k_gemm_nt 加 __half2 版
-   （fp16 乘加、fp32 累加），attention/RoPE 可保 fp32（精度敏感）；大 GEMM 走
-   cublasHgemm（先 bench：Turing 卡 hgemm vs sgemm 实测多少倍再定分派阈值）。
-2) 混合精度预算：权重/输入 fp16，累加与 softmax fp32（对标 sglang 的 fp16 推理）。
-3) 目标：TinyLlama-1.1B（fp16 后 ≈2.2GB）能整卡装入并推理；qwen05 吞吐对比 fp32。
-验收：
-- cuda_test：qwen05 fp16 vs fp32 GPU 的 greedy 逐 token 一致或差异可解释
-  （打印 top1/top2 间隙，间隙 <1e-2 的分步翻转可接受）；
-- tinyllama-1.1B 在 GPU 上跑通 'The meaning of life is' 续写（连贯文本），
-  与 CPU(MinGW) greedy 逐 token 对照（fp16 容差内）；
-- bench_all.ps1 新增 fp16 行，吞吐/显存数字写入 README。
-注意：显存预算公式先算清（权重 + KV[24层][ctx][KD] + scratch），ctx 钳制逻辑沿用。
+现状：k_attn_long 两遍式（K 点积算两遍换固定 shared 内存），8192-token prefill 66.2s
+（KV scatter 已优化过：174→66s，见 git log）。CPU 同长度 4096s，数值验收已过
+（maxerr 1.56e-4 < 1e-3），纯性能问题。
+1) 先 profile 定位：nsys 或手打每层计时（k_attn_long vs GEMM vs KV scatter 占比），
+   别猜。怀疑点：q 加载重复、无 K/V 分块复用 L2、两遍扫描本身。
+2) 块级 Flash Attention 重写 k_attn_long：Q 块驻 shared，K/V 块流式过 global，
+   online softmax 已有（run_max/run_sum 框架在），缺的是 Q 分块复用与向量化
+   （half2/float4 加载）。
+3) 目标：8K prefill 66s → <10s（6.6x）；验收用 tests/long_vcpu.c models/qwen05 8192
+   （maxerr < 1e-3 不回退）+ cuda_test [long] 段全绿。
 ```
 
-## 任务 2 · 长上下文：两段式（flash 式）attention（能力，中）
+## 任务 G2 · W8 大 M 切 cublas IMMA（性能，中）
 
 ```
-解除 CUDA 侧 ctx=4096 钳制（k_attn 的 scores 全驻 shared memory，48KB 上限）：
-1) k_attn 改分块在线 softmax：KV 按 512/块迭代，维护 running max 与 running sum
-   （标准 flash-attention 的 rescale 技巧），shared 只驻当前块；输出同样分块累积。
-2) forward_seg/decode_batch 同步解除钳制；ctx 上限回到模型配置（qwen05=32K）。
-3) prefill 顺带支持长 prompt 分块（n 大时 attention O(n²) 逐块走）。
-验收：
-- 构造 8K token prompt（重复文本即可），GPU prefill 输出 logits 与
-  CPU（llama.c 本就支持任意 ctx）maxerr < 1e-3；
-- 显存不随 ctx 超线性爆（打印峰值）；
-- 原 4096 内路径回归不破坏（cuda_test 全绿）。
+现状：PROJ 宏所有 M 都走手写 dp4a kernel。gemm-bench 实测（NOTES_t8.md 补记）：
+M=1 两者持平（dp4a 正确选择）；M=8 IMMA 快 6-16x、M=64 快 30-100x——dp4a 的
+dim3(N,M) 网格每块独立重复量化同一行激活。
+1) 写 k_quant_rows（激活 [M,K] → int8 + 每行 scale，一次 kernel）；
+2) PROJ 宏 M>1 分支：量化 → cublasGemmEx(CUDA_R_8I×8I→32I, CUBLAS_COMPUTE_32I)
+   → 反量化 kernel（Ci32 × scale_A[row]×scale_W[n] + bias）；
+3) 验收：cuda_test SGL_CUDA_W8=1 全绿（fp32 对照容差已有）；bench：qwen05 W8 prefill
+   （长 prompt）前后对比进 BENCH.md。注意 cublasGemmEx 8I 要求 K%4==0 且列主布局——
+   gemm-bench 里已有可抄的正确调用姿势。
 ```
 
-## 任务 3 · CUDA Graph（性能，中）
+## 任务 G3 · cuda_http decode graph 稳定性（稳定/性能，中）
 
 ```
-decode 循环每步 ~20 个 kernel launch，用 CUDA Graph 消除：
-1) 形状固定的 decode 步（B、各 seq len 每步变）→ 把 pos/base/lens 放设备内存
-   （kernel 从设备指针读），输入输出 buffer 固定地址，即可 cudaStreamBeginCapture
-   捕获整个 decode_batch 的一次迭代，实例化后每步只 memcpy 参数 + cudaGraphLaunch。
-2) 注意 cuBLAS 在 capture 中的行为（cublasSetStream 指向捕获流；workspace 预分配）。
-验收：捕获路径 vs 非捕获路径同输入 logits 全等（bit 级或 1e-6）；
-decode 吞吐提升实测（B=1 与 B=4 各报一个数字，目标 +15% 以上）；cuda_test 全绿。
+现状：cuda_http 默认 SGL_CUDA_GRAPH=0（t5 决定）。开启时动态 batch（B 逐请求变化 +
+ensure_io/reserve realloc）偶发 sticky CUDA error，即使已加 invalidate_graphs()。
+已修：buffer 悬空、graph 缓存失效；未修：偶发 illegal memory access（WDDM 下
+cudaGraphExecUpdate/跨 B 的 graph 竞态待查）。
+1) 复现脚本：conc_test.ps1 循环 + SGL_CUDA_GRAPH=1，盯 nvidia-smi 与 err log；
+2) 尝试：按 (B, cap代数) 双键缓存 graph；或 capture 时固定最大 B=8、空槽 pos=0 掩码；
+3) 验收：graph ON 下 conc_test 5 轮全过 + stream_test 全 PASS；BENCH 加 graph ON 的
+   cuda_http 批处理吞吐行（预期恢复 t3 的 +89%）。
 ```
 
-## 任务 4 · GPT-2 的 CUDA 后端（对等性，小）
+## 任务 G4 · HTTP 无 body 请求间歇卡（稳定，中）
 
 ```
-CUDA 后端目前只支持 llama 族；给 gpt2 补上（sgl_gpt2* 为源）：
-1) gpt2 权重是 Conv1D 布局 [K,N]（llama 是 [N,K]）：上传时转置一次成 [N,K] 复用
-   现有 gemm/attention 路径（gpt2 有绝对位置编码 wpe、LayerNorm 带 bias、GELU——
-   上传 wpe，kernel 组合差异在 forward_seg 内分支处理，或写 gpt2 专用 forward）。
-验收：cuda_cli 对 models/gpt2 的 greedy 输出与 MinGW sglc 逐 token 一致；
-cuda_test 加 gpt2 用例（三方对照沿用现有断言风格）。
+现状：GET /health（无 body）在本机间歇挂起 conn_thread——CPU http.c 与 GPU cuda_http.c
+两套独立实现同现象（NOTES_t5.md 详记实验矩阵：短请求挂、带 body/加 pad 全通）。
+已规避：监控用 POST /health（已支持）；SO_RCVTIMEO/SO_SNDTIMEO/TCP_NODELAY 都加了。
+怀疑方向：本机 LSP/杀软钩子或 winsock 对特定 recv 模式的 bug。
+1) 抓包定位（pktmon/netsh trace）：卡住时包到底到没到内核；
+2) 旁证实验：另一台干净 Win 机器跑同 binary 是否复现（区分环境 vs 代码）；
+3) 若是环境：README 已知限制节写明+指引；若是代码：修。
+验收：复现路径明确（或干净机器不复现的结论），写入 NOTES_t5.md 更新。
 ```
 
-## 任务 5 · GPU HTTP 服务对等 + RadixCache（对等性，中）
+## 任务 G5 · t11 遗留：CUDA 显存预检 + soak 资源曲线（质量，小）
 
 ```
-cuda_http 目前 8 静态 KV 段、无前缀复用、流式未验证：
-1) 验证/修复 SSE 流式（wait_done 已有流式分支雏形）——curl -N 流式拼接必须严格
-   等于非流式响应（CPU 服务的 test_http 有同款断言可抄）。
-2) 并发 >8 时排队而非拒绝；段满 finish_reason=length；空闲段回收复用。
-3) 进阶（可选）：GPU 版前缀复用——prompt hash → KV 段缓存，重复 system prompt
-   的 chat 请求跳过 prefill（段内 memcpyAsync 复制 KV 或记录段租约）。
-验收：两轮 8 并发全过且服务存活（build-cuda/conc_test.ps1 现成）；
-流式==非流式；排队请求最终完成。
+t11 做了 soak+fuzz+降级（soak_fuzz.ps1 全过），但两项没做：
+1) GPU 上传前 free_mem 预检：sgl_cuda_from_llama 前 cudaMemGetInfo 估
+   （权重 + KV[ctx] + scratch）需求，不够则明确报错（现在是大半路 cudaMalloc 失败退出）；
+2) soak 的 RSS/VRAM 曲线：soak_fuzz.ps1 只测了延迟漂移，原要求「循环 1000 请求记录
+   RSS/VRAM 修到平稳」——加曲线记录与斜率判定（Get-Process WorkingSet64 +
+   nvidia-smi --query-gpu=memory.used 采样）。
+验收：显存不足场景返回明确 503 文案；1000 轮 soak 曲线末段斜率 <5%（无泄漏）。
 ```
 
-## 任务 6 · 多 LoRA 热切换（功能，中）
+## 任务 G6 · GPU 前缀缓存 RadixCache（功能，中）
 
 ```
-LoRA 现为加载时合并（一份权重一个 adapter）。改运行时多适配器：
-方案 A（显存允许时）：base fp16 + 每个 adapter 预乘 delta [N,K] 上传，gemm 前用
-  cublasAxpy 临时叠加（请求级），或 forward 分支 W+delta 的 cublasGemmEx beta 技巧；
-方案 B（省显存）：只在 CPU 栈做——model.c 支持按请求选择已合并的多份实例副本
-  （调度器给每个 sgl_model 实例建池，请求带 lora 名路由）。
-先估算显存：qwen05 fp16 base ≈0.5GB + 每 adapter delta（r=8×7投影≈18MB）→ 方案 A 可行。
-验收：同一服务两个请求用不同 adapter，输出各自 == 单独加载该 adapter 的 CPU 参考
-（tests/gen_lora.py 造 2 个不同 seed 的 adapter）。
+t5 的可选项没做。cuda_http 每 KV 段独立，重复 system prompt 的 chat 全量重 prefill。
+1) prompt hash → 段号租约表：hash(prompt_ids) 相同的请求复用已完成 prefill 的段
+   （引用计数，同 CPU 栈 radix 语义的最小子集）；
+2) 或轻量版：段内 memcpyAsync 复制 KV（src 段 → dst 段 + 跳过 prefill）；
+3) 验收：同 system prompt 两连发，第二发 prefill 时间 ~0 且输出与第一发逐 token 一致；
+   conc_test 回归。注意与 G3 的 graph 交互。
 ```
 
-## 任务 7 · Speculative Decoding v2（性能，中）
+## 任务 G7 · Speculative decoding GPU 侧（性能，中）
 
 ```
-M18/M19 结论：框架正确但未训练 draft 接受率 13%、CPU 逐步验证无批收益 → 净减速。
-v2 两件事：
-1) 验证批 n-outer GEMM：CPU 侧 llama.c 加「一次前向吃 n 个 token 的分块 GEMM」
-   （权重驻留复用，n 路激活按块算），使 verify 成本 ≈ 单步 ×1.2 而非 ×n；
-2) 找真 draft：qwen2.5-0.5B 的官方小 draft 无——改用 llama-160m 已验（13%），
-   或下载 Qwen2.5-0.5B 蒸馏版/自测 Qwen2-0.5B 当 target 时用 random-init 微调不可行——
-   务实路径：target=llama-160m + draft=截层自草稿（160m 上测接受率），或直接
-   在 160m/1.1B 组合上重测（llama-160m 是 Llama-2 词表 32000，tinyllama 同词表——
-   M19 已配好 models/llama-160m）。
-验收：报告接受率与端到端 tok/s（vs 非 spec 基线）；数学保证保持
-（spec greedy == target-only greedy 逐 token，test_spec 现成断言）。
+CPU 侧已验证框架正确（spec==greedy 保证 + 13% 接受率），但 CPU 净减速（draft 前向
+成本>verify 节省，NOTES_t7.md）。GPU 才是收益场景：
+1) sgl_spec_generate 的 CUDA 版：draft/target 都 sgl_cuda_forward_seg（同段隔离），
+   verify 用 n-token forward_seg（GPU 已支持 n>1）；
+2) lm_head 每 verify 步一次（n 行 logits）→ 主机逐步比对；
+3) 验收：tinyllama-1.1B(target)+llama-160m(draft) GPU 上报告接受率与 tok/s vs 非 spec
+   基线（BENCH.md 加行）；spec==greedy 断言沿用 test_spec。
 ```
 
-## 任务 8 · CUDA int8 权重（性能，中大）
+## 任务 G8 · 真实 LLaVA 端到端 + 图片解码（广度，中）
 
 ```
-GPU 侧 W8A16（CPU 已有 sgl_quant 基建）：
-1) cublasGemmEx：A CUDA_R_8I × B CUDA_R_8I → C CUDA_R_32F（Turing int8 tensor core，
-   理论 2x fp16）；权重加载时 per-channel 量化上传，scale 向量另存，输出乘 scale；
-2) 或手写 dp4a kernel（__dp4a 指令，Turing 原生），先 bench 两者。
-验收：qwen05 int8 vs fp32：top5 重叠 ≥4/5、greedy 允许低概率分步翻转（打印间隙）；
-吞吐/显存数字 vs fp16/fp32 三列对比进 README。与任务 1 的 FP16 可组合（fp16 激活
-+ int8 权重的混合可后续再议，先各自独立）。
+t10 用随机结构验证了 CLIP→projector→融合→HTTP 全链路（numpy 9.3e-9）。缺真实权重：
+1) openai/clip-vit-base-patch32 真实 CLIP（~150M，hf 直连）+ ref 分层对照
+   （每层输出 maxerr<1e-4，ref_llava.py 扩展）；
+2) 真实小 LM 组合：clip + projector(随机) + mistral-rand 已通，换 qwen3-06 当 LM 的
+   维度适配（projector 输出 E=1024）；llava-1.5-7b 6GB 卡装不下不做；
+3) JPEG/PNG 解码（可选）：stb_image.h 单头集成，HTTP 接受真实图片格式而非 raw float
+   base64（现约定已文档化）。
+验收：真实 CLIP 分层对照全过；带图 chat 请求 200 且输出随图变（人工检查）。
 ```
 
-## 任务 9 · 更多模型族：Mistral / Gemma / Qwen3（广度，中）
+## 任务 G9 · 模型族补完（广度，小）
 
 ```
-llama.c 加新族差异（各自 config 探测 + 权重命名适配）：
-- Mistral：sliding window attention（window 4096 的 banded mask；CUDA k_attn 加
-  window 参数跳过窗外块，CPU 侧 attention 循环加窗口判断）；
-- Gemma：pre-feedforward/post 布局差异、normalizer sqrt(hidden) 缩放、
-  RoPE 8k 基频 + 线性缩放（rope_scaling 配置）；embedding 软上限 tanh(30x)（可选）；
-- Qwen3：QK-Norm 已支持、layer_types（sliding/full 混合层）。
-每个族：下小模型（hf 直连）→ 照 tests/ref_llama.py 写 numpy 参考 → greedy 全等断言。
-验收：各族 greedy6 == numpy；ctest 各加一 case；README 模型支持表更新。
+t9 各族主干已通（随机结构 numpy 全等 + qwen3-06 真实权重），三个特性没实现：
+1) Gemma：rope_scaling（8k 基频+线性缩放，config.rope_scaling 字段）、embedding
+   tanh(30x) 软上限（可选开关）；
+2) Qwen3：layer_types（sliding/full 混合层）——现 qwen3-0.6B 全 full 未暴露；
+   下载 qwen3-06 之外带 sliding 层的变体或改 gen 脚本生成混合层随机模型对照；
+3) 真实 Mistral-7B/Gemma-2B 太大，不下；用随机结构覆盖特性即可。
+验收：各特性 numpy 参考对照（ref_llama.py 已有分支框架）；ctest 各加一 case。
 ```
 
-## 任务 10 · 多模态：LLaVA 式视觉输入（广度，大）
+## 任务 G10 · AVX2 自动向量化重试（性能，小，条件任务）
 
 ```
-给 /v1/chat/completions 加 image_url(base64 data URI)：
-1) CLIP ViT-B/32 encoder 的 C 移植（patch embed conv + 12 层 transformer，
-   ~150M 参数 safetensors，openai/clip-vit-base-patch32）；image → 49 patch tokens；
-2) projector（llava 的 MLP）映射到 llama 词表维度，插入 prompt token 序列；
-3) HTTP 解析 content 数组形式（[{type:text},{type:image_url}]）。
-验收：encoder 每层输出 vs HF transformers numpy 参考 maxerr<1e-4（分层数值对照，
-沿用 ref_llama.py 模式）；端到端：llava-1.5-7b 太大装不下——用
-llava tiny 随机权重测试数值通路 + 真实小组合（qwen2-vl-2b 若可拆）人工检查连贯性。
-范围提示：这是最大的单项任务，可拆 encoder→projector→HTTP 三步分轮做。
-```
-
-## 任务 11 · 健壮性硬化（质量，中）
-
-```
-1) 泄漏：循环 1000 请求（CPU sglc --serve 与 cuda_http 各一轮）记录 RSS/VRAM 曲线，
-   修到平稳；工具写进 bench_all.ps1（--soak 模式）。
-2) Fuzz：畸形 JSON、超长 prompt（>ctx）、max_tokens=10^9、非法 UTF-8、二进制 body、
-   Connection 立即断开、并发同 id——全部不崩、有合理状态码。
-3) 优雅降级：KV pool 满（CPU 调度器已会等待重试，验证）、GPU 显存不足
-   （上传前 free_mem 预检 + 明确报错）、ctx 满时 finish_reason=length。
-验收：soak 曲线平坦；fuzz 清单全过；两种服务的错误路径各有断言测试。
-```
-
-## 任务 12 · CPU 性能二阶段（性能，中）
-
-```
-1) OpenBLAS 集成：sgl_matmul_nt 加运行时分派（预编译 openblas.dll + CMake 可选
-   SGL_OPENBLAS=ON），注意 OpenBLAS 是 [N,K] 列主 Fortran 习惯——CblasRowMajor
-   直接支持；bench 决定是否默认开。
-2) AVX2 重试：装新版 WinLibs/GCC（>=16.3）重跑当年 25 次崩溃复现
-   （tests 里有历史：x86-64-v2 稳、avx2 间歇 0xC0000005）——修复则换
-   -march=native 重 bench（预计 GEMM 再 2x）。
-3) prefill n-outer 分块 GEMM（与任务 7.1 同一基建，先做这边可复用）。
-验收：bench_all.ps1 前后对比写入 README；ctest 全绿（OpenBLAS 与内置两路都要过）。
-```
-
-## 任务 13 · 收尾发布（文档，小）
-
-```
-1) README 完整化：英文版或双语、全部端点+参数表、模型支持矩阵、性能表
-   （CPU/GPU × fp32/fp16/int8 各行）、已知限制清单（对照各任务完成情况更新）。
-2) CHANGELOG.md（M0–M25+ 时间线已在 ROADMAP.md，转正式格式）；
-   LICENSE 核查（原 sglang Apache-2.0，注明派生关系）。
-3) 从零验证：删除 build*/ 后 build_all.bat 一把过；新机器清单（工具链版本）写进
-   README「环境要求」。
-4) 最终全套回归 + bench_all.ps1 快照存档。
+t12 时 winget 最新 WinLibs 16.2（16.3 不存在），当年 25 次 0xC0000005 复现没重跑；
+现用手写 AVX2 dot + 运行时检测绕开（M=1 GEMV 已吃满带宽，收益有限）。
+条件：winget 出 GCC>=16.3 后。步骤：装新版 → tests 历史复现脚本跑 25 次 →
+稳则 -march=native 重 bench（预计大 M GEMM 再 2x，与 OpenBLAS 195 GFLOPs 对比）。
+验收：25/25 稳定 + BENCH.md 更新，或仍崩则关闭并在 ROADMAP 记录版本号。
 ```
 
 ---
 
 ## 附注
 
-- **张量并行**未列入：本机单卡 4GB，真 TP 无从验证；若未来双卡，任务 9 的 Mistral
-  路径（MoE 的 expert 并行）是更自然的切入点。
-- 顺序建议：1 → 2 → 3（性能主线）→ 4/5（对等性）→ 11（随时可插入）→ 其余按需。
-  任务 7.1 与 12.3 共享「n-outer 分块 GEMM」基建，做哪个先都行、注明复用。
+- **张量并行**仍未列入：单卡 6GB 无从验证；双卡时 Mistral 路径（MoE expert 并行）切入。
+- 顺序建议：G1（性能主线最大缺口）→ G2 → G3（恢复 graph 收益）→ G5（小而快）→ 其余按需。
+  G3 与 G6 都动 cuda_http 引擎，先 G3 后 G6。
+
+---
+
+## 已完成索引（v0.2.0，2026-10-27）
+
+原 t1–t13 全部完成并验收，细节见 docs/NOTES_t*.md 与 git log（t1: t-series commits）：
+
+| 任务 | 结果 |
+|---|---|
+| t1 FP16 | 1.1B 入 6GB 卡 39.4 tok/s；gap 对照可解释翻转 |
+| t2 长上下文 | ctx 16384；8K GPU vs CPU 1.56e-4 PASS（66s 慢 → G1） |
+| t3 CUDA Graph | B=1 +174% / B=4 +89%（cuda_cli；cuda_http 场景 → G3） |
+| t4 GPT-2 CUDA | 三方（MinGW CPU==GPU fp32==fp16）逐 token 一致 |
+| t5 GPU HTTP 对等 | 排队/finish_reason/SSE==plain/12 并发全过（前缀缓存 → G6） |
+| t6 多 LoRA | 运行时热切换（plan B 实例池） |
+| t7 Spec v2 | 13% 接受率、spec==greedy 保持；CPU 净减速如实记录（GPU → G7） |
+| t8 CUDA int8 | dp4a 显存最优档（free 3947MB）greedy 全同（IMMA 对比已补，大 M → G2） |
+| t9 模型族 | qwen3-06 真实 + mistral 滑窗/gemma 随机结构 numpy 全等（补特性 → G9） |
+| t10 LLaVA | CLIP+projector+融合+HTTP image_url 全链路（真实权重 → G8） |
+| t11 健壮性 | soak+fuzz 全过；修 5 个服务 bug（预检/曲线 → G5） |
+| t12 CPU 性能 | OpenBLAS 分派 3.1x + AVX2 dot 手写（向量化重试 → G10） |
+| t13 发布 | README/CHANGELOG/LICENSE（含 sglang 派生声明）/BOM 自检/从零两栈验证 |
