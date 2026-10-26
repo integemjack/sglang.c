@@ -1,5 +1,4 @@
 ﻿# 鏋勫缓鏍戯紙鍚竴涓悕瀛楁崯鍧忕殑鍘嗗彶娈嬬暀鐩綍锛?buil*/
-
 # 鏋勫缓浜х墿
 *.exe
 *.obj
@@ -7,9 +6,12 @@
 *.a
 *.lib
 *.pdb
-
 # 妯″瀷鏉冮噸涓嶅叆搴擄紙tests 鐨?gpt2 鏉冮噸鐢?CI 鎸夐渶涓嬭浇锛泃okenizer/config 鍏冩暟鎹叆搴擄級
 **/model.safetensors
-
 # OpenBLAS 权重不入库（51MB dll；fetch 见 README 环境要求。必须用 Release 的 x64.zip 标准 32 位 int 包——x64_64 是 64 位 int ABI）
 third_party/openblas/
+buil*/
+third_party/openblas/
+models/*/model.safetensors
+models/*/_ref_proj.npy
+*.npy
