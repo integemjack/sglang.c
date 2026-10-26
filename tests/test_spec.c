@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "sgl/port.h"
 #include "sgl/alloc.h"
 #include "sgl/bpe.h"
 #include "sgl/llama.h"

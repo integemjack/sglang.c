@@ -7,9 +7,35 @@
 #include <string.h>
 #include <time.h>
 
-#include <pthread.h>
+#ifdef _WIN32
+#include "sgl/port.h"
+#include <pthread.h>          /* MinGW winpthreads */
 #include <winsock2.h>
 #include <ws2tcpip.h>
+static void sgl_sock_init(void) {
+  WSADATA wd;
+  if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) SGL_ERROR("WSAStartup failed");
+}
+static void sgl_sleep_ms(int ms) { Sleep(ms); }
+#else
+#include "sgl/port.h"
+#include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <pthread.h>
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define closesocket(s) close(s)
+#define WSAGetLastError() (errno)
+#define WSACleanup() ((void)0)
+#define sgl_sock_init() ((void)0)
+static void sgl_sleep_ms(int ms) {
+  struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+  nanosleep(&ts, NULL);
+}
+#endif
 
 #include "sgl/alloc.h"
 #include "sgl/json.h"
@@ -450,7 +476,7 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
         pthread_mutex_unlock(&srv->lock);
         break;
       } else {
-        Sleep(25); /* MORE：等下一批 */
+        sgl_sleep_ms(25); /* MORE：等下一批 */
       }
     }
     sgl_xfree(prompt_copy);
@@ -591,8 +617,7 @@ static void *acceptor_fn(void *arg) {
 /* ---------- 生命周期 ---------- */
 
 sgl_http_server *sgl_http_serve(sgl_scheduler *sched, const char *host, int port) {
-  WSADATA wd;
-  if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) { SGL_ERROR("WSAStartup failed"); return NULL; }
+  sgl_sock_init();
 
   sgl_http_server *srv = (sgl_http_server *)sgl_xcalloc(1, sizeof(*srv));
   srv->sched = sched;
@@ -648,7 +673,7 @@ void sgl_http_stop(sgl_http_server *srv) {
   while (srv->active_conns > 0) {
     pthread_mutex_unlock(&srv->lock);
     closesocket(srv->listen_fd); /* 令 accept 退出 */
-    Sleep(100);
+    sgl_sleep_ms(100);
     pthread_mutex_lock(&srv->lock);
   }
   pthread_mutex_unlock(&srv->lock);

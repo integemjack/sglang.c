@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "sgl/port.h"
 #include "sgl/alloc.h"
 #include "sgl/bpe.h"
 #include "sgl/json.h"

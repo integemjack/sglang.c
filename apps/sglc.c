@@ -70,8 +70,13 @@ int main(int argc, char **argv) {
   if (!model_dir) { usage(argv[0]); return 1; }
 
   /* 量化开关（llama 后端）：须在模型加载前生效 */
-  if (w8) _putenv_s("SGL_W8", "1");
-  if (kv8) _putenv_s("SGL_KV8", "1");
+#ifdef _WIN32
+#define SGLC_SETENV(k, v) _putenv_s(k, v)
+#else
+#define SGLC_SETENV(k, v) setenv(k, v, 1)
+#endif
+  if (w8) SGLC_SETENV("SGL_W8", "1");
+  if (kv8) SGLC_SETENV("SGL_KV8", "1");
 
   double t0 = now_sec();
 

@@ -15,6 +15,7 @@
 #include <omp.h>
 #endif
 
+#include "sgl/port.h"
 #include "sgl/alloc.h"
 #include "sgl/json.h"
 #include "sgl/log.h"

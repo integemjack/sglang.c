@@ -11,6 +11,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "sgl/port.h"
 #include "sgl/alloc.h"
 #include "sgl/scheduler.h"
 

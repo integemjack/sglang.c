@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "sgl/port.h"
 #include "sgl/alloc.h"
 #include "sgl/llama.h"
 #include "sgl/sampling.h"

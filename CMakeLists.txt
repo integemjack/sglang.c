@@ -43,6 +43,9 @@ endif()
 if(WIN32)
   target_link_libraries(sgl PUBLIC ws2_32) # http.c 的 winsock
   target_link_options(sgl INTERFACE -static) # 生成不依赖 MinGW 运行库 DLL 的独立 exe
+else()
+  # POSIX：math 函数在独立 libm（Windows 在主 CRT）
+  target_link_libraries(sgl PUBLIC m)
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -76,6 +79,9 @@ endif()
 file(GLOB SGL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_*.c)
 if(MSVC)
   # test_http 直接编 http.c（winpthreads）；MSVC 构建排除
+  list(REMOVE_ITEM SGL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_http.c)
+elseif(NOT WIN32)
+  # POSIX 无 winsock
   list(REMOVE_ITEM SGL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_http.c)
 endif()
 foreach(t ${SGL_TESTS})
