@@ -1013,9 +1013,13 @@ static int sgl_cuda_ensure_io(sgl_cuda_model *g, int B) {
   return 0;
 }
 
-/* logits buffers (device + pinned host), grown to `rows` rows of V floats */
+/* logits buffers (device + pinned host), grown to `rows` rows of V floats.
+ * G7: captured decode graphs bind d_lgb/h_lgb addresses in their D2H logits
+ * memcpy node (see capture_decode_graph), so a growth (free + realloc) must
+ * drop them first — same rule as the activation workspace (rule 4). */
 static int sgl_cuda_ensure_lgb(sgl_cuda_model *g, int rows) {
   if (rows <= g->lgb_cap) return 0;
+  invalidate_graphs(g);
   cudaFree(g->d_lgb); cudaFreeHost(g->h_lgb);
   CK(cudaMalloc(&g->d_lgb, sizeof(float) * (size_t)rows * g->V));
   CK(cudaMallocHost(&g->h_lgb, sizeof(float) * (size_t)rows * g->V));
@@ -1514,6 +1518,7 @@ long sgl_cuda_free_mem_mb(void) {
 }
 
 int sgl_cuda_ctx(const sgl_cuda_model *m) { return m->ctx; }
+int sgl_cuda_vocab(const sgl_cuda_model *m) { return m->V; }
 
 /* G6: 把 [src_base, src_base+len) 这 len 行的 KV（所有层、k 和 v）拷到
  * [dst_base, dst_base+len)。服务端前缀缓存用：命中的前缀不必重算 prefill，
@@ -1678,9 +1683,13 @@ static int gpt2_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos
 }
 
 /* t10 llava: shared llama forward — tokens==NULL takes emb ([n][E] host,
- * pre-fused visual embeddings) and skips the embed lookup; same layer loop. */
+ * pre-fused visual embeddings) and skips the embed lookup; same layer loop.
+ * G7: all_rows!=0 returns every position's logits in logits_out ([n][V],
+ * row i = prediction after consuming tokens[0..i]) via ONE M=n lm_head GEMM;
+ * otherwise logits_out is the single last-position row (original behavior). */
 static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
-                         int n, int pos0, int kv_base, float *logits_out) {
+                         int n, int pos0, int kv_base, float *logits_out,
+                         int all_rows) {
   int E = g->E, H = g->H, HK = g->HK, D = g->D, KD = g->KD;
   if (n <= 0 || pos0 + n > g->ctx) return -1;
   if (kv_base + pos0 + n > g->ctx) return -1;
@@ -1837,14 +1846,16 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
   }
   {
     if (logits_out) {
-      if (sgl_cuda_ensure_lgb(g, 1) != 0) return -1;
-      gemm_nt_any(g, g->h + (long)(n - 1) * E, g->lm_head, g->lm_head_h, NULL,
-                  g->d_lgb, 1, g->V, E);
+      int rows = all_rows ? n : 1;
+      const float *hbase = all_rows ? g->h : g->h + (long)(n - 1) * E;
+      if (sgl_cuda_ensure_lgb(g, rows) != 0) return -1;
+      gemm_nt_any(g, hbase, g->lm_head, g->lm_head_h, NULL,
+                  g->d_lgb, rows, g->V, E);
       CK(cudaGetLastError());
-      CK(cudaMemcpyAsync(g->h_lgb, g->d_lgb, sizeof(float) * (size_t)g->V,
+      CK(cudaMemcpyAsync(g->h_lgb, g->d_lgb, sizeof(float) * (size_t)rows * g->V,
                          cudaMemcpyDeviceToHost, g->stream));
       CK(cudaStreamSynchronize(g->stream));
-      memcpy(logits_out, g->h_lgb, sizeof(float) * (size_t)g->V);
+      memcpy(logits_out, g->h_lgb, sizeof(float) * (size_t)rows * g->V);
     }
   }
   if (prof) {
@@ -1865,7 +1876,16 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
 int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
                          int kv_base, float *logits_out) {
   if (g->kind == 1) return gpt2_forward_seg(g, tokens, n, pos0, kv_base, logits_out);
-  return fwd_seg_llama(g, tokens, NULL, n, pos0, kv_base, logits_out);
+  return fwd_seg_llama(g, tokens, NULL, n, pos0, kv_base, logits_out, 0);
+}
+
+/* G7: verify forward — every one of the n positions gets its own logits row
+ * (single M=n lm_head GEMM). See cuda.h for row semantics. */
+int sgl_cuda_forward_seg_rows(sgl_cuda_model *g, const int *tokens, int n,
+                              int pos0, int kv_base, float *logits_out) {
+  if (!logits_out || n <= 0) return -1;
+  if (g->kind == 1) return -1; /* llama backend only */
+  return fwd_seg_llama(g, tokens, NULL, n, pos0, kv_base, logits_out, 1);
 }
 
 /* t10 llava: pre-fused visual embeddings [n][E] straight into the layer loop
@@ -1873,7 +1893,7 @@ int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
 int sgl_cuda_forward_seg_emb(sgl_cuda_model *g, const float *emb, int n, int pos0,
                              int kv_base, float *logits_out) {
   if (g->kind == 1) return -1;
-  return fwd_seg_llama(g, NULL, emb, n, pos0, kv_base, logits_out);
+  return fwd_seg_llama(g, NULL, emb, n, pos0, kv_base, logits_out, 0);
 }
 
 /* graph-safe KV row write (M26b): destination computed from the DEVICE

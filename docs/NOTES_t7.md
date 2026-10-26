@@ -18,3 +18,22 @@
 - 修复记录：v2 初版 kv_catch_up 把 1 行 logits 缓冲传给 forward_n 的 n>1 prefill
   导致堆溢出（已修：借 n 行临时缓冲末行拷回）；test_llama 增加
   decode_batch==forward 断言防回归。
+
+## G7 补记：GPU 侧实现（2026-10-28，src/cuda_spec.c + sgl_cuda_forward_seg_rows）
+
+- 后端新增多行 logits 出口 `sgl_cuda_forward_seg_rows`（lm_head 一张 M=n GEMM）；
+  ensure_lgb 增长路径补 invalidate_graphs（图里绑的是 h_lgb/d_lgb 裸指针，铁律 4）。
+- 正确性（cuda_test [spec]，全绿）：
+  - qwen05 draft==target（同实例双 KV 段 0/8192）：接受率 100% (20/20)，24 tok 与非 spec greedy 全同；
+  - tinyllama(fp16)+llama-160m：接受率 13.3% (8/60)，24 tok 与非 spec greedy 全同（与 CPU 版 13% 一致）。
+- 性能（RTX 2060，free VRAM 2881MB，prompt='The meaning of life is'，new=32，best-of-3，
+  非 spec 基线 = prefill + decode_batch B=1 图步）：
+  - plain 80.3-82.9 tok/s；spec K=1 35.1 (0.44x, acc 39.1%) / K=2 28.6 (0.35x, acc 28.6%) /
+    K=4 22.0 (0.27x, acc 14.8%)——**仍净减速**。
+  - 成本实测分解（K=4）：每轮 ≈ 135ms（修补齐前）：4 次 draft 图步 ~20ms + verify n=4
+    plain 路径 ~30ms + reject/bonus 补齐各 1 次 plain forward_seg ~45ms。补齐改走
+    decode_batch 图步后降到 ~97ms/轮（11.9→22.0 tok/s）。
+  - 根因：① 接受率上限（未蒸馏同源小模型 13-15%，每轮只产 1.6 tok）；② verify/catchup
+    的 plain 路径在 WDDM 桌面 GPU 下不能图化（n 可变），固定吃 2-3 倍图步成本。
+    正收益条件：接受率≥ 50%（同源蒸馏 draft）或 verify 图化（固定 n）+ 批量 spec。
+- temperature>0 的修正采样（speculative sampling）GPU/CPU 均未实现，只支持 greedy。

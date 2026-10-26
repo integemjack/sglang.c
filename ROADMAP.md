@@ -99,3 +99,37 @@ G10 的前置条件（新版工具链）不成立。以下为本机实测：
    但序言已把栈对齐到 32B），ctest 一轮 21/23——**test_w8、test_family_qwen3 仍 0xc0000409**，旁路不完整，不采纳。
 5. 处置：CMakeLists 维持 `-march=x86-64-v2` 默认不变（未加开关：AVX2 无可靠启用路径）。复测资产：
    `build-g10/{repro/repro.c, run25.ps1, run25b.ps1, rounds25.log}`、`build-g10-sr/`。
+
+## G10 复验：x86-64-v2 主树 10 轮（2026-10-27）——结论：主树稳定，维持关闭
+
+**前置复核（winget，2026-10-26 独立再查）**：`winget search BrechtSanders.WinLibs` 最高
+POSIX.UCRT / POSIX.MSVCRT = **16.2.0-14.0.0-r3**（MCF.UCRT 16.1.0）；其余带 gcc 的包均非桌面
+x86-64 MinGW GCC（LLVM-MinGW 是 clang、avr-gcc 是交叉、GCC-TBC 是教学套件）。**GCC≥16.3 仍不存在，
+G10 条件不成立，任务关闭**。
+
+**主树 10 轮全量 ctest**（`build`，x86-64-v2，23 项；二进制 23:48 编自最终合并态——最新 CPU 源
+为 23:29 的 apps/sglc.c，工作树未提交改动仅 GPU 侧文件）。脚本 `build-g10/reverify10.ps1`，
+日志 `build-g10/reverify10.log`，每轮完整输出 `build-g10/rv_round{1..10}.txt`：
+
+```
+Round 1 [411s] FreeBefore=19315MB FreeAfter=18188MB | 100% tests passed out of 23
+Round 2 [432s] FreeBefore=18246MB FreeAfter=20409MB | 100% tests passed out of 23
+Round 3 [536s] FreeBefore=20398MB FreeAfter=19988MB | 100% tests passed out of 23
+Round 4 [557s] FreeBefore=19798MB FreeAfter=20225MB | 100% tests passed out of 23
+Round 5 [513s] FreeBefore=20242MB FreeAfter=17780MB | 100% tests passed out of 23
+Round 6 [393s] FreeBefore=24949MB FreeAfter=20413MB | 100% tests passed out of 23
+Round 7 [510s] FreeBefore=12738MB FreeAfter=17472MB | 100% tests passed out of 23
+Round 8 [503s] FreeBefore=17323MB FreeAfter=20184MB | 100% tests passed out of 23
+Round 9 [368s] FreeBefore=20309MB FreeAfter=17920MB | 100% tests passed out of 23
+Round 10[236s] FreeBefore=17926MB FreeAfter=25032MB | 100% tests passed out of 23
+```
+
+230/230 实例全过，0 次 SegFault / 0xc0000409。第 7 轮开始时空闲仅 12.7GB（GPU 任务并发占用
+~8GB）仍全绿——主树对内存压力不敏感。
+
+**判定**：上文 25 轮风暴（build-g10 = -march=native 实验构建）与当前代码无关，根因即上文第 3 条
+（AVX2 栈对齐）；其中 0xc0000409 一项已实证对应 `src/alloc.c` 的 OOM 路径：`sgl_xmalloc` 分配失败
+→ `SGL_ERROR + abort()`（alloc.c:24-28），本机 MinGW/UCRT 下 abort() 退出码实测 = 0xC0000409
+（`_aligned_malloc((size_t)-1,64)` 失败 + abort 的最小样本），与并发 GPU 进程挤占内存时大权重
+测试（test_w8/test_family_qwen3/test_spec/test_tinyllama）触发 OOM 的形态一致。发布基线维持
+x86-64-v2，无需改动任何 CPU 源码。

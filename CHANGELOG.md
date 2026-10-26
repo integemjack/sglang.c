@@ -2,7 +2,7 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — 2026-10-27 「缺口关闭 G1–G9」
+## [Unreleased] — 2026-10-27 「缺口关闭 G1–G10」
 
 本批处理 TODO_PROMPTS.md v0.2 列出的缺口。测量口径与全部数字见
 [docs/NOTES_gaps.md](docs/NOTES_gaps.md)（重要：本机空闲显存常小于模型常驻量，
@@ -26,6 +26,13 @@ WDDM 溢出会把绝对时间放大 3–20x，所以性能结论一律用**同�
   精确比对、LRU、段复用时释放租让）。`[prefix]` 复用 vs 重算 maxerr 1.43e-05、
   greedy 6/6 全同、prefill 50.4 vs 127.1ms；端到端 756-token 共享 system prompt
   0.76s → **0.34s（2.2x）**且输出逐字一致。
+- **G7 GPU 投机解码**：新增 `sgl_cuda_forward_seg_rows`（lm_head 一张 M=n GEMM 出全部
+  位置 logits）+ `src/cuda_spec.c` 的 `sgl_cuda_spec_generate`（draft/target 各占 KV 段，
+  接受逻辑与 CPU spec.c v2 逐 token 等价）。**正确性全过**：`[spec]` draft==target 接受率
+  100%、真实组合（tinyllama+llama-160m）13.3%，两者输出均 == 非 spec greedy 逐 token 全同。
+  **性能为净减速**（K=1 0.44x / K=4 0.27x）：未蒸馏同源 draft 接受率上限 ~13–15%（每轮仅产
+  ~1.6 tok），且 verify/catchup 的 plain 路径在 WDDM 桌面 GPU 下不能图化。正收益需接受率
+  ≥50%（同源蒸馏 draft）或 verify 固定 n 图化 + 批量 spec——已如实记入 BENCH.md / NOTES_t7.md。
 
 ### 健壮性
 - **G4 HTTP 无 body 请求间歇卡死修复**：根因不是 CUDA，是 `srv->lock` 一把锁同时被
@@ -62,7 +69,12 @@ WDDM 溢出会把绝对时间放大 3–20x，所以性能结论一律用**同�
   radix 前缀共享场景会互踩（见 docs/NOTES_g9.md §4）。
 - 真实 llava-1.5 的 projector 是两层 MLP + CLIP-336/1024→4096，本仓库仍是单层 linear；
   `<image>` 只作占位，视觉 token 接在 prompt 末尾。
-- WinLibs GCC 16.2 的 AVX2 自动向量化仍不稳（G10：winget 暂无 16.3）。
+- **G10 AVX2 自动向量化（条件任务，条件不成立→关闭）**：winget 无 GCC≥16.3（最高即已装的
+  16.2.0-14.0.0-r3）。整库 `-march=native` 实测 25/25 轮有崩溃、99/500 实例失败（gdb 定位：
+  GCC AVX 下 ymm 栈溢出按 32B 对齐、而进程入口栈仅 16B，间歇性随环境块长度变化）；同配置
+  x86-64-v2 对照 20/20 全绿。`-mstackrealign` 旁路不完整（test_w8/test_family_qwen3 仍
+  0xc0000409），不采纳。维持 `-march=x86-64-v2`，实测记录见 ROADMAP.md。主树合并态另跑
+  10 轮×23/23 全绿复验（0 SegFault / 0 fastfail）。
 
 ## [Unreleased] — 2026-10-27 「t 系列收尾」
 

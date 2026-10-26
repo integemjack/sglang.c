@@ -34,8 +34,18 @@ int sgl_cuda_forward(sgl_cuda_model *m, const int *tokens, int n, int pos0,
 int sgl_cuda_forward_seg(sgl_cuda_model *m, const int *tokens, int n, int pos0,
                          int kv_base, float *logits_out);
 
+/* G7: multi-row logits for speculative-decoding verify. Same forward as
+ * sgl_cuda_forward_seg, but logits_out receives ALL n rows: row i is the
+ * distribution after consuming tokens[0..i] (prediction for position
+ * pos0+i+1), V floats each, host memory [n][V]. lm_head runs as ONE M=n
+ * GEMM (not n M=1 calls). llama backend only (gpt2 returns -1). */
+int sgl_cuda_forward_seg_rows(sgl_cuda_model *m, const int *tokens, int n,
+                              int pos0, int kv_base, float *logits_out);
+
 /* model geometry accessors (opaque struct; ctx = context length on GPU) */
 int sgl_cuda_ctx(const sgl_cuda_model *m);
+/* G7: vocab size on GPU (logits row length; spec verify buffers need it) */
+int sgl_cuda_vocab(const sgl_cuda_model *m);
 
 /* batch decode: B sequences x 1 token; sequence i uses KV segment at absolute
  * position base_pos[i] + p (caller keeps segments non-overlapping in m->ctx;

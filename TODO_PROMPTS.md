@@ -4,8 +4,8 @@
 > 按价值排序；任务间无强依赖，可任意顺序（标注除外）。
 > v0.2（2026-10-27）：原 t1–t13 已全部完成并验收，见文末索引；本文件现列出
 > 验收时发现但未修的性能/健壮性/广度缺口。
-> v0.3（2026-10-27）：G1–G6、G8、G9 已完成并验收（数据见 docs/NOTES_gaps.md、
-> NOTES_g8.md、NOTES_g9.md，CHANGELOG 有总结）；G7、G10 进行中。
+> v0.3（2026-10-27）：G1–G10 全部处理完毕（G7 净减速如实记录、G10 条件不成立关闭）。
+> 数据见 docs/NOTES_gaps.md、NOTES_g8.md、NOTES_g9.md、NOTES_t7.md、ROADMAP.md，CHANGELOG 有总结。
 
 ## 状态速查（v0.3）
 
@@ -17,10 +17,10 @@
 | G4 无 body 间歇卡 | ✅ 完成 | 根因=srv->lock 争用饿死 acceptor；拆 conns_lock；600/600 无超时 |
 | G5 显存预检 + soak | ✅ 完成 | 不够时降级服务（/health degraded、/generate 503）；soak 20min 无泄漏 |
 | G6 GPU 前缀缓存 | ✅ 完成 | `[prefix]` 1.43e-05 + greedy 6/6 全同；端到端 0.76→0.34s（2.2x）输出逐字一致 |
-| G7 GPU 投机解码 | ⏳ 进行中 | — |
+| G7 GPU 投机解码 | ✅ 完成（净减速，如实记录） | `[spec]` draft==target 接受率 100%、真实组合 13.3%，两者均 == 非 spec greedy 逐 token 全同；性能 K=1 0.44x / K=4 0.27x（接受率上限 ~15% + verify 不可图化），BENCH/NOTES_t7 已记 |
 | G8 真实 LLaVA + 图片解码 | ✅ 完成 | 真实 CLIP 分层 vs torch **≤1.24e-05**；stb_image PNG/JPEG 进 HTTP image_url，端到端 200 随图变 |
 | G9 模型族补完 | ✅ 完成 | Gemma rope_scaling/softcap/layer_types；Qwen3-Next Gated DeltaNet vs float64 numpy **≤8e-08**；ctest 20→23 |
-| G10 AVX2 重试（条件） | ⏳ 复验中 | winget 无 GCC≥16.3（待复核）；旧 25 轮 SEGFAULT 已证为并发内存压力（修后干净环境 ctest 23/23） |
+| G10 AVX2 重试（条件） | ✅ 关闭（条件不成立） | winget 无 GCC≥16.3（最高 16.2.0-14.0.0-r3）；`-march=native` 整库 25/25 轮崩溃（gdb：ymm 栈溢出假设 32B 对齐、入口栈仅 16B），x86-64-v2 对照 20/20；主树 10 轮×23/23 全绿复验 |
 
 补测遗留（下次干净机器上跑）：`long_vcpu models/qwen05 8192` 的 8K GPU-vs-CPU 绝对对照、
 `soak_curve.ps1` 无干扰版（斜率判定）。
