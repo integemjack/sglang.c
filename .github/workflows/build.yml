@@ -101,6 +101,8 @@ jobs:
           Write-Host "sglc usage exit code: $code"
           if ($code -ne 1) { throw "sglc usage smoke failed ($code)" }
           Write-Host "smoke OK (3 exes present, sglc usage exit 1)"
+          # Actions 的 pwsh wrapper 在脚本尾 exit $LASTEXITCODE（usage 留下的 1）；显式清零
+          exit 0
 
       - name: Package (Linux/macOS)
         if: matrix.gen == 'ninja'
