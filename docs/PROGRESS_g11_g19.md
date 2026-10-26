@@ -29,7 +29,7 @@
 | G19 CI 真跑模型族与多模态 | ✅ 完成 | 见下 |
 | G16 W8 重测 + flash 泛化 | ✅ 完成 | 见下 |
 | G14 投机正收益 | 已做完（未达 ≥1.0x，如实记“仍净减速”） | 见下 |
-| G12 真实 llava-1.5 | 未开始 | 需下 ~4GB 权重（`../models/llava-1.5-7b` 之类） |
+| G12 真实 llava-1.5 | ✅ 完成（两层 MLP + 占位插入 + 真实 CLIP/projector 分段对照） | 见下 |
 | G15 前缀缓存 radix | ✅ 完成（租让覆盖生成 token + 带图 text；四组全 PASS） | 见下 |
 | G13 Qwen3-Next full 层 | ✅ 完成（q 门控 / partial rope / (1+w) / MoE；递归状态按序列） | 见下 |
 | G18 8K GPU-vs-CPU 绝对对照 | 未开始 | qwen05 在，需 40–60 分钟干净时段 |
@@ -148,8 +148,21 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 新 API：`sgl_llama_forward_seq` / `sgl_llama_decode_batch_seq` /
   `sgl_llama_lin_release` / `sgl_llama_lin_slots_in_use`（调度器接入时要用 release 归还槽）。
 
+### 新增（G12）
+- **两层 MLP projector**（`sgl_projector`，自动判层数 + GELU erf）+ **视觉 token 插在
+  `<image>` 占位位置**（scheduler `img_at`，尾巴文本位置顺延）。
+- **tokenizer 修 bug**：added token 只在 pre-token 边界匹配 → `USER: <image> ...`
+  根本产生不了 `<image>` id（测试第一轮就是这么失败的）；现在先按字面量切再 BPE。
+- **真实权重分段对照**（任务允许）：真实 openai/clip-vit-large-patch14-336（392 张量）
+  + 真实 liuhaotian/llava-v1.5-7b 的 mm_projector（1024→4096→4096），并支持
+  `mm_vision_select_layer=-2`。与 torch/transformers fp32 对照：预处理 rel 1.15e-07、
+  CLIP patch 行 rel **1.41e-05**、mm_projector rel **1.78e-05**。
+- 新 ctest：**test_g12_place**（占位符插入 == 等价路径、≠ 旧行为）、**test_llava_real**
+  （真实权重分段对照）。全量 **26/26**。
+- 未做：真实 7B LM 的端到端（fp16 13.5GB，本机只剩 3.5GB 磁盘）；多图仍拼在同一占位位置
+  （llava 是一图一占位）。
+
 ## 下一轮从这里继续
 
-1. **G12**（真实 llava-1.5 链路）：需下 ~4GB 权重（CLIP ViT-L + projector + 7B LM）；
-   本机 6GB 显存/磁盘够，但下载耗时长——建议单独一轮只做这件事。
-2. **G18**（8K GPU-vs-CPU 绝对对照）：要 40–60 分钟 CPU 侧算力，建议放最后一轮。
+1. **G18**（8K GPU-vs-CPU 绝对对照）：要 40–60 分钟 CPU 侧算力，建议最后一轮。
+   命令：`long_vcpu ..\models\qwen05 8192`（GPU 侧现在 ~2s，CPU 侧是瓶颈）。

@@ -31,6 +31,7 @@ typedef struct sgl_clip {
   sgl_tensor post_ln_w, post_ln_b, vproj;
   sgl_clip_layer *layers;
   int synth; /* 1 = 有合成权重（pre_ln/patch_b/post_ln bias 缺省），释放时回收 */
+  int sel_layer; /* G12: mm_vision_select_layer（取哪一层的 patch 行为视觉 token）*/
   float *x, *h, *qkv, *attn, *mid;
 } sgl_clip;
 

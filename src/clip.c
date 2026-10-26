@@ -160,6 +160,20 @@ sgl_clip *sgl_clip_load(const char *dir) {
     else { SGL_ERROR("clip hidden_act '%s' unsupported", act); sgl_xfree(c); sgl_json_free(root); return NULL; }
   }
   c->n_patch = (c->img / c->P) * (c->img / c->P);
+  /* G12: llava 的 mm_vision_select_layer（llava-v1.5 是 -2：取倒数第二层的 hidden state）。
+   * -1 / 缺省 = 最后一层（等于旧行为）。优先读环境变量 SGL_CLIP_LAYER，
+   * 其次读 config 里的 mm_vision_select_layer / select_layer。*/
+  c->sel_layer = c->L - 1;
+  {
+    int sel = sgl_json_get_int(cfg, "mm_vision_select_layer",
+                              sgl_json_get_int(cfg, "select_layer", -1));
+    const char *e = getenv("SGL_CLIP_LAYER");
+    if (e && *e) sel = atoi(e);
+    if (sel < 0) sel += c->L; /* -1 -> L-1, -2 -> L-2 */
+    if (sel < 0) sel = 0;
+    if (sel > c->L - 1) sel = c->L - 1;
+    c->sel_layer = sel;
+  }
   sgl_json_free(root);
   if (c->E <= 0 || c->H <= 0 || c->L <= 0 || c->P <= 0 || c->img % c->P != 0 || c->E % c->H) {
     SGL_ERROR("clip config invalid");
@@ -318,6 +332,7 @@ int sgl_clip_encode_full(const sgl_clip *c, const float *image, float *patch_out
   if (layer_dump) memcpy(layer_dump, c->x, sizeof(float) * (size_t)rows * E);
 
   float *q = c->qkv, *k = c->qkv + (size_t)rows * E, *v = c->qkv + 2 * (size_t)rows * E;
+  int patched = 0;
   for (int l = 0; l < c->L; l++) {
     const sgl_clip_layer *L = &c->layers[l];
     for (int t = 0; t < rows; t++)
@@ -338,9 +353,14 @@ int sgl_clip_encode_full(const sgl_clip *c, const float *image, float *patch_out
     for (size_t i = 0; i < (size_t)rows * E; i++) c->x[i] += c->h[i];
     if (layer_dump)
       memcpy(layer_dump + (size_t)(l + 1) * rows * E, c->x, sizeof(float) * (size_t)rows * E);
+    /* G12: mm_vision_select_layer —— 取指定层（含 class）的 patch 行。*/
+    if (patch_out && l == c->sel_layer) {
+      memcpy(patch_out, c->x + (size_t)E, sizeof(float) * (size_t)NP * E);
+      patched = 1;
+    }
   }
   /* last_hidden_state = c->x（★ 不过 post_layernorm）：LLaVA 取 patch 行 1..NP */
-  if (patch_out) memcpy(patch_out, c->x + (size_t)E, sizeof(float) * (size_t)NP * E);
+  if (patch_out && !patched) memcpy(patch_out, c->x + (size_t)E, sizeof(float) * (size_t)NP * E);
   /* pooled_output = post_layernorm(x[:, 0, :])；image_embeds = visual_projection(pooled) */
   float *pl = (float *)sgl_xmalloc(sizeof(float) * (size_t)E);
   ln_f32(c->x, c->post_ln_w.data, c->post_ln_b.data, pl, E, c->eps);

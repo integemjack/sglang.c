@@ -138,16 +138,54 @@ JPEG/PNG/纯文本三种请求都 **200**，同 seed greedy 下输出随图片�
 
 ## 7. 未尽事项
 
-1. GPU 侧（cuda_http / cuda_backend）没接图片解码，等你自己接线（见 §5 的 CMake 一行）。
-2. projector 仍是单层 linear（llava-1.5 真实是 `linear_1→gelu→linear_2`，
-   且 CLIP 用 large-patch14-336 + 1024→4096）；`test_llava` 的融合路径沿用单层。
-3. `<image>` 占位没有做「按占位位置插入视觉 token」，现在是把视觉 token
-   接在 prompt 末尾（与 cuda_test 的 mm 路径一致）；多图也只是拼接。
+1. ~~GPU 侧（cuda_http / cuda_backend）没接图片解码~~ → **G11 已接**（cuda_http 按 mime
+   分派 PNG/JPEG 走 `sgl_clip_project_bytes_pj`，见 CHANGELOG 的 G11）。
+2. ~~projector 仍是单层 linear~~ → **G12 已支持两层 MLP**（`sgl_projector`，从权重形状
+   自动判层数，GELU 用 erf 版）；真实 llava-1.5 的 mm_projector 已直接对上（见 §8）。
+3. ~~`<image>` 占位没有做「按占位位置插入视觉 token」~~ → **G12 已做**（scheduler 把
+   视觉 token 插在占位符位置，尾巴文本位置顺延；占位符 token 本身不进 KV）。
+   多图仍拼在**同一个**占位位置（llava 是一图一占位，本实现在多图时与它不同）。
 4. `test_clip_real` 只在 `models/clip-vit-base-patch32/ref/` 存在时注册
    （fresh clone 不会红）；重跑参考要 `python tests/clip_real_ref.py <clip目录>`
    （需 transformers 5.20.2，本任务已 pip 安装）。
-5. 真实 LLaVA 端到端（CLIP 336 + llava-1.5 权重 + 语言模型）没做：只对齐了
-   CLIP 视觉塔本身。
+5. 真实 LLaVA **端到端**（CLIP 336 + llava-1.5 权重 + 语言模型）仍未做：llava-1.5-7B 的
+   LM 是 fp16 13.5GB，本机剩余磁盘放不下（见 §8）。已改用任务允许的「分段对照」：
+   真实 CLIP-L/14-336 + 真实 mm_projector 全链路对齐。
 6. ctest 首轮曾有 9 项 `0xc0000409`（alloc.c out-of-memory 后 fastfail）：
    本机当时被其他 agent 的测试占满内存（Free 11 GB、单测要 mmap 数百 MB），
    单独跑与重跑全绿，非代码问题。
+
+## 8. G12：真实权重分段对照（CLIP-L/14-336 + 真实 mm_projector）
+
+权重来源（hf-mirror，2026-10-27）：
+
+| 文件 | 来源 | 大小 |
+|---|---|---|
+| `models/clip-vit-large-patch14-336/pytorch_model.bin` | openai/clip-vit-large-patch14-336 | 1.71 GB |
+| → `clip_model.safetensors`（392 个 vision_model.* 张量，fp32） | tests/convert_real_llava.py | 1.21 GB |
+| `models/llava-real/mm_projector.bin` | liuhaotian/llava-v1.5-7b | 42 MB（fp16） |
+| → `models/llava-real/projector.safetensors`（linear_1/linear_2，fp32） | 同上 | 84 MB |
+
+真实 llava 的 config 关键字段：`mm_projector_type=mlp2x_gelu`、`mm_hidden_size=1024`、
+`mm_vision_tower=openai/clip-vit-large-patch14-336`、**`mm_vision_select_layer=-2`**
+（取倒数第二层 hidden state，不是最后一层）、`image_aspect_ratio=pad`。
+
+C 侧新增：`sgl_clip` 多了 `sel_layer`（读 config 的 `mm_vision_select_layer` / `select_layer`，
+也接受 `SGL_CLIP_LAYER` 覆盖，负数按 `L+sel` 归一）；`sgl_clip_encode` 在那一层拷贝
+patch 行。已验证 select_layer=22（L=24）。
+
+对照（同一张 336×336 图，torch 2.14.1+cpu fp32 vs C fp32，`tests/llava_real_ref.py`
+生成 `_ref_pv/_ref_vis/_ref_real_proj.npy`）：
+
+| 阶段 | 绝对 maxerr | 参考最大绝对值 | 相对 |
+|---|---|---|---|
+| CLIPImageProcessor 预处理（CHW 归一化） | 2.38e-07 | 2.07 | 1.15e-07 |
+| CLIP 视觉塔 patch 行（576×1024，第 22 层） | 2.78e-03 | 197 | **1.41e-05** |
+| mm_projector（576×4096，1024→4096→4096 + GELU） | 6.60e-04 | 37.1 | **1.78e-05** |
+
+`ctest -R test_llava_real`：Passed（17.5s，主要花在 mmap 1.2GB 权重 + 576×1024×4096
+的 CPU GEMM）。全量 ctest **26/26**。
+
+**仍未做**：真实 7B 语言模型的端到端（磁盘不够）；换成一个小真实 LM（如
+TinyLlama-1.1B）与 llava 的 CLIP+projector 拼接的混合实验也没做——那是另一个模型，
+不是 llava-1.5 的真实行为，所以没当验收。

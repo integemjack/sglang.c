@@ -2,7 +2,32 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G13/G14/G15/G16/G17/G19
+## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G12/G13/G14/G15/G16/G17/G19
+
+### 多模态（G12 真实 llava-1.5 链路）
+- **projector 支持两层 MLP**：新增 `sgl_projector`（`include/sgl/image.h` + `src/image.c`），
+  从权重形状自动判层数（`[out][in]` = 单层 linear；`[mid][in]`+`[out][mid]` = 两层，
+  GELU 用 erf 版），`sgl_clip_project_bytes_pj()` 一次走完 CLIP→projector。sglc /
+  cuda_http / cuda_test 都改成自动判层数，旧单层权重照旧能跑。
+- **视觉 token 插到 `<image>` 占位符位置**（`src/scheduler.c`）：`sgl_req.img_at` 记占位符
+  下标，prefill 顺序变成 `[0,img_at)` → 视觉 emb → 占位符之后的文本（位置顺延，RoPE
+  跟着移），即 llava 的「把 `<image>` 换成视觉 token 块」。无占位符保持旧的末尾拼接。
+  多图仍拼在同一位置（llava 是一图一占位）。
+- **修了一个真 bug**（`src/bpe.c`）：tokenizer 只在 pre-token 边界匹配 added token，于是
+  `USER: <image> ...` 里的 `<image>` 被符号类段吃进去、根本不会产生 `<image>` id（新测试
+  一开始就是因此失败的）。现在先按 added token 字面量切文本再逐段 BPE（与 HF 一致），
+  并新增 `sgl_tokenizer_piece_id()`。
+- **真实权重对齐（含 `mm_vision_select_layer=-2`）**：新增 `sgl_clip.sel_layer`（读 config
+  的 `mm_vision_select_layer`/`select_layer`，`SGL_CLIP_LAYER` 可覆盖）。实测（torch
+  2.14.1+cpu fp32 vs C fp32，同一张 336×336 图）：预处理 rel 1.15e-07、CLIP patch 行
+  （576×1024，第 22 层）**rel 1.41e-05**、真实 mm_projector（1024→4096→4096）
+  **rel 1.78e-05**。新 ctest **test_llava_real**（1.2GB CLIP + 84MB projector，17.5s）。
+- 新测试 **test_g12_place**：调度器在 `A<image>B` 上的首 token 与「A→visual→B」等价
+  路径**完全相同**，与旧末尾拼接**不同**（首 token logits 差 0.85），无图路径完全不变。
+- 新工具：`tests/make_g12_model.py` / `make_g12_tokenizer.py`（可重现地造带 `<image>`
+  added token 的测试模型）、`convert_real_llava.py`、`llava_real_ref.py`；
+  `gen_random_llava.py` 支持 `--mlp/--lm-e/--mid`。全量 ctest **26/26**；build-cuda 重建
+  后 `cuda_test` 仍 `test_cuda: all OK`。
 
 ### 模型广度
 - **G13 Qwen3-Next full 层补齐**（`src/llama.c` + `src/ops.c`，对照 HF

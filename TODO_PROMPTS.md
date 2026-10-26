@@ -221,7 +221,7 @@ t12 时 winget 最新 WinLibs 16.2（16.3 不存在），当年 25 次 0xC000000
    对照（已有 sgl_cuda_forward_seg_emb，历史 maxerr 1.2e-7）。
 ```
 
-## 任务 G12 · 真实 llava-1.5 链路（功能，中大）
+## 任务 G12 · 真实 llava-1.5 链路（功能，中大） ✅ 已完成（两层 MLP projector + 占位符位置插入 + 真实 CLIP-L/14-336 与真实 mm_projector 分段对照；7B LM 端到端因磁盘不够未做，任务本身允许分段）——见 docs/NOTES_g8.md §8
 
 ```
 现状（NOTES_g8.md §7-2/3/5）：只对齐了 CLIP 视觉塔本身（真实 clip-vit-base-patch32，

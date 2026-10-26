@@ -163,6 +163,17 @@ else()
   set_tests_properties(test_lin_seq PROPERTIES ENVIRONMENT "SGL_TEST_QNEXT=")
 endif()
 
+# ---- G12 真实权重分段对照（CLIP-L/14-336 + llava mm_projector，参考由 llava_real_ref.py 生成）----
+# test_llava_real.c 已被上面的 glob 注册，这里只补模型路径（无参考时留空 -> 自跳过）
+if(EXISTS ${SGL_MODELS_DIR}/clip-vit-large-patch14-336/_ref_vis.npy AND
+   EXISTS ${SGL_MODELS_DIR}/llava-real/_ref_real_proj.npy)
+  set_tests_properties(test_llava_real PROPERTIES DEPENDS test_llava
+    ENVIRONMENT "SGL_TEST_LLAVA_REAL_CLIP=${SGL_MODELS_DIR}/clip-vit-large-patch14-336;SGL_TEST_LLAVA_REAL_PROJ=${SGL_MODELS_DIR}/llava-real")
+else()
+  set_tests_properties(test_llava_real PROPERTIES ENVIRONMENT
+    "SGL_TEST_LLAVA_REAL_CLIP=;SGL_TEST_LLAVA_REAL_PROJ=")
+endif()
+
 # ---- G12 占位符位置插入 visual token（需 g12-mlp：LM + 2层 MLP projector + <image>）----
 if(EXISTS ${SGL_MODELS_DIR}/g12-mlp/projector.safetensors AND
    EXISTS ${SGL_MODELS_DIR}/g12-mlp/clip_model.safetensors)
