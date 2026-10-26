@@ -144,9 +144,11 @@ jobs:
           # 判据用正向标记（测试都打了 "all OK"），不用反查 SKIP —— test_spec 在
           # 没下 draft 权重时本来就 SKIP，按 SKIP 判会恒红。
           fam=$(grep -c 'greedy6=一致' ctest.log || true)
+          fam_ran=$(grep -cE 'test_family_(mistral|gemma|gemma2|qwen3next).*Passed' ctest.log || true)
           llava=$(grep -c 'test_llava: all OK' ctest.log || true)
-          echo "family cases that actually ran: $fam, test_llava all-OK: $llava"
-          if [ "$fam" -lt 4 ]; then echo "::error::模型族只跑了 $fam 个（应为 mistral/gemma/gemma2/qwen3next 4 个）"; exit 1; fi
+          echo "family cases that actually ran: $fam, test_family_* Passed: $fam_ran, test_llava all-OK: $llava"
+          if [ "$fam_ran" -lt 4 ]; then echo "::error::test_family_* 只有 $fam_ran 个 Passed（应为 mistral/gemma/gemma2/qwen3next 4 个）"; exit 1; fi
+          if [ "$fam" -lt 4 ]; then echo "::error::模型族只跑了 $fam 个 greedy6 对照（应为 4 个）"; exit 1; fi
           if [ "$llava" -lt 1 ]; then echo "::error::test_llava 没真跑（缺 models/llava-rand 或它在 SKIP）"; exit 1; fi
 
       # CI runner 无 NVIDIA 驱动：cuda_cli/cuda_http 动态链 cublas（→nvcuda.dll）启动即

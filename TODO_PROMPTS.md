@@ -203,7 +203,7 @@ t12 时 winget 最新 WinLibs 16.2（16.3 不存在），当年 25 次 0xC000000
 
 ---
 
-## 任务 G11 · GPU 版收标准图片（功能，中）
+## 任务 G11 · GPU 版收标准图片（功能，中） ✅ 已完成（未发版，见 docs/PROGRESS_g11_g19.md）
 
 ```
 现状（doc/NOTES_g8.md §7-1）：CPU 版 HTTP 已能收 OpenAI vision 风格的
@@ -316,7 +316,7 @@ vs float64 numpy ≤8e-08；但 full_attention 层还是普通 qwen3 写法，�
 验收：BENCH 更新；cuda_test [long] 全绿；D=96 随机模型 GPU vs CPU maxerr < 5e-3。
 ```
 
-## 任务 G17 · G4 的 GPU 版复验 + soak 误报（健壮性，小）
+## 任务 G17 · G4 的 GPU 版复验 + soak 误报（健壮性，小） ✅ 已完成（未发版，见 docs/PROGRESS_g11_g19.md）
 
 ```
 现状：G4 的根因（srv->lock 被 worker 计算和 acceptor 登记争用）修在 **CPU 版** src/http.c
@@ -348,7 +348,7 @@ logits vs CPU 同 ids，要求 maxerr < 1e-3）本批没跑完——CPU 侧 8192
 验收：verdict: PASS (<1e-3)，原始输出存 docs/ 或 NOTES_gaps 引用的日志路径。
 ```
 
-## 任务 G19 · CI 真跑模型族与多模态测试（基础设施，中）
+## 任务 G19 · CI 真跑模型族与多模态测试（基础设施，中） ✅ 已完成（未发版，见 docs/PROGRESS_g11_g19.md）
 
 ```
 现状（2026-10-27 查 v0.2.0 的 CI 日志时发现）：CI 只 curl 了 models/gpt2/model.safetensors，

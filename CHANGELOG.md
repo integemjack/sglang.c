@@ -2,6 +2,44 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G17/G19
+
+### 功能
+- **G11 GPU 版收标准图片**：`cuda_http` 的 image_url 以前只认 raw float32 CHW，真实
+  客户端发的 JPEG/PNG 一律 400。现在按 data URL 的 mime 分派：`image/{png,jpeg}` 走
+  `sgl_clip_project_bytes`（stb_image 解码 + PIL 语义 resize/crop + CLIP + projector，
+  与 CPU 版同一条代码路径），其余仍走 t10 的 raw 兼容分支。`src/image.c` 进 `sgl_cuda`。
+  验收：`tests/http_image_e2e.py --url`（新增：指向已在跑的服务、不自起进程）对
+  `cuda_http models/mm-test 30024` 发 jpeg / png / 纯文本 → 全 200，jpeg≠png、有图≠无图，
+  坏 base64 → 400；同一套图 CPU 版输出逐 token 前缀完全相同；`cuda_test [mm]`
+  GPU 融合 vs CPU 融合 maxerr **1.19e-07**、greedy SAME（无回归）。
+
+### 健壮性
+- **G17 GPU 版「/health 偶发卡死」根因修复**（和 CPU 版 G4 是两个不同的病）：
+  `cuda_http.c` 的 `read_request` 在**未 NUL 截断**的请求缓冲上用 `strstr` 找
+  `Content-Length:`，负载一大就会撞上前一个 POST 请求在堆里残留的
+  `Content-Length: 105`，把 body 长度当成 105 后一直等永不会来的字节 —— 表现就是
+  无 body 的 GET /health 挂到客户端超时断开为止（实测：12 并发 load 下 **100%
+  timeout_read**，挂的时长恰好等于客户端超时；空闲时堆恰好为 0 才看不出来）。
+  修复：每次 recv 后 `buf[len]=0`，Content-Length 只在本请求 header 段内做有界搜索
+  （与 `src/http.c` 的 t5 修法一致）。复验：`g4_probe load 600 12 256` 对
+  cuda_http（GPU）与 sglc（CPU）均 **ok=600 / timeout_read=0**；修复前同样负载为 0/600。
+  另加 `SGL_HTTP_TRACE=1` 入口/收包/应答/退出逐行诊断（env 开关，默认静默），
+  以及 `g4_probe.py` 的 `--host/--port`（以前写死 30000，没法指向 GPU 版）。
+- **G17 soak 误报**：`soak_curve.ps1` 的 stderr 判定加了 INFO 白名单（模型加载时
+  `safetensors.c` 会打一堆 `ERROR tensor ... not found` 的可选张量探测，以前会被
+  当成异常）。复验：cuda_http + mm-test 跑 2 分钟 → RSS 斜率 0.020 MB/min（0.0044%/min）、
+  VRAM 0.000 MB/min，PASS，且如实打出「无 ERROR/FATAL 行」。
+
+### 基础设施
+- **G19 CI 真跑模型族与多模态**：`gen_random_{mistral,gemma,qwen3next}.py` 加
+  `--out/--tokenizer`（`gen_random_gemma.py` 另有 `--variant dynamic` 出 gemma2），
+  CI 里生成 mistral/gemma/gemma2/qwen3next/llava 五套随机模型 + 跑 `ref_llava.py`，
+  这样 CMake 的 「模型存在才注册 test」 条件都成立，family 测试与 test_llava 真跑起来；
+  验收判据改成正向（`greedy6=一致` 行数 ≥ 4、`test_family_*` 全部 Passed、
+  `test_llava: all OK`），不再只是「ctest 退出码 0」。本地核验：新参数生成的 6 个
+  safetensors 与仓库现有 `models/*-rand` **逐字节相同**（保证与 `_ref_*.json` 对得上）。
+
 ## [v0.3.0] — 2026-10-27 「缺口关闭 G1–G10」
 
 本批处理 TODO_PROMPTS.md v0.2 列出的缺口。测量口径与全部数字见
