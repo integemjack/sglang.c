@@ -1,7 +1,6 @@
-# 构建树（含一个名字损坏的历史残留目录）
-buil*/
+﻿# 鏋勫缓鏍戯紙鍚竴涓悕瀛楁崯鍧忕殑鍘嗗彶娈嬬暀鐩綍锛?buil*/
 
-# 构建产物
+# 鏋勫缓浜х墿
 *.exe
 *.obj
 *.o
@@ -9,8 +8,8 @@ buil*/
 *.lib
 *.pdb
 
-# 模型权重不入库（tests 的 gpt2 权重由 CI 按需下载；tokenizer/config 元数据入库）
+# 妯″瀷鏉冮噸涓嶅叆搴擄紙tests 鐨?gpt2 鏉冮噸鐢?CI 鎸夐渶涓嬭浇锛泃okenizer/config 鍏冩暟鎹叆搴擄級
 **/model.safetensors
 
-# OpenBLAS 黄�浂E��51MB．���下载方法�? README � �� 求� 求�?��??���?Release � x64.zip 标准 32 �?int �?x64_64 �?64 �?int ABI�?
+# OpenBLAS 权重不入库（51MB dll；fetch 见 README 环境要求。必须用 Release 的 x64.zip 标准 32 位 int 包——x64_64 是 64 位 int ABI）
 third_party/openblas/
