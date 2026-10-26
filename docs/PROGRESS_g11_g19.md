@@ -189,6 +189,22 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 至此 **TODO_PROMPTS v0.4 的 G11–G19 全部完成**（只剩可选项未做：G12 的 7B LM 端到端
   因磁盘不够、G13 的 CUDA 路径、G15 的跳段共享——都有实测依据说明无意义/不可能）。
 
+## 最终验收（v0.4 清零后的全量重跑，2026-10-27）
+
+两个构建都从当前 HEAD 重编重跑，四项全绿：
+
+| 验收项 | 命令 | 结果 |
+|---|---|---|
+| CPU 全量 ctest | `ctest --test-dir build --timeout 900` | **26/26 通过**（含 test_lin_seq / test_g12_place / test_llava_real / test_family_* 5 族） |
+| GPU 全量 cuda_test | `cuda_test ..\models\qwen05` | **rc=0，test_cuda: all OK**；prefill CPU-vs-GPU 2.15e-05、[w8] imma==dp4a 0、[batch] 291.8 tok/s 一致、[long] 三路全 SAME、[prefix] 2.1x 且 6/6 SAME、[mm] 1.19e-07、[spec] 两例逐 token 等于非 spec |
+| 前缀缓存 e2e | `tests/prefix_e2e.ps1` | **4 组 ALL PASS**（同前缀 552 行 / 续写 573 行 / 带图 text 130 行 / 超容量 flushes=1） |
+| 多模态 e2e | `tests/http_image_e2e.py` | **E2E OK**（jpeg/png/text 全 200，图不同则输出不同，坏 base64 → 400） |
+
+顺带修掉了一个一直让 `git status` 不准的噪音：`.gitignore` 以前只忽略 `models/*/model.safetensors`，
+于是生成出来的 7 个夹具目录（*-rand / mm-test / g12-mlp / d96,d80-rand / llava-mlp）里的
+config.json/tokenizer.json 全部显示为 untracked。现已整目录忽略（`models/gpt2` 仍跟踪，CI 需要它），
+夹具仍在磁盘上、不影响任何测试。
+
 ## 现状（v0.4 已清零）
 
 - TODO_PROMPTS v0.4 的 **G11–G19 全部完成**（每节都有实测数字和日志路径）。

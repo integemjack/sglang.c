@@ -1,4 +1,4 @@
-﻿# 鏋勫缓鏍戯紙鍚竴涓悕瀛楁崯鍧忕殑鍘嗗彶娈嬬暀鐩綍锛?buil*/
+# 鏋勫缓鏍戯紙鍚竴涓悕瀛楁崯鍧忕殑鍘嗗彶娈嬬暀鐩綍锛?buil*/
 # 鏋勫缓浜х墿
 *.exe
 *.obj
@@ -14,4 +14,17 @@ buil*/
 third_party/openblas/
 models/*/model.safetensors
 models/*/_ref_proj.npy
+# 生成出来的测试夹具（tests/gen_random_*.py / make_g12_*.py 可重建，CI 也自己生成）
+# —— 以前的 .gitignore 只忽略了 .safetensors，于是这些目录里的 config.json/tokenizer.json
+# 让 `git status` 一直有 7 条无意义的 untracked。models/gpt2 仍会被跟踪（CI 需要它）。
+models/*-rand/
+models/mm-test/
+models/g12-mlp/
+models/d96-rand/
+models/d80-rand/
+models/llava-mlp/
+# 历史残留子集（真模型在仓库外层的 ../models/<同名>；这里只剩 tokenizer/小权重，
+# 仅作 gen_random_*.py 的 --tokenizer 默认值来源）
+models/qwen3-06/
+models/tiny-llama-hf/
 *.npy
