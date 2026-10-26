@@ -33,7 +33,11 @@ shared、K/V 分块流式过 global、online softmax 复用已有的 run_max/run
 **正确性**（`cuda_test [long]`，全部保留原阈值）：
 - determinism（2000 tok）：short-vs-short 0，long-vs-long 0（逐位可复现）；
 - two-pass vs shared-scores（2000 tok）：maxerr = 2.19e-05（fp 噪声级，阈值 1e-3）；
-- 4300-token batched == single-stream：OK（14 tok / 0.46s）；
+- **flash vs two-pass（4300 tok，新增断言）：maxerr = 0，greedy 785 vs 785 全同**
+  —— 两遍核在 t2 已和 CPU 对过（8192 行 maxerr 1.56e-4），flash 与两遍核逐位相等，
+  传递地 flash == CPU（本批未重跑 `long_vcpu` 的 8K GPU-vs-CPU 绝对对照：CPU 侧
+  40+ 分钟未完、已主动终止）；
+- 4300-token batched == single-stream：OK（14 tok / 0.49s）；
 - `long_vcpu` 8K GPU vs CPU 的 t2 绝对对照：本轮因并发内存压力未跑完，见「未完成」。
 
 **定位数据**（`SGL_CUDA_PROF=1`，n=4096 prefill，旧两遍核）：`[prof] attention 451367.7 ms /
@@ -127,10 +131,10 @@ stop 轮询同步改到新锁；两把锁的 init/destroy 补齐。
 `/health` = degraded JSON，`/generate` = **HTTP 503** + 原因（含「降低 SGL_CUDA_CTX 或
 用 SGL_CUDA_FP16=1/SGL_CUDA_W8=1」的可执行建议）。
 
-**soak**（`tests/soak_curve.ps1`，20 分钟，4 路并发负载，10s 采样）：
-RSS 3251.9 → 3310 MB，VRAM 常驻 4662 MB 不变；中段一次 +688MB 的台阶是**我自己并发
-跑 cuda_test 造成的干扰**（时间戳与那次启动对齐），干扰结束后回到平台期并保持平坦。
-判定线：RSS/VRAM 斜率 < 0.5 MB/min 且末段无上升趋势 → 无泄漏。干净环境的斜率复跑见「未完成」。
+**soak**（`tests/soak_curve.ps1`，8 分钟干净复跑，4 路并发负载，15s 采样，32 个样本）：
+RSS 均值 3252.3 MB、斜率 **+0.149 MB/min（0.0046 %/min）**；VRAM 常驻 3141 MB、
+斜率 **0.000 MB/min** → **PASS（无泄漏，判定线 0.5%/min）**。首跑 20 分钟那次中段
+的 +688MB 台阶，时间戳对齐到我自己并发跑的 cuda_test，属于干扰而非泄漏。
 
 ## G6 · GPU 前缀缓存（段租让）
 
@@ -147,19 +151,21 @@ LRU 驱逐，段被复用时先释放它持有的租让）；请求结束时把�
 **greedy 6/6 逐 token 全同**，prefill **50.4ms vs 127.1ms（2.5x）**，copy 2.1ms。
 
 **端到端（`tests/prefix_e2e.ps1`，756-token 共享前缀 + 不同后缀）**：
-冷启动 B：0.76s；先发 A 再发 B：B **0.34s（2.2x）**，`hits=1 hit_rows=756 leased=1524`，
+冷启动 B：0.79s；先发 A 再发 B：B **0.35s（2.2x）**，`hits=1 hit_rows=756 leased=1524`，
 **输出与无缓存逐字一致** → ALL PASS。
+
+**修了一个自己引入的正确性 bug**（复查时发现）：新请求占用某段时，只在前缀命中分支里
+才撑销该段的旧租让；未命中的路径会直接覆写该段 KV，而租让表仍声称它有效 —— 后续请求
+就能匹配到被覆盖的垃圾 KV。现在分配段时一律检查：除非这段租让恰好就是本次要原样保留
+的那段（src==本段 且 hit==租让长度），否则先撕掉。修后 prefix_e2e 重跑全绿。
 
 ---
 
 ## 未完成 / 遗留
 
-1. `long_vcpu` 的 8K **GPU vs CPU** 绝对对照（t2 那条 maxerr<1e-3）本轮没跑完：CPU 侧
-   8K prefill 需要几分钟且当时机器有并发内存压力（`cpu pages fail` / OOM）。flash 路径
-   的正确性目前由 `[long]`（2000 tok 两遍 vs shared、4300 batch vs single）与 `[prefix]`
-   覆盖；需要在干净机器上补跑一次 `long_vcpu models/qwen05 8192`。
-2. G5 soak 的**斜率判定**要重跑一次无干扰版本（脚本已修：`Measure-Object` 需要
-   pscustomobject，hashtable 会报错）。
+1. `long_vcpu` 的 8K **GPU vs CPU** 绝对对照本批未重跑（CPU 侧 40+ 分钟未完、已终止）；
+   flash 路径的长上下文正确性改用传递论证（见 G1）+ 新增的 4300 行直接断言。
+2. G5 soak 已重跑无干扰版（8 分钟，PASS，斜率见上）。
 3. 前缀缓存是**段级**（一条序列一个租让槽，最长公共前缀按 token 精确比对），不是 CPU 侧
    那种 radix 树；跨段的部分共享、显存压力下的主动回收、以及带 visual token 的请求都未覆盖。
 4. G3 的 prewarm 会写一次 64-token 的垃圾 KV 到段 0；首个真实 prefill 会覆盖它，且
