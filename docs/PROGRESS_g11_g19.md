@@ -30,7 +30,7 @@
 | G16 W8 重测 + flash 泛化 | ✅ 完成 | 见下 |
 | G14 投机正收益 | 已做完（未达 ≥1.0x，如实记“仍净减速”） | 见下 |
 | G12 真实 llava-1.5 | 未开始 | 需下 ~4GB 权重（`../models/llava-1.5-7b` 之类） |
-| G15 前缀缓存 radix | 未开始 | 纯代码 + 随机模型可验 |
+| G15 前缀缓存 radix | ✅ 完成（租让覆盖生成 token + 带图 text；四组全 PASS） | 见下 |
 | G13 Qwen3-Next full 层 | 未开始 | 纯代码 + 随机模型可验 |
 | G18 8K GPU-vs-CPU 绝对对照 | 未开始 | qwen05 在，需 40–60 分钟干净时段 |
 
@@ -124,8 +124,20 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - **诊断开关**：`SGL_SPEC_PROF=1`（每轮 draft/verify/补齐分解）、
   `SGL_ATTN_DEBUG=1`（用的哪个 attention 核）、`SGL_SMALLM_CUBLAS=1`（M=2..8 退回 cublas A/B）。
 
+### 新增（G15）
+- **前缀租让覆盖生成 token**（`apps/cuda_http.c`）：非视觉请求登记 `n_prompt+(n_gen-1)` 行，
+  多轮对话/续写整段复用。实测命中 552 → **573 行**，同 prompt 重发 0.262s → **0.103s（2.5x）**。
+- **带图请求也登记 text 部分**：同文本不同图命中 **135 行**（以前 0）。
+- **`/health` prefix 字段**：slots/hits/misses/hit_rate/hit_rows/leased_rows/flushes；
+  `SGL_PFX_MAX=0` 可全面关缓存，超容量请求会 flush 全部租让。
+- **`tests/prefix_e2e.ps1` 四组全 PASS**（同前缀/续写/带图/显存紧张），每组都与
+  「关缓存」逐字对比。任务里的「跳段两轮扫描」已实测无收益（扁平表上界就是最长的一条），
+  改用「登记生成 token 行」拿到真实收益。
+- 回归：`cuda_test ..\models\qwen05` → `test_cuda: all OK`（[prefix] reuse vs full
+  maxerr 1.4e-05、greedy 6/6 SAME、prefill 33.4ms vs 68.8ms）；CPU ctest 23/23。
+
 ## 下一轮从这里继续
 
-1. **G15**（前缀缓存升 radix）：纯代码 + 随机模型可验，`prefix_e2e.ps1` 要扩成四组。
-2. G13（Qwen3-Next full 层）、G12（需下 llava-1.5 权重）、G18（8K 绝对对照，要 40–60 分钟
-   干净时段；8K GPU prefill 现在 ~2s，CPU 侧仍要 40+ 分钟）。
+1. **G13**（Qwen3-Next full 层与递归状态）：纯代码 + 随机模型（`qwen3next-rand`）可验。
+2. G12（需下 llava-1.5 权重）、G18（8K 绝对对照，要 40–60 分钟干净时段；8K GPU prefill
+   现在 ~2s，CPU 侧仍要 40+ 分钟）。
