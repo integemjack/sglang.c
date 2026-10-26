@@ -141,14 +141,17 @@ jobs:
           ctest --test-dir build -V --timeout 900 2>&1 | tee ctest.log
           # G19 验收：模型族/多模态必须真跑（注册了、且不是 SKIP），否则最核心的
           # numpy 对照等于仍然没被 CI 覆盖（v0.2.0 前一直是这个状态）。
-          # 判据用正向标记（测试都打了 "all OK"），不用反查 SKIP —— test_spec 在
-          # 没下 draft 权重时本来就 SKIP，按 SKIP 判会恒红。
-          fam=$(grep -c 'greedy6=一致' ctest.log || true)
-          fam_ran=$(grep -cE 'test_family_(mistral|gemma|gemma2|qwen3next).*Passed' ctest.log || true)
-          llava=$(grep -c 'test_llava: all OK' ctest.log || true)
-          echo "family cases that actually ran: $fam, test_family_* Passed: $fam_ran, test_llava all-OK: $llava"
+          # 判据全部用 **ASCII 标记**（test_llama / test_llava 成功时都打 "all OK"），
+          # 不去 grep 输出里的中文——那串字面量能不能按 UTF-8 落盘取决于工具链的
+          # /utf-8（CMakeLists 现在给了，但换个编译器就可能变成系统代码页）。
+          # 注意用 `|| echo 0` 而不是 `|| true`：ctest.log 不存在时 grep 什么也不输出，
+          # 变量为空会让 `[ "$fam" -lt 4 ]` 报 integer 错并被 if 当成假 —— 判据静默失效。
+          fam=$(grep -c 'test_llama: all OK' ctest.log 2>/dev/null || echo 0)
+          fam_ran=$(grep -cE 'test_family_(mistral|gemma|gemma2|qwen3next).*Passed' ctest.log 2>/dev/null || echo 0)
+          llava=$(grep -c 'test_llava: all OK' ctest.log 2>/dev/null || echo 0)
+          echo "family runs that finished all-OK: $fam, test_family_* Passed: $fam_ran, test_llava all-OK: $llava"
           if [ "$fam_ran" -lt 4 ]; then echo "::error::test_family_* 只有 $fam_ran 个 Passed（应为 mistral/gemma/gemma2/qwen3next 4 个）"; exit 1; fi
-          if [ "$fam" -lt 4 ]; then echo "::error::模型族只跑了 $fam 个 greedy6 对照（应为 4 个）"; exit 1; fi
+          if [ "$fam" -lt 4 ]; then echo "::error::模型族只跑了 $fam 个（应为 4 个）"; exit 1; fi
           if [ "$llava" -lt 1 ]; then echo "::error::test_llava 没真跑（缺 models/llava-rand 或它在 SKIP）"; exit 1; fi
 
       # CI runner 无 NVIDIA 驱动：cuda_cli/cuda_http 动态链 cublas（→nvcuda.dll）启动即

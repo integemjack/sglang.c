@@ -4,6 +4,21 @@
 
 ## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G12/G13/G14/G15/G16/G17/G18/G19
 
+### 基础设施（G19 补记）
+- **从干净检出按 CI 步骤实跑一次**（之前只验了生成器产出逐字节相同 + YAML 可解析，
+  没验过那串步骤在 fresh clone 上能跑）：`git clone` → 逐字执行 workflow 的生成步 →
+  Ninja+MSVC 配置编译 → `ctest -V` **24/24 通过**（`test_family_{mistral,gemma,gemma2,
+  qwen3next}` + `test_llava` 均已注册并真跑）→ 抽出 workflow 的验收 gate 用 bash 跑 →
+  **CI GATE: PASS**（all-OK 4 / family Passed 4 / llava 1）。
+- **修 `tests/_ref_llava.json` 已过期**：它无人读取（真正被测的是模型目录里的
+  `_ref_{feats,proj}.npy`），但 G12 把默认 projector 改成两层 MLP 后就与生成结果不一致了；
+  按文档要求从干净检出的产物重生。
+- **修 CI 验收 gate 的两个隐患**（模拟时踩到）：① 判据从 `grep 'greedy6=一致'`（中文）
+  改成纯 ASCII 的 `grep 'test_llama: all OK'`，不再依赖测试二进制的执行字符集；
+  ② `|| true` 改为 `2>/dev/null || echo 0`——原来 `ctest.log` 不存在时变量为空，
+  `[ "" -lt 4 ]` 报 integer 错被 `if` 当成假，**gate 会静默通过**（已用改名日志反向验证：
+  现在正确 `exit 1`）。
+
 ### 验收（G18）
 - **8K GPU-vs-CPU 绝对对照补跑通过**：`SGL_POOL_SLOTS=8208 long_vcpu ..\models\qwen05 8192`
   → GPU prefill **2.8 s**、CPU prefill **3733.0 s（62.2 分钟，单线程）**、

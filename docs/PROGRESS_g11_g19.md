@@ -189,6 +189,42 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 至此 **TODO_PROMPTS v0.4 的 G11–G19 全部完成**（只剩可选项未做：G12 的 7B LM 端到端
   因磁盘不够、G13 的 CUDA 路径、G15 的跳段共享——都有实测依据说明无意义/不可能）。
 
+## G19 补记：从**干净检出**按 CI 步骤实跑（2026-10-27，第 10 轮）
+
+之前只验证了「生成器产出与夹具逐字节相同」和「YAML 能解析」，**没验证过那串步骤在 fresh
+clone 上真能跑通**——而且夹具现在被 .gitignore 了，CI 必须自己生成。这一轮补上了：
+
+做法：`git clone sglang-c` 到临时目录（138 个文件，`models/` 里只有 gpt2 的 config/tokenizer），
+把 `models/qwen3-06` 的 4 个 tokenizer 文件 + `models/gpt2/model.safetensors` 用本地副本代替
+CI 的 curl（**只替换下载，不动任何命令**），然后**逐字**执行 workflow 里 `msvc` job 的：
+
+1. 生成步：`gen_random_{mistral,gemma,gemma2,qwen3next,llava}.py` + `ref_llava.py` → 全部成功，5 个族目录都在；
+2. 配置 + 编译（Ninja + MSVC，vcvars64）：rc=0；`ctest -N` 注册 **24** 项，其中
+   `test_family_{mistral,gemma,gemma2,qwen3next}` 4 项 + `test_llava` 均在列（qwen3 族需真实
+   权重，CI 不下，故不注册——判据只要求 ≥4）；
+3. `ctest --test-dir build -V` → **100% tests passed out of 24**；
+4. 把 workflow 里那段验收 gate 抽出来用 bash 跑（与 `shell: bash` 同一套命令）→
+   `family runs all-OK: 4, test_family_* Passed: 4, test_llava all-OK: 1` → **CI GATE: PASS**。
+
+### 顺带发现并修掉的两个真问题
+
+1. **`tests/_ref_llava.json` 已过期**（第 9 轮之前就存在，这一轮才发现）：它在仓库里但
+   **没有任何代码读它**（真正被测的是 `ref_llava.py` 写进模型目录的 `_ref_{feats,proj}.npy`），
+   而 G12 把 `gen_random_llava.py` 的默认 projector 改成两层 MLP 后就与生成结果不一致了
+   （`proj_checksum` 1.18944 vs 1.07285，且缺 `projector: "mlp"` 字段）。按文档要求
+   「`_ref_*.json` 必须与被生成的权重一致」已从干净检出的产物重生并提交。
+2. **CI 验收 gate 自己有两个隐患**（都是这轮模拟时踩到的）：
+   - 原来用 `grep -c 'greedy6=一致'`（中文）——能不能匹配取决于测试二进制的执行字符集。
+     本机实测 MSVC + `/utf-8` 下确实是 UTF-8 字节，所以今天能工作；但换个不带 `/utf-8`
+     的工具链就会变成系统代码页而默默匹配不到。已改成纯 ASCII 判据
+     `grep -c 'test_llama: all OK'`（语义还更准：整轮零失败）。
+   - 原来写的是 `|| true`：`ctest.log` 不存在时 grep 什么都不输出，变量为空 →
+     `[ "" -lt 4 ]` 报 integer 错、被 `if` 当成假 → **gate 静默通过**。已改为
+     `2>/dev/null || echo 0`。反向验证：把 ctest.log 改名后跑，现在正确输出
+     `::error::fam_ran=0` 并 exit 1（改之前是 exit 0）。
+
+临时克隆已删除，磁盘回到 3.7GB。
+
 ## 最终验收（v0.4 清零后的全量重跑，2026-10-27）
 
 两个构建都从当前 HEAD 重编重跑，四项全绿：
