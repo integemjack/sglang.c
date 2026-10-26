@@ -63,6 +63,14 @@ jobs:
         with:
           arch: x64
 
+      # runner 不预装 CUDA toolkit；装全量（含 cublas/cudart 库与 DLL）
+      # Jimver 会设 CUDA_PATH 并把 CUDA_PATH/bin 加进 PATH，命中 CMakeLists 的自动发现
+      - name: Install CUDA toolkit
+        if: matrix.gen == 'msvc-cuda'
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.3.0'
+
       - name: Configure (MSVC)
         if: matrix.gen == 'msvc' || matrix.gen == 'msvc-cuda'
         shell: pwsh
