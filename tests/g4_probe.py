@@ -3,10 +3,27 @@
 # 背景负载 = 并发 POST /generate（驱动 worker/调度器），
 # 同时反复 GET /health，分别用 raw socket / requests / curl / Invoke-WebRequest 计时。
 # 只读诊断，不改服务。用法见 __main__。
+# G17：--port/--host 可传，同一探针既能打 CPU 版 sglc --serve（30000），
+#      也能打 GPU 版 cuda_http（历史症状就是 GPU 版报的，之前从没打过它）：
+#        python g4_probe.py load 600 12 256 --port 30024
 import json, socket, sys, time, threading, subprocess, statistics, os
 
 HOST, PORT = "127.0.0.1", 30000
 PY = sys.executable
+
+def parse_net_args(argv):
+    """取出 --port/--host（位置任意），其余按位置参数返回（G17）。"""
+    global HOST, PORT
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--port", "-p") and i + 1 < len(argv):
+            PORT = int(argv[i + 1]); i += 2; continue
+        if a == "--host" and i + 1 < len(argv):
+            HOST = argv[i + 1]; i += 2; continue
+        rest.append(a); i += 1
+    return rest
 
 def http_get_health_raw(timeout_s):
     """raw socket GET /health，返回 (connect_ms, firstbyte_ms, complete_ms, status)。
@@ -136,16 +153,18 @@ def probe_curl(n, timeout_s, label):
         print("  ms: min=%.1f med=%.1f max=%.1f" % (min(lat), statistics.median(lat), max(lat)))
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "baseline"
+    argv = parse_net_args(sys.argv[1:])
+    mode = argv[0] if len(argv) > 0 else "baseline"
+    print("target: %s:%d mode=%s" % (HOST, PORT, mode))
     if mode == "baseline":
         # 无负载：raw + requests + curl 各测一轮，确认基线正常
         run_probe(200, 10.0, "baseline raw GET /health (no load)")
         probe_requests(50, 10.0, "baseline")
         probe_curl(50, 10.0, "baseline")
     elif mode == "load":
-        n = int(sys.argv[2]) if len(sys.argv) > 2 else 300
-        nl = int(sys.argv[3]) if len(sys.argv) > 3 else 8
-        mn = int(sys.argv[4]) if len(sys.argv) > 4 else 128
+        n = int(argv[1]) if len(argv) > 1 else 300
+        nl = int(argv[2]) if len(argv) > 2 else 8
+        mn = int(argv[3]) if len(argv) > 3 else 128
         threads = [threading.Thread(target=load_worker, args=(mn,), daemon=True) for _ in range(nl)]
         for t in threads: t.start()
         time.sleep(2.0)  # 让负载起来
@@ -159,10 +178,10 @@ if __name__ == "__main__":
             print("  load POST /generate: ok=%d fail=%d" % (load_stats["ok"], load_stats["fail"]))
     elif mode == "long":
         # 长超时：区分「慢（最终完成）」还是「永久卡死」
-        n = int(sys.argv[2]) if len(sys.argv) > 2 else 40
-        nl = int(sys.argv[3]) if len(sys.argv) > 3 else 8
-        mn = int(sys.argv[4]) if len(sys.argv) > 4 else 128
-        to = float(sys.argv[5]) if len(sys.argv) > 5 else 60.0
+        n = int(argv[1]) if len(argv) > 1 else 40
+        nl = int(argv[2]) if len(argv) > 2 else 8
+        mn = int(argv[3]) if len(argv) > 3 else 128
+        to = float(argv[4]) if len(argv) > 4 else 60.0
         threads = [threading.Thread(target=load_worker, args=(mn,), daemon=True) for _ in range(nl)]
         for t in threads: t.start()
         time.sleep(8.0)  # 预热：让负载线程完成若干轮，worker 进入稳定循环
@@ -183,11 +202,11 @@ if __name__ == "__main__":
             print("  load POST /generate: ok=%d fail=%d" % (load_stats["ok"], load_stats["fail"]))
     elif mode == "sust":
         # 先让负载真正饱和（长预热），再串行探测 health：确定性触发
-        n = int(sys.argv[2]) if len(sys.argv) > 2 else 100
-        nl = int(sys.argv[3]) if len(sys.argv) > 3 else 8
-        mn = int(sys.argv[4]) if len(sys.argv) > 4 else 128
-        to = float(sys.argv[5]) if len(sys.argv) > 5 else 10.0
-        warm = float(sys.argv[6]) if len(sys.argv) > 6 else 30.0
+        n = int(argv[1]) if len(argv) > 1 else 100
+        nl = int(argv[2]) if len(argv) > 2 else 8
+        mn = int(argv[3]) if len(argv) > 3 else 128
+        to = float(argv[4]) if len(argv) > 4 else 10.0
+        warm = float(argv[5]) if len(argv) > 5 else 30.0
         threads = [threading.Thread(target=load_worker, args=(mn,), daemon=True) for _ in range(nl)]
         for t in threads: t.start()
         print("  warming up %.0fs to saturate worker..." % warm)
@@ -200,10 +219,10 @@ if __name__ == "__main__":
             print("  load POST /generate: ok=%d fail=%d" % (load_stats["ok"], load_stats["fail"]))
     elif mode == "conc":
         # 并发 health：看 connect() 延迟是否随 backlog 上升（区分 acceptor 饿死 vs send 阻塞）
-        dur = float(sys.argv[2]) if len(sys.argv) > 2 else 30.0
-        nl = int(sys.argv[3]) if len(sys.argv) > 3 else 12
-        mn = int(sys.argv[4]) if len(sys.argv) > 4 else 64
-        hc = int(sys.argv[5]) if len(sys.argv) > 5 else 16
+        dur = float(argv[1]) if len(argv) > 1 else 30.0
+        nl = int(argv[2]) if len(argv) > 2 else 12
+        mn = int(argv[3]) if len(argv) > 3 else 64
+        hc = int(argv[4]) if len(argv) > 4 else 16
         lt = [threading.Thread(target=load_worker, args=(mn,), daemon=True) for _ in range(nl)]
         for t in lt: t.start()
         time.sleep(6.0)

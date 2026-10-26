@@ -7,6 +7,13 @@ import json, os, struct, sys
 import numpy as np
 
 out = sys.argv[1] if len(sys.argv) > 1 else "models/llava-rand"
+
+# G19: --out/-o 可传（CI 用），位置参数兼容
+_argv = sys.argv[1:]
+if "--out" in _argv and _argv.index("--out") + 1 < len(_argv):
+    out = _argv[_argv.index("--out") + 1]
+elif "-o" in _argv and _argv.index("-o") + 1 < len(_argv):
+    out = _argv[_argv.index("-o") + 1]
 E, H, L, P, IMG, I, PROJ = 64, 4, 2, 8, 32, 128, 32   # n_patch=16
 rng = np.random.default_rng(7)
 os.makedirs(out, exist_ok=True)

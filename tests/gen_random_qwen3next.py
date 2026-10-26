@@ -9,6 +9,23 @@ import json, os, sys
 import numpy as np
 
 out = sys.argv[1] if len(sys.argv) > 1 else "models/qwen3next-rand"
+
+def _args(argv, default_out):
+    """G19: --out/-o 与 --tokenizer/-t 可传，位置参数仍兼容。"""
+    out, tok, pos = default_out, "models/qwen3-06", []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--out", "-o") and i + 1 < len(argv):
+            out = argv[i + 1]; i += 2; continue
+        if a in ("--tokenizer", "-t") and i + 1 < len(argv):
+            tok = argv[i + 1]; i += 2; continue
+        pos.append(a); i += 1
+    if pos:
+        out = pos[0]
+    return out, tok, pos
+
+out, TOKDIR, _pos = _args(sys.argv[1:], "models/qwen3next-rand")
 L, H, KVH, E, I, V = 4, 4, 2, 64, 128, 151936
 D = E // H
 NK, NH, KD, VD, CONV = 2, 4, 16, 16, 4  # linear attn：k 头 2、v 头 4、头维 16、conv 核 4
@@ -75,7 +92,9 @@ def save_safetensors(path, tensors):
 save_safetensors(f"{out}/model.safetensors", W)
 import shutil
 for f2 in ("tokenizer.json", "vocab.json", "merges.txt", "tokenizer_config.json"):
-    p2 = f"models/qwen3-06/{f2}"
+    p2 = f"{TOKDIR}/{f2}"
     if os.path.exists(p2):
         shutil.copy(p2, f"{out}/{f2}")
+if not os.path.exists(f"{TOKDIR}/tokenizer.json"):
+    print(f"WARN: no tokenizer at {TOKDIR}/tokenizer.json (--tokenizer <dir> to point at one)")
 print(f"saved random qwen3_next -> {out} (L={L} E={E} lin: nk={NK} nh={NH} kd={KD} vd={VD} conv={CONV})")

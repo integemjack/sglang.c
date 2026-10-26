@@ -90,8 +90,23 @@ if ($null -eq $rmean -or $null -eq $vmean -or $rmean -le 0 -or $vmean -le 0) {
 Write-Output ("samples: {0} (slope 从第 {1} 个起算)" -f $samples.Count, ($skip + 1))
 Write-Output ("RSS  : mean {0:N1} MB, slope {1:N3} MB/min ({2:N4} %/min)" -f $rmean, $rs, (100 * $rs / $rmean))
 Write-Output ("VRAM : mean {0:N1} MB, slope {1:N3} MB/min ({2:N4} %/min)" -f $vmean, $vs, (100 * $vs / $vmean))
-$err = (Get-Content "$logf.err" -Raw -ErrorAction SilentlyContinue)
-if ($err -match 'error|Error|failed') { Write-Output "server stderr 有错误："; ($err -split "`n" | Select-Object -Last 5) }
+# G17：旧版把 server stderr 的任何含 error/Error 的行都当错误报 —— 实测是误报。
+# 例：qwen2 加载器对可选张量打的 "q_norm not found / k_norm not found" 是无害 INFO；
+# 而 `-match 'error'` 连路径里的子串也算。现改为：只有词界匹配 ERROR|FATAL|abort
+# 且不在白名单的行才算真错误，干净服务不再报错误段。
+$whitelist = 'not found|INFO|SKIP|debug'
+$errLines = @()
+if (Test-Path "$logf.err") {
+  $errLines = @(Get-Content "$logf.err" | Where-Object {
+      ($_ -match '(^|[^A-Za-z])(ERROR|FATAL|abort|Abort)([^A-Za-z]|$)') -and ($_ -notmatch $whitelist)
+    })
+}
+if ($errLines.Count -gt 0) {
+  Write-Output ("server stderr 有 {0} 条错误行（已过滤 INFO/not found 白名单）：" -f $errLines.Count)
+  $errLines | Select-Object -Last 8 | ForEach-Object { Write-Output ("  " + $_) }
+} else {
+  Write-Output 'server stderr: no ERROR/FATAL lines (INFO whitelist filtered)'
+}
 $ok = $alive -and ($rs -ne $null) -and ([math]::Abs(100 * $rs / $rmean) -lt 0.5) -and ([math]::Abs(100 * $vs / $vmean) -lt 0.5)
 Write-Output ("soak_curve: {0}" -f $(if ($ok) { 'PASS (无泄漏：斜率 <0.5%/min)' } else { 'FAIL' }))
 Remove-Item $logf, "$logf.err" -Force -ErrorAction SilentlyContinue

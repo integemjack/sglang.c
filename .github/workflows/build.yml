@@ -52,6 +52,30 @@ jobs:
             -o models/gpt2/model.safetensors \
             https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors
 
+      # G19: 随机结构模型族入 CI —— 以前 models/ 里没有这些目录，CMakeLists 的条件注册
+      # （:141-155 的 test_family_*、:127-130 的 test_llava）就不注册，多模态与模型族的
+      # 数值正确性在 CI 上从来没跑过（只有 gpt2）。生成脚本固定 seed，权重与仓库里的
+      # tests/_ref_*.json 一一对应；tokenizer 只下 Qwen3-0.6B 的 4 个小文件（~16MB，
+      # 不下真实权重），与 _ref_*.json 里的 ids 同源（换成 gpt2 tokenizer 会让 ids 对不上）。
+      - name: Generate random model family (Linux/macOS)
+        if: matrix.gen == 'ninja' || matrix.gen == 'ninja-x64'
+        shell: bash
+        run: |
+          python3 -m pip install --quiet --break-system-packages numpy \
+            || python3 -m pip install --quiet --user numpy
+          mkdir -p models/qwen3-06
+          for f in tokenizer.json vocab.json merges.txt tokenizer_config.json; do
+            curl -L --retry 5 --retry-all-errors -f -o "models/qwen3-06/$f" \
+              "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/$f"
+          done
+          python3 tests/gen_random_mistral.py   --out models/mistral-rand   --tokenizer models/qwen3-06
+          python3 tests/gen_random_gemma.py     --out models/gemma-rand     --tokenizer models/qwen3-06
+          python3 tests/gen_random_gemma.py     --out models/gemma2-rand    --tokenizer models/qwen3-06 --variant dynamic
+          python3 tests/gen_random_qwen3next.py --out models/qwen3next-rand --tokenizer models/qwen3-06
+          python3 tests/gen_random_llava.py     --out models/llava-rand
+          python3 tests/ref_llava.py models/llava-rand tests/_ref_llava.json
+          ls -d models/*-rand
+
       - name: Configure (Ninja)
         if: matrix.gen == 'ninja' || matrix.gen == 'ninja-x64'
         run: |
@@ -80,6 +104,23 @@ jobs:
         with:
           cuda: '13.3.0'
 
+      - name: Generate random model family (Windows CPU)
+        if: matrix.gen == 'msvc'
+        shell: pwsh
+        run: |
+          python -m pip install --quiet numpy
+          New-Item -ItemType Directory -Force -Path models/qwen3-06 | Out-Null
+          foreach ($f in 'tokenizer.json', 'vocab.json', 'merges.txt', 'tokenizer_config.json') {
+            curl.exe -L --retry 5 --retry-all-errors -f -o "models/qwen3-06/$f" "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/$f"
+          }
+          python tests/gen_random_mistral.py   --out models/mistral-rand   --tokenizer models/qwen3-06
+          python tests/gen_random_gemma.py     --out models/gemma-rand     --tokenizer models/qwen3-06
+          python tests/gen_random_gemma.py     --out models/gemma2-rand    --tokenizer models/qwen3-06 --variant dynamic
+          python tests/gen_random_qwen3next.py --out models/qwen3next-rand --tokenizer models/qwen3-06
+          python tests/gen_random_llava.py     --out models/llava-rand
+          python tests/ref_llava.py models/llava-rand tests/_ref_llava.json
+          Get-ChildItem -Directory models/*-rand | Select-Object Name
+
       - name: Configure (MSVC)
         if: matrix.gen == 'msvc' || matrix.gen == 'msvc-cuda'
         shell: pwsh
@@ -95,7 +136,18 @@ jobs:
       - name: Test (CPU builds)
         if: matrix.gen != 'msvc-cuda'
         shell: bash
-        run: ctest --test-dir build --output-on-failure --timeout 900
+        run: |
+          set -o pipefail
+          ctest --test-dir build -V --timeout 900 2>&1 | tee ctest.log
+          # G19 验收：模型族/多模态必须真跑（注册了、且不是 SKIP），否则最核心的
+          # numpy 对照等于仍然没被 CI 覆盖（v0.2.0 前一直是这个状态）。
+          # 判据用正向标记（测试都打了 "all OK"），不用反查 SKIP —— test_spec 在
+          # 没下 draft 权重时本来就 SKIP，按 SKIP 判会恒红。
+          fam=$(grep -c 'greedy6=一致' ctest.log || true)
+          llava=$(grep -c 'test_llava: all OK' ctest.log || true)
+          echo "family cases that actually ran: $fam, test_llava all-OK: $llava"
+          if [ "$fam" -lt 4 ]; then echo "::error::模型族只跑了 $fam 个（应为 mistral/gemma/gemma2/qwen3next 4 个）"; exit 1; fi
+          if [ "$llava" -lt 1 ]; then echo "::error::test_llava 没真跑（缺 models/llava-rand 或它在 SKIP）"; exit 1; fi
 
       # CI runner 无 NVIDIA 驱动：cuda_cli/cuda_http 动态链 cublas（→nvcuda.dll）启动即
       # 0xC0000135，无法在无 GPU runner 上运行 —— 只验证产物存在；可加载 smoke 用同

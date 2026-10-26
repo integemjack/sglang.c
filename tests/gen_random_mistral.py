@@ -5,6 +5,23 @@ import json, os, sys
 import numpy as np
 
 out = sys.argv[1] if len(sys.argv) > 1 else "models/mistral-rand"
+
+def _args(argv, default_out):
+    """G19: --out/-o 与 --tokenizer/-t 可传（CI 用仓内 tokenizer），位置参数仍兼容。"""
+    out, tok, pos = default_out, "models/qwen3-06", []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--out", "-o") and i + 1 < len(argv):
+            out = argv[i + 1]; i += 2; continue
+        if a in ("--tokenizer", "-t") and i + 1 < len(argv):
+            tok = argv[i + 1]; i += 2; continue
+        pos.append(a); i += 1
+    if pos:
+        out = pos[0]
+    return out, tok, pos
+
+out, TOKDIR, _pos = _args(sys.argv[1:], "models/mistral-rand")
 L, H, KVH, E, I, V, SW = 2, 4, 2, 64, 128, 151936, 64
 D = E // H
 rng = np.random.default_rng(42)
@@ -51,11 +68,13 @@ def save_safetensors(path, tensors):
 
 save_safetensors(f"{out}/model.safetensors", W)
 import shutil
-src_tok = "models/qwen3-06/tokenizer.json"
+src_tok = f"{TOKDIR}/tokenizer.json"
 if os.path.exists(src_tok):
     shutil.copy(src_tok, f"{out}/tokenizer.json")
     for f2 in ("vocab.json", "merges.txt", "tokenizer_config.json"):
-        p2 = f"models/qwen3-06/{f2}"
+        p2 = f"{TOKDIR}/{f2}"
         if os.path.exists(p2):
             shutil.copy(p2, f"{out}/{f2}")
+else:
+    print(f"WARN: no tokenizer at {src_tok} (--tokenizer <dir> to point at one)")
 print(f"saved random mistral -> {out} (L={L} H={H} KVH={KVH} E={E} window={SW})")
