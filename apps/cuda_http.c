@@ -1,4 +1,4 @@
-/* sgl cuda_http.c - GPU HTTP inference server (MSVC build, links sgl_cuda)
+﻿/* sgl cuda_http.c - GPU HTTP inference server (MSVC build, links sgl_cuda)
  * endpoints: GET /health, POST /generate, POST /v1/completions,
  *            POST /v1/chat/completions (chatml template; stream via SSE)
  * engine: KV-segment scheduler on GPU - each request gets a segment of

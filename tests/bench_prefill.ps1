@@ -1,4 +1,4 @@
-# G16: prefill bench (three precisions) + dp4a/imma crossover + flash-vs-two-pass A/B.
+﻿# G16: prefill bench (three precisions) + dp4a/imma crossover + flash-vs-two-pass A/B.
 # Usage: powershell -File tests\bench_prefill.ps1   (writes build\g16_final.log)
 #   模型用 ..\models\qwen05（D=64，24 层），ctx 默认 16384；每步 rounds=2 取优，
 #   最后一项是 --ab（同进程两遍 vs flash，WDDM 下绝对值会飘，比值才可信）。
