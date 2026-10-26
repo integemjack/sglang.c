@@ -140,10 +140,7 @@ static void pfx_register(int seg, const int *toks, int len) {
     if (g_pfx[i].seg == seg) { slot = i; break; } /* 同段直接覆盖旧登记 */
     if (g_pfx[i].use < oldest) { oldest = g_pfx[i].use; lru = i; }
   }
-  if (slot < 0) pfx_drop(lru); /* LRU 驱逐：那个段从此可被复用 */
-  else if (slot < 0 || g_pfx[slot].used) { /* unreachable */ }
-  if (slot < 0) { pfx_drop(lru); slot = lru; }
-  if (g_pfx[slot].used && g_pfx[slot].seg != seg) pfx_drop(slot);
+  if (slot < 0) { pfx_drop(lru); slot = lru; } /* 表满：LRU 驱逐（那个段从此可被复用） */
   int *cp = (int *)malloc(sizeof(int) * (size_t)len);
   if (!cp) return;
   memcpy(cp, toks, sizeof(int) * (size_t)len);
@@ -339,6 +336,13 @@ static DWORD WINAPI worker(LPVOID unused) {
         int src_seg = -1;
         int hit = pfx_match(r->prompt, r->n_prompt, &src_seg);
         if (hit >= r->n_prompt) hit = r->n_prompt - 1;
+        /* 本段自己如果持有租让：新请求要写它的 KV 行了。除非这段租让恰好就是
+         * 我们要原样保留的那段（src==本段 且 hit==租让长度），否则必须撕掉这条租让，
+         * 不然下一个请求会匹配到已被覆盖的垃圾 KV。 */
+        if (hit > 0 && g_pfx_of[i]) {
+          int li = g_pfx_of[i] - 1;
+          if (!(src_seg == i && hit == g_pfx[li].len)) pfx_drop(li);
+        }
         if (hit > 0) {
           if (src_seg != i) {
             if (g_pfx_of[i]) pfx_drop(g_pfx_of[i] - 1); /* 本段旧租让要被覆盖了 */

@@ -14,6 +14,7 @@
 #include "sgl/bpe.h"
 #include "sgl/clip.h"
 #include "sgl/cuda.h"
+#include "sgl/cuda_spec.h"
 #include "sgl/gpt2.h"
 #include "sgl/json.h"
 #include "sgl/llama.h"
@@ -116,6 +117,96 @@ static void mm_gpu_check(void) {
   }
   sgl_xfree(lc3); sgl_xfree(feats); sgl_xfree(fp2); sgl_xfree(img);
   sgl_st_close(pst); sgl_clip_free(cp); sgl_llama_free(lm);
+}
+
+/* G7: 真实 draft/target 组合（tinyllama target + llama-160m draft，同 Llama-2
+ * 词表 32000）。6GB 卡约束：强制 fp16 + ctx 1024（两份权重 ~2.2+0.33GB + KV）；
+ * 显存不够上传失败则 SKIP（机器限制非代码问题）。硬约束：spec 输出与同
+ * target GPU 非 spec greedy 逐 token 全同；另报接受率。 */
+static void spec_real_check(const char *dir) {
+  char parent[512];
+  snprintf(parent, sizeof(parent), "%s", dir);
+  char *sl = strrchr(parent, '/');
+  char *bs = strrchr(parent, '\\');
+  if (bs > sl) sl = bs;
+  if (sl) *sl = 0; else snprintf(parent, sizeof(parent), "models");
+  char tdir[600], ddir[600], probe[640];
+  snprintf(tdir, sizeof(tdir), "%s/tinyllama", parent);
+  snprintf(ddir, sizeof(ddir), "%s/llama-160m", parent);
+  FILE *f1 = NULL;
+  snprintf(probe, sizeof(probe), "%s/model.safetensors", tdir);
+  if (fopen_s(&f1, probe, "rb") != 0 || !f1) { printf("[spec] SKIP: no %s\n", tdir); return; }
+  fclose(f1);
+  snprintf(probe, sizeof(probe), "%s/model.safetensors", ddir);
+  if (fopen_s(&f1, probe, "rb") != 0 || !f1) { printf("[spec] SKIP: no %s\n", ddir); return; }
+  fclose(f1);
+
+  char sv16[32], svc[32];
+  { const char *e = getenv("SGL_CUDA_FP16"); snprintf(sv16, sizeof(sv16), "%s", e ? e : ""); }
+  { const char *e = getenv("SGL_CUDA_CTX"); snprintf(svc, sizeof(svc), "%s", e ? e : ""); }
+  _putenv_s("SGL_CUDA_FP16", "1");
+  _putenv_s("SGL_CUDA_CTX", "1024");
+  printf("[spec] real combo: target=%s draft=%s (fp16 ctx1024, free VRAM %ldMB)\n",
+         tdir, ddir, sgl_cuda_avail_vram_mb());
+  sgl_llama *tc = sgl_llama_load(tdir);
+  sgl_llama *dc = tc ? sgl_llama_load(ddir) : NULL;
+  sgl_cuda_model *tg = tc ? sgl_cuda_from_llama(tc) : NULL;
+  sgl_cuda_model *dg = dc ? sgl_cuda_from_llama(dc) : NULL;
+  if (!tg || !dg) {
+    printf("[spec] SKIP: tinyllama/llama-160m upload failed (VRAM?)\n");
+  } else {
+    CHECK(sgl_cuda_vocab(tg) == sgl_cuda_vocab(dg),
+          "spec B vocab: draft=%d target=%d", sgl_cuda_vocab(dg), sgl_cuda_vocab(tg));
+    int V7 = sgl_cuda_vocab(tg);
+    snprintf(probe, sizeof(probe), "%s/tokenizer.json", tdir);
+    sgl_tokenizer *tk = sgl_tokenizer_load(probe);
+    CHECK(tk, "spec B tokenizer");
+    if (tk) {
+      const char *pp = "The meaning of life is";
+      int np = 0, eos = sgl_tokenizer_eos_id(tk);
+      (void)eos; /* 固定 24 tok、eos=-1：避开 CPU 版已知的“spec 含尾 eos/reference 不含”
+                 * 长度不对称边界（eos 路径由 CPU test_spec 覆盖） */
+      int *ids = sgl_tokenizer_encode(tk, pp, strlen(pp), &np);
+      float *l7 = (float *)sgl_xmalloc(sizeof(float) * (size_t)V7 * 8);
+      /* 参考：非 spec greedy（forward n=1，段 0），固定 24 tok */
+      int ref7[32], nr7 = 0, len7 = np;
+      CHECK(sgl_cuda_forward_seg(tg, ids, np, 0, 0, l7) == 0, "spec B prefill");
+      for (int s = 0; s < 24; s++) {
+        int t = sgl_sample_greedy(l7, V7);
+        ref7[nr7++] = t;
+        if (s < 23) {
+          CHECK(sgl_cuda_forward_seg(tg, &t, 1, len7, 0, l7) == 0, "spec B step");
+          len7++;
+        }
+      }
+      /* spec：target 段 0 / draft 段 0（不同实例各自 KV 池），K=4 */
+      int *out7 = NULL, dr7 = 0, ac7 = 0;
+      double ts0 = now_sec();
+      int ns7 = sgl_cuda_spec_generate(tg, 0, dg, 0, ids, np, 24, 4, -1,
+                                       &out7, &dr7, &ac7);
+      double tsd = now_sec() - ts0;
+      CHECK(ns7 > 0, "spec B n=%d", ns7);
+      CHECK(ns7 == nr7, "spec B length: spec=%d ref=%d", ns7, nr7);
+      int same7 = ns7 == nr7;
+      for (int i = 0; same7 && i < nr7; i++)
+        if (out7[i] != ref7[i]) {
+          printf("  [spec] B 首个分歧 @%d: spec=%d ref=%d\n", i, out7[i], ref7[i]);
+          same7 = 0;
+        }
+      CHECK(same7, "spec B output != non-spec greedy");
+      printf("[spec] tinyllama+llama-160m: 接受率 %.1f%% (%d/%d), %d tok / %.2fs, == 非 spec greedy %s\n",
+             dr7 ? 100.0 * ac7 / dr7 : 0.0, ac7, dr7, ns7, tsd,
+             same7 ? "✓" : "✗");
+      sgl_xfree(out7); sgl_xfree(ids); sgl_xfree(l7);
+      sgl_tokenizer_free(tk);
+    }
+    sgl_cuda_free(dg);
+    sgl_cuda_free(tg);
+  }
+  if (dc) sgl_llama_free(dc);
+  if (tc) sgl_llama_free(tc);
+  _putenv_s("SGL_CUDA_FP16", sv16);
+  _putenv_s("SGL_CUDA_CTX", svc);
 }
 
 int main(int argc, char **argv) {
@@ -553,6 +644,24 @@ int main(int argc, char **argv) {
       for (int i = 0; i < npl; i++) idl[i] = ids[i % np];
       int tref[8];
       CHECK(sgl_cuda_forward_seg(gpu, idl, npl, 0, 0, la) == 0, "4300 ss prefill");
+      /* G1: >4096 行的单流路径现在走 flash 核。把它和两遍核（t2 时在 8192 行
+       * 跟 CPU 对过，maxerr 1.56e-4）在同一 prompt 上对 logits：flash == 两遍
+       * 在噪声内 ⇒ 传递地 flash == CPU。写到 base 8192 避开 [0,4308) 的 KV。 */
+      _putenv("SGL_FORCE_LONG_ATTN=1");
+      CHECK(sgl_cuda_forward_seg(gpu, idl, npl, 0, 8192, lb) == 0, "4300 two-pass prefill");
+      _putenv("SGL_FORCE_LONG_ATTN=0");
+      {
+        double me43 = 0;
+        for (int i = 0; i < V; i++) {
+          double e = fabs((double) la[i] - (double) lb[i]);
+          if (e > me43) me43 = e;
+        }
+        int g43a = sgl_sample_greedy(la, V), g43b = sgl_sample_greedy(lb, V);
+        printf("[long] flash vs two-pass (4300 tok): maxerr = %g; greedy %d vs %d %s\n",
+               me43, g43a, g43b, g43a == g43b ? "SAME" : "DIFF");
+        CHECK(me43 < (FP16 ? 0.05 : 5e-3), "flash vs two-pass kernel mismatch %g", me43);
+        CHECK(g43a == g43b, "flash vs two-pass greedy mismatch");
+      }
       tref[0] = sgl_sample_greedy(la, V);
       int rlen = npl;
       for (int s = 1; s < 8; s++) {
@@ -700,6 +809,55 @@ int main(int argc, char **argv) {
     }
   }
 
+  /* ---- G7: GPU spec 正确性 A：draft==target（同实例、双 KV 段）。
+   * 接受率必须 100%（draft argmax 即 target argmax，同权重），且输出与
+   * 非 spec greedy 逐 token 全同（算法等价性哨兵：任何实现 bug 都会在这
+   * 里暴露成接受率<100% 或输出分歧）。target 段 8192 / draft 段 0。 */
+  {
+    int ctx7 = sgl_cuda_ctx(gpu);
+    if (ctx7 >= 8192 + 64) {
+      snprintf(p, sizeof(p), "%s/tokenizer.json", dir);
+      sgl_tokenizer *tok7 = sgl_tokenizer_load(p);
+      const char *pp7 = "The meaning of life is";
+      int np7 = 0;
+      int *ids7 = NULL;
+      if (tok7) ids7 = sgl_tokenizer_encode(tok7, pp7, strlen(pp7), &np7);
+      CHECK(tok7 && ids7, "spec A tokenizer");
+      if (tok7 && ids7) {
+        float *l7 = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+        int ref7[32], nr7 = 0, len7 = np7;
+        CHECK(sgl_cuda_forward_seg(gpu, ids7, np7, 0, 0, l7) == 0, "spec A prefill");
+        for (int s = 0; s < 24; s++) {
+          int t = sgl_sample_greedy(l7, V);
+          ref7[nr7++] = t;
+          if (s < 23) {
+            CHECK(sgl_cuda_forward_seg(gpu, &t, 1, len7, 0, l7) == 0, "spec A step");
+            len7++;
+          }
+        }
+        int *out7 = NULL, dr7 = 0, ac7 = 0;
+        int ns7 = sgl_cuda_spec_generate(gpu, 8192, gpu, 0, ids7, np7, 24, 4,
+                                         -1, &out7, &dr7, &ac7);
+        CHECK(ns7 == nr7, "spec A length: spec=%d ref=%d", ns7, nr7);
+        int same7 = ns7 == nr7;
+        for (int i = 0; same7 && i < nr7; i++)
+          if (out7[i] != ref7[i]) {
+            printf("  [spec] A 首个分歧 @%d: spec=%d ref=%d\n", i, out7[i], ref7[i]);
+            same7 = 0;
+          }
+        CHECK(same7, "spec A output != non-spec greedy");
+        CHECK(ns7 > 0 && ac7 == dr7,
+              "spec A 接受率应 100%%（同权重），实测 %d/%d", ac7, dr7);
+        printf("[spec] qwen05 draft==target（同实例双段）: 接受率 %.0f%% (%d/%d), %d tok == 非 spec greedy %s\n",
+               dr7 ? 100.0 * ac7 / dr7 : 0.0, ac7, dr7, ns7, same7 ? "✓" : "✗");
+        sgl_xfree(out7); sgl_xfree(l7); sgl_xfree(ids7);
+      }
+      sgl_tokenizer_free(tok7);
+    } else {
+      printf("[spec] SKIP A: qwen05 gpu ctx %d < 8256\n", ctx7);
+    }
+  }
+
   sgl_cuda_free(gpu);
   sgl_llama_free(cpu);
 
@@ -772,6 +930,8 @@ int main(int argc, char **argv) {
   }
 
   mm_gpu_check();
+
+  spec_real_check(dir);
 
   if (FAILURES) { printf("test_cuda: %d FAILURES\n", FAILURES); return 1; }
   printf("test_cuda: all OK\n");
