@@ -261,7 +261,7 @@ vs float64 numpy ≤8e-08；但 full_attention 层还是普通 qwen3 写法，�
 验收：ctest 新增 case 全绿；真实 qwen3-06 回归不变；带 MoE 的随机模型 numpy maxerr < 1e-6。
 ```
 
-## 任务 G14 · 投机解码正收益路径（性能，中大）
+## 任务 G14 · 投机解码正收益路径（性能，中大） ✅ 已做完（结构成本已砍；验收门槛未达，如实记“仍净减速”，见 docs/NOTES_t7.md G14 补记）
 
 ```
 现状（NOTES_t7.md G7 补记）：GPU 侧实现已正确（spec == 非 spec greedy 逐 token 全同），

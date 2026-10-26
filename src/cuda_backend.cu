@@ -191,6 +191,83 @@ __global__ void k_gemm_nt_h(const float *A, const __half *W, const float *bias,
   if (threadIdx.x == 0) C[mn] = red[0] + (bias ? bias[n] : 0.0f);
 }
 
+/* G14 small-M GEMV：M 很小（2..8，验证型前向 / 小批量）时，k_gemm_nt 每个输出元素
+ * 一个 block 会把权重行读 M 遍；这里改成每个输出行 n 一个 block，**权重只读一遍**，
+ * 同时累 MT 个 query 行的点积（A 很小，全在 L2）。
+ * MT 必须是编译期常量：动态 M 的循环会让累加器 acc[] 落到 local memory，反而把
+ * 带宽优势吃光（M=2 实测 22.1ms vs M=1 的 14.6ms；改成模板后见 BENCH G14 节）。 */
+/* 跨线程归约：先 warp 内 shuffle（每行 5 步，无同步），再每个 warp 的 lane0 写一份
+ * 共享内存，最后线程 0 汇总。MT=8 的旧写法是 MT 轮树形归约，每轮都 8 次
+ * __syncthreads（共 64 次同步），实测让 n=5..8 反而比 n=4 慢。 */
+template <int MT>
+__device__ __forceinline__ void mrow_emit(float *C, const float *acc, const float *bias,
+                                          int n, int N, int M, int tid, int nt) {
+  __shared__ float wred[MT * 8];
+  int lane = tid & 31, warp = tid >> 5, nwarp = nt >> 5;
+#pragma unroll
+  for (int i = 0; i < MT; i++) {
+    float v = acc[i];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+    if (lane == 0) wred[i * nwarp + warp] = v;
+  }
+  __syncthreads();
+  if (tid == 0)
+    for (int i = 0; i < M; i++) {
+      float s = 0.f;
+      for (int w = 0; w < nwarp; w++) s += wred[i * nwarp + w];
+      C[(long)i * N + n] = s + (bias ? bias[n] : 0.0f);
+    }
+}
+
+template <int MT>
+__global__ void k_gemm_nt_mrow(const float *A, const float *W, const float *bias,
+                               float *C, int M, int N, int K) {
+  int n = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+  const float *wr = W + (long)n * K;
+  float acc[MT];
+#pragma unroll
+  for (int i = 0; i < MT; i++) acc[i] = 0.f;
+  for (int k = tid; k < K; k += nt) {
+    float w = wr[k];
+#pragma unroll
+    for (int i = 0; i < MT; i++)
+      if (i < M) acc[i] += A[(long)i * K + k] * w; /* i>=M 时 A 没那行，别越界读 */
+  }
+  mrow_emit<MT>(C, acc, bias, n, N, M, tid, nt);
+}
+
+/* 同上，权重是 __half（fp16 上传）；累加仍全 fp32（与 k_gemm_nt_h 一致）。 */
+template <int MT>
+__global__ void k_gemm_nt_h_mrow(const float *A, const __half *W, const float *bias,
+                                 float *C, int M, int N, int K) {
+  int n = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+  const __half *wr = W + (long)n * K;
+  float acc[MT];
+#pragma unroll
+  for (int i = 0; i < MT; i++) acc[i] = 0.f;
+  if ((K & 1) == 0) {
+    const __half2 *w2 = (const __half2 *)wr;
+    for (int k = tid; k < K / 2; k += nt) {
+      float2 wf = __half22float2(w2[k]);
+#pragma unroll
+      for (int i = 0; i < MT; i++) {
+        if (i >= M) continue; /* 同上：A 只分配了 M 行 */
+        const float *ar = A + (long)i * K + 2 * k;
+        acc[i] += ar[0] * wf.x + ar[1] * wf.y;
+      }
+    }
+  } else {
+    for (int k = tid; k < K; k += nt) {
+      float w = __half2float(wr[k]);
+#pragma unroll
+      for (int i = 0; i < MT; i++)
+        if (i < M) acc[i] += A[(long)i * K + k] * w;
+    }
+  }
+  mrow_emit<MT>(C, acc, bias, n, N, M, tid, nt);
+}
+
 /* t1 fp16 embed lookup: x = fp32(wte_h[token]) */
 __global__ void k_embed_h(const __half *wte, const int *tok, float *x, int n, int E) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -860,6 +937,34 @@ static int gemm_nt_w8_imma(sgl_cuda_model *g, const float *A, const sgl_w8w *W8,
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
+/* G14: M in [2,8] also goes to a hand kernel — one block per output row,
+ * one pass over the weight row for all M query rows. cublas needs ~9 ms more
+ * than the M=1 kernel for M=2 on tinyllama (measured), because each of the
+ * 66 per-layer GEMMs pays its own launch/tile overhead while the traffic is
+ * identical.
+ * SGL_SMALLM_CUBLAS=1 forces the old cublas path for A/B. */
+static int small_m_hand(void) {
+  static int on = -1;
+  if (on < 0) on = getenv("SGL_SMALLM_CUBLAS") ? 0 : 1;
+  return on;
+}
+
+/* G14: dispatch the templated small-M GEMV by rounding M up to 2/4/8 so the
+ * accumulator loop is compile-time unrolled (dynamic M spills acc[] to local
+ * memory and loses the whole point). */
+static void gemm_nt_mrow_launch(cudaStream_t s, const float *A, const float *W,
+                                const float *bias, float *C, int M, int N, int K) {
+  if (M <= 2) k_gemm_nt_mrow<2><<<N, 256, 2 * 256 * sizeof(float), s>>>(A, W, bias, C, M, N, K);
+  else if (M <= 4) k_gemm_nt_mrow<4><<<N, 256, 4 * 256 * sizeof(float), s>>>(A, W, bias, C, M, N, K);
+  else k_gemm_nt_mrow<8><<<N, 256, 8 * 256 * sizeof(float), s>>>(A, W, bias, C, M, N, K);
+}
+static void gemm_nt_h_mrow_launch(cudaStream_t s, const float *A, const __half *W,
+                                  const float *bias, float *C, int M, int N, int K) {
+  if (M <= 2) k_gemm_nt_h_mrow<2><<<N, 256, 2 * 256 * sizeof(float), s>>>(A, W, bias, C, M, N, K);
+  else if (M <= 4) k_gemm_nt_h_mrow<4><<<N, 256, 4 * 256 * sizeof(float), s>>>(A, W, bias, C, M, N, K);
+  else k_gemm_nt_h_mrow<8><<<N, 256, 8 * 256 * sizeof(float), s>>>(A, W, bias, C, M, N, K);
+}
+
 static void gemm_nt_cublas(cublasHandle_t h, cudaStream_t stream,
                            const float *A, const float *W,
                            const float *bias, float *C, int M, int N, int K) {
@@ -873,6 +978,10 @@ static void gemm_nt_cublas(cublasHandle_t h, cudaStream_t stream,
   }
   if (M == 1 && !force_blas) {
     k_gemm_nt<<<N, 256, 256 * sizeof(float), stream>>>(A, W, bias, C, 1, N, K);
+    return;
+  }
+  if (M >= 2 && M <= 8 && !force_blas && small_m_hand()) {
+    gemm_nt_mrow_launch(stream, A, W, bias, C, M, N, K);
     return;
   }
   if (bias)
@@ -899,6 +1008,10 @@ static void gemm_nt_any(sgl_cuda_model *g, const float *A, const float *W_f,
   }
   if (M == 1) {
     k_gemm_nt_h<<<N, 256, 256 * sizeof(float), st>>>(A, W_h, bias, C, 1, N, K);
+    return;
+  }
+  if (M >= 2 && M <= 8 && small_m_hand()) {
+    gemm_nt_h_mrow_launch(st, A, W_h, bias, C, M, N, K);
     return;
   }
   if ((long)M * K > (long)g->ws_cap * (g->E > g->I ? g->E : g->I)) {

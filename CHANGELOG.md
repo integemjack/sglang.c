@@ -2,7 +2,26 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G16/G17/G19
+## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G14/G16/G17/G19
+
+### 性能
+- **G14 投机解码流水线化**（`src/cuda_spec.c`）：预填 `np-1` 行，把 prompt 末 token
+  当“挂起 token”由下一轮 verify 第 0 行吞掉 —— 每轮 verify 固定 n=K+1 行，
+  reject/bonus token 的 KV 不再需要单独一次 target 图步（旧结构每轮固定 11.9–12.8ms，
+  占总时长 23–46%）。tinyllama+llama-160m（ctx=1024，new=32，best-of-3）：
+  K=1 0.44x→**0.73x**（35.1→60.5 tok/s）、K=2 0.35x→**0.64x**、K=4 0.27x→**0.40x**。
+  输出语义不变：`cuda_test [spec]` 两例（draft==target 100% 接受率、真实组合 13.3%）
+  依旧逐 token 等于非 spec greedy。
+  仍末达到 ≥1.0x 的门槛：按实测 t=11.4ms、d=3.35ms 算，回本需 K=1 接受率 >88%、
+  K=2 >69.5%，而实测只有 39.1% / 28.6% —— 未蒸馏 draft 太弱，已如实记入 BENCH/NOTES。
+- **G14 small-M GEMV**（`k_gemm_nt_mrow` / `k_gemm_nt_h_mrow`）：M=2..8 时每输出行
+  一个 block，权重行只读一遍、同时累 2/4/8 个 query 行（MT 用模板实例化，动态 M
+  会把累加器打回 local memory：M=2 实测 22.1→16.1ms）。verify 成本因此变成
+  n=2 16.1ms / n=3 17.2 / n=4 18.5（旧值 22.1/24.0/25.8）；跨线程归约改 warp
+  shuffle（单次同步），n=5..8 的额外惩罚从 33ms 降到 27.7ms。同样受益于批量
+  decode B=2..8 与 2–8 token 的短 prefill。
+- **G14 诊断开关**：`SGL_SPEC_PROF=1` 打每轮的 draft/verify/补齐耗时分解；
+  `SGL_SMALLM_CUBLAS=1` 把 M=2..8 退回 cublas（A/B 用）。
 
 ### 性能
 - **G16 flash 不再只服务长行：short 核阀值 4096 → 64**（`SGL_ATTN_FLASH_MIN`）。

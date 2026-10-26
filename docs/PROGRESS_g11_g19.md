@@ -27,8 +27,8 @@
 | G11 GPU 收标准图片 | ✅ 完成 | 见下 |
 | G17 G4 GPU 版复验 + soak 误报 | ✅ 完成（**找到并修掉真根因**） | 见下 |
 | G19 CI 真跑模型族与多模态 | ✅ 完成 | 见下 |
-| G16 W8 重测 + flash 泛化 | 未开始 | qwen05 在 `../models/qwen05` |
-| G14 投机正收益 | 未开始 | tinyllama + llama-160m 都在 `../models` |
+| G16 W8 重测 + flash 泛化 | ✅ 完成 | 见下 |
+| G14 投机正收益 | 已做完（未达 ≥1.0x，如实记“仍净减速”） | 见下 |
 | G12 真实 llava-1.5 | 未开始 | 需下 ~4GB 权重（`../models/llava-1.5-7b` 之类） |
 | G15 前缀缓存 radix | 未开始 | 纯代码 + 随机模型可验 |
 | G13 Qwen3-Next full 层 | 未开始 | 纯代码 + 随机模型可验 |
@@ -109,11 +109,23 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 工具：`tests/bench_prefill.ps1`、`long_vcpu` 新增 flash-vs-two-pass、
   `SGL_ATTN_DEBUG=1` 打实际用的核、`gen_random_mistral.py` 可指定维度。
 
+### 新增（G14）
+- **投机解码流水线（`src/cuda_spec.c`）**：预填 `np-1` 行，prompt 末 token 作为“挂起
+  token”由下一轮 verify 第 0 行吞掉 → 每轮 verify 固定 n=K+1，reject/bonus 的 KV
+  顺带被写掉，**去掉每轮一次 target 图步**。tinyllama+llama-160m（ctx=1024，new=32，
+  best-of-3）：K=1 0.44x→0.73x（60.5 tok/s）、K=2 0.35x→0.64x、K=4 0.27x→0.40x。
+  `cuda_test` 的两个 [spec] 例子（draft==target 100%、真实组合 13.3%）依旧逐 token
+  等于非 spec greedy。**仍末达到 ≥1.0x**：按实测回本需 K=1 a>88% / K=2 a>69.5%，
+  而实际只有 39.1% / 28.6%。
+- **small-M GEMV（`k_gemm_nt_mrow` / `k_gemm_nt_h_mrow`，模板 MT=2/4/8）**：M=2..8 时
+  权重行只读一遍、同时累 MT 行 query。verify：n=2 22.1→16.1ms、n=4 25.8→18.5ms；
+  批量 decode B=2..8 与 2–8 token 短 prefill 同样受益。踩过的坑：动态 M 落 local
+  memory、MT 轮同步归约让 n=5 反而变慢、MT>M 时不能读 A 的越界行。
+- **诊断开关**：`SGL_SPEC_PROF=1`（每轮 draft/verify/补齐分解）、
+  `SGL_ATTN_DEBUG=1`（用的哪个 attention 核）、`SGL_SMALLM_CUBLAS=1`（M=2..8 退回 cublas A/B）。
+
 ## 下一轮从这里继续
 
-1. **G14**：tinyllama（target）+ llama-160m（draft）都在 `../models`，直接能复跑
-   接受率与 tok/s。注意本轮改了 attention 默认路径（>64 tok 走 flash），spec 的
-   verify/catchup 走同一条路径，所以 BENCH 里旧的 80.3 / 35.1 tok/s 是 short 核时代的
-   数，基准要重测。
-2. G15 / G13 是纯代码任务，随机模型就能验；G12 需要先下 llava-1.5 权重；
-   G18 要一段 40–60 分钟的干净时段（8K GPU prefill 现在 ~2s，但 CPU 侧仍要 40+ 分钟）。
+1. **G15**（前缀缓存升 radix）：纯代码 + 随机模型可验，`prefix_e2e.ps1` 要扩成四组。
+2. G13（Qwen3-Next full 层）、G12（需下 llava-1.5 权重）、G18（8K 绝对对照，要 40–60 分钟
+   干净时段；8K GPU prefill 现在 ~2s，CPU 侧仍要 40+ 分钟）。

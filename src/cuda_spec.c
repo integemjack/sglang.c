@@ -15,9 +15,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "sgl/alloc.h"
 #include "sgl/log.h"
+
+/* G14 诊断：SGL_SPEC_PROF=1 时累计各阶段耗时（draft 图步 / verify / 两侧补齐），
+ * 结束时打一行到 stderr —— 这是“该往哪个方向优化”的唯一可靠依据（WDDM 下
+ * 绝对值会飘，但同一进程内的占比是稳定的）。*/
+typedef struct {
+  double draft, verify, catch_t, catch_d, bonus_prefill;
+  int n_round;
+} spec_prof;
+static int spec_prof_on(void) {
+  static int on = -1;
+  if (on < 0) on = getenv("SGL_SPEC_PROF") ? 1 : 0;
+  return on;
+}
+static double now_sec(void) {
+  struct timespec ts;
+  timespec_get(&ts, TIME_UTC);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 static int argmax_v(const float *lg, int n) {
   int best = 0;
@@ -31,18 +50,21 @@ static int argmax_v(const float *lg, int n) {
  * decode_batch==forward 逐位等价已由 cuda_test [batch] 断言。
  * n>1（prompt prefill/异常长跳）仍走批量 forward_seg（本就只回末行）。 */
 static int kv_catch_up_gpu(sgl_cuda_model *m, int base, const int *seq,
-                           int want, int *kv_len, float *dl) {
+                           int want, int *kv_len, float *dl, double *acc) {
   int n = want - *kv_len;
   if (n <= 0) return 0;
+  double t0 = acc ? now_sec() : 0.0;
   if (n == 1) {
     int b = base, l = *kv_len;
     if (sgl_cuda_decode_batch(m, seq + *kv_len, &b, &l, 1, dl) != 0) return -1;
     *kv_len = want;
+    if (acc) *acc += now_sec() - t0;
     return 0;
   }
   if (sgl_cuda_forward_seg(m, seq + *kv_len, n, *kv_len, base, dl) != 0)
     return -1;
   *kv_len = want;
+  if (acc) *acc += now_sec() - t0;
   return 0;
 }
 
@@ -71,19 +93,40 @@ int sgl_cuda_spec_generate(sgl_cuda_model *target, int t_base,
   int *seq = (int *)sgl_xmalloc(sizeof(int) * (size_t)cap);
   float *dl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
   float *tl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
-  float *vl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V * (size_t)K);
+  float *vl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V * (size_t)(K + 1));
   if (!seq || !dl || !tl || !vl) goto done;
   memcpy(seq, prompt, sizeof(int) * (size_t)n_prompt);
   int len = n_prompt, t_kv = 0, d_kv = 0;
   int produced = 0, n_accepts = 0, n_drafted = 0;
+  spec_prof prof;
+  memset(&prof, 0, sizeof(prof));
+  double *acc_t = spec_prof_on() ? &prof.catch_t : NULL;
+  double *acc_d = spec_prof_on() ? &prof.catch_d : NULL;
 
-  if (kv_catch_up_gpu(target, t_base, seq, n_prompt, &t_kv, tl) != 0) goto done;
-  if (kv_catch_up_gpu(draft, d_base, seq, n_prompt, &d_kv, dl) != 0) goto done;
+  /* G14 流水线：**预填 np-1 行**，把 prompt 末 token 留作“挂起 token”（pending），
+   * 它由下一轮的 verify 第 0 行吞下去。这样每轮 verify 都是固定 n = K+1 行，
+   * 而 reject/bonus token 的 KV 不再需要单独跑一次 target 前向（旧结构每轮固定
+   * 一次 target 补齐 = 11.9ms，占总时长 30-46%）。实测分解见 BENCH G14 节。*/
+  int npf = n_prompt > 1 ? n_prompt - 1 : n_prompt; /* prefill 行数 */
+  if (npf > 0) {
+    if (kv_catch_up_gpu(target, t_base, seq, npf, &t_kv, tl, acc_t) != 0) goto done;
+    if (kv_catch_up_gpu(draft, d_base, seq, npf, &d_kv, dl, acc_d) != 0) goto done;
+  }
 
   while (produced < max_new) {
-    /* 1) draft 连出 K 候选（B=1 批量解码路径 = graph 快路径；token 写在
-     *    d_base+d_kv 行，attend [d_base, d_base+d_kv)）*/
+    prof.n_round++;
+    /* npend = 已输出但未进 target KV 的 token 数（≤1）。首轮为 0（np==1 时
+     * 预填了整个 prompt），之后恒为 1。*/
+    int npend = len - t_kv;
+    if (npend > 1) npend = 1; /* 防御：不应发生 */
+    /* 1) draft：先吞 pending（如有），再连出 K 候选（B=1 图快路径）*/
     int cand[8], nk = 0;
+    double td0 = spec_prof_on() ? now_sec() : 0.0;
+    if (npend == 1) {
+      int p = seq[len - 1];
+      if (sgl_cuda_decode_batch(draft, &p, &d_base, &d_kv, 1, dl) != 0) goto done;
+      d_kv++;
+    }
     for (int i = 0; i < K && produced + nk < max_new; i++) {
       int t = argmax_v(dl, V);
       cand[nk++] = t;
@@ -91,15 +134,29 @@ int sgl_cuda_spec_generate(sgl_cuda_model *target, int t_base,
       d_kv++;
     }
     n_drafted += nk;
+    if (spec_prof_on()) prof.draft += now_sec() - td0;
+    if (nk == 0) break;
 
-    /* 2) target 一次批量验证：vl[i] = 吃掉 cand[0..i] 后的分布。
-     *    i=0 用 tl（prompt 末位），i>0 用 vl 第 i-1 行（同 CPU v2）。 */
+    /* 2) target 一次前向验证固定 n = npend + nk 行：
+     *    row r 吃掉 tokens[r]（位于 pos0+r），输出的是 pos0+r+1 位置的分布。
+     *    所以“位于 len+i 的候选 cand[i]”要跟 vl[npend-1+i] 比（npend==0 时
+     *    i=0 用 tl = prefill 末位分布）。*/
+    int vt[9];
+    int vn = 0;
+    if (npend == 1) vt[vn++] = seq[len - 1];
+    for (int i = 0; i < nk; i++) vt[vn++] = cand[i];
+    int pos0 = len - npend;
+    if ((long)pos0 + vn > sgl_cuda_ctx(target) || (long)d_base + len + nk > sgl_cuda_ctx(draft))
+      break; /* 段用完就收工（与旧行为一致：不写非法 KV 行）*/
     int accepted = 0, reject_tok = -1;
-    if (sgl_cuda_forward_seg_rows(target, cand, nk, t_kv, t_base, vl) != 0) goto done;
-    t_kv += nk; /* 批量一次写入全部候选位 KV；作废时轮末回退计数 */
+    double tv0 = spec_prof_on() ? now_sec() : 0.0;
+    if (sgl_cuda_forward_seg_rows(target, vt, vn, pos0, t_base, vl) != 0) goto done;
+    if (spec_prof_on()) prof.verify += now_sec() - tv0;
+    t_kv = pos0 + vn;
     for (int i = 0; i < nk; i++) {
-      const float *p = (i == 0) ? tl : vl + (size_t)(i - 1) * V;
-      int g = argmax_v(p, V); /* 上一位置对 cand[i] 位置的预测 */
+      int ridx = npend - 1 + i; /* 候选 cand[i] 位置上的分布所在行 */
+      const float *p = ridx >= 0 ? vl + (size_t)ridx * V : tl;
+      int g = argmax_v(p, V);
       if (g == cand[i]) { accepted++; n_accepts++; }
       else { reject_tok = g; break; }
     }
@@ -111,19 +168,17 @@ int sgl_cuda_spec_generate(sgl_cuda_model *target, int t_base,
       seq[len + accepted] = reject_tok;
       n_new++;
     } else if (produced + nk < max_new) {
-      seq[len + nk] = argmax_v(vl + (size_t)(nk - 1) * V, V);
+      seq[len + nk] = argmax_v(vl + (size_t)(vn - 1) * V, V);
       n_new++;
     }
     len += n_new;
     produced += n_new;
 
-    /* 4) KV 有效长度回退（作废候选行靠下轮覆写，同 CPU 版）：
-     *    末 token（reject/bonus）未入 KV 则 valid=len-1，否则 len。 */
-    {
-      int valid = (n_new > accepted) ? len - 1 : len;
-      t_kv = valid;
-      d_kv = valid;
-    }
+    /* 4) 流水线推进：末 token（reject/bonus）成为下一轮的 pending。
+     *    target KV 里 [len-1, t_kv) 的候选行可能已作废，但下一轮 verify 从
+     *    pos0 = len-1 重新写起，必然覆写；draft 同理（它下轮先吞 pending）。*/
+    t_kv = len - 1;
+    d_kv = len - 1;
 
     /* 5) eos：截去其后的本轮 token（同 CPU 版）*/
     if (eos_id >= 0) {
@@ -133,15 +188,26 @@ int sgl_cuda_spec_generate(sgl_cuda_model *target, int t_base,
           produced -= (len - new_len);
           len = new_len;
           produced = max_new;
+          t_kv = len; /* 收工，不再需要 pending */
+          d_kv = len;
           break;
         }
       }
     }
-    /* 6) 两模型 KV 补齐到新 len（reject/bonus token 的 KV；dl/tl 同步末位分布）*/
-    if (produced < max_new) {
-      if (kv_catch_up_gpu(target, t_base, seq, len, &t_kv, tl) != 0) goto done;
-      if (kv_catch_up_gpu(draft, d_base, seq, len, &d_kv, dl) != 0) goto done;
-    }
+  }
+
+  if (spec_prof_on()) {
+    double tot = prof.draft + prof.verify + prof.catch_t + prof.catch_d;
+    fprintf(stderr,
+            "[spec-prof] K=%d rounds=%d drafted=%d accepted=%d (%.1f%%) | "
+            "draft %.1fms verify %.1fms catchT %.1fms catchD %.1fms | sum %.1fms "
+            "(draft %.0f%% verify %.0f%% catch %.0f%%)\n",
+            K, prof.n_round, n_drafted, n_accepts,
+            n_drafted ? 100.0 * n_accepts / n_drafted : 0.0, prof.draft * 1e3,
+            prof.verify * 1e3, prof.catch_t * 1e3, prof.catch_d * 1e3, tot * 1e3,
+            tot > 0 ? 100 * prof.draft / tot : 0.0,
+            tot > 0 ? 100 * prof.verify / tot : 0.0,
+            tot > 0 ? 100 * (prof.catch_t + prof.catch_d) / tot : 0.0);
   }
 
   *out_ids = (int *)sgl_xmalloc(sizeof(int) * (size_t)(len - n_prompt));

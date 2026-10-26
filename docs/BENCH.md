@@ -32,8 +32,57 @@ int8 IMMA vs dp4a：M=1 持平（选 dp4a）；**M≥2 已切 IMMA**，拐点与
 
 G7 净减速的根因：未蒸馏同源 draft 接受率上限 ~13–15%（每轮只产 ~1.6 tok），且 verify/catchup
 的 plain 路径在 WDDM 桌面 GPU 下不能图化。正收益需接受率 ≥50%（同源蒸馏 draft）或 verify 固定 n 图化 + 批量 spec。详见 NOTES_t7.md G7 补记。
+**G14 后更新**：结构成本已改掉（流水线去掉每轮 target 图步 + small-M GEMV），
+K=1 0.44x→0.73x、K=2 0.35x→0.64x、K=4 0.27x→0.40x；按实测回本需 K=1 a>88% /
+K=2 a>69.5%，而实测只有 39.1% / 28.6% —— **仍未转正**，根因就是 draft 太弱（见下）。
 
-## G16：W8 IMMA 后的 prefill 重测 + flash 泛化（2026-10-27）
+## G14：投机解码流水线化 + small-M GEMV（2026-10-27）
+
+工具：`cuda_perf --spec <draft> --spec-k K`，`SGL_SPEC_PROF=1` 打各阶段耗时。
+
+### 成本分解（tinyllama fp16 + llama-160m，ctx=1024，K=4，**改前**）
+
+| 阶段 | ms/轮 | 占比 |
+|---|---|---|
+| draft 4 个图步 | 13.4 | 24% |
+| verify（n=4，plain） | 25.8 | 46% |
+| target 补齐 1 次（图步） | 12.8 | 23% |
+| draft 补齐 1 次 | 3.9 | 7% |
+
+### 两处改动
+
+1. **small-M GEMV（`k_gemm_nt_mrow` / `k_gemm_nt_h_mrow`）**：M=2..8 时每输出行
+   一个 block，权重行只读一遍，同时累 MT 个 query 行（MT 用模板实例化成 2/4/8）。
+   踩到的两个坑：① 动态 M 的累加器落 local memory → M=2 比 M=1 还慢（22.1 vs 14.6ms）；
+   ② 旧的 MT 轮同步归约让 n=5..8 比 n=4 慢（33ms vs 18.5ms），改 warp shuffle +
+   单次同步后回到 27.7ms；③ MT=8 时不能读 A 的 i≥M 行（A 只分配 M 行）。
+   verify 实测：n=1 14.6ms、n=2 16.1ms、n=3 17.2ms、n=4 18.5ms、n=5 27.7ms
+   （改前分别是 14.6 / 22.1 / 24.0 / 25.8 / 33ms）。
+2. **流水线（去掉每轮一次 target 图步）**：预填 `np-1` 行，prompt 末 token 当“挂起
+   token”由下一轮 verify 第 0 行吞掉，于是每轮 verify 固定 n=K+1，reject/bonus
+   的 KV 顺带被写掉。
+
+### 结果（prompt 16 tok、new 32、best-of-3；plain = 82.4–82.8 tok/s）
+
+| K | 接受率 | 改前 | 改后 | 每轮成本 |
+|---|---|---|---|---|
+| 1 | 39.1% | 0.44x（35.1 tok/s） | **0.73x（60.5 tok/s）** | 2×3.35 + 14.7 = 21.4 ms |
+| 2 | 28.6% | 0.35x（28.6 tok/s） | **0.64x（53.1 tok/s）** | 3×3.35 + 17.2 = 27.2 ms |
+| 4 | 14.8% | 0.27x（22.0 tok/s） | **0.40x（33.3 tok/s）** | 5×3.35 + 27.7 = 44.5 ms |
+
+**结论：仍净减速（未达到 G14 的 ≥1.0x 门槛）。** 回本条件是
+`(1 + K·a)·t > (K+1)·d + v`，代入 t=11.4ms、d=3.35ms：K=1 需 a>88%、K=2 需 a>69.5%、
+K=4 需 a>72%，而实测 a 只有 39.1% / 28.6% / 14.8%。根因是 160M draft 的图步也有
+3.35ms 固定开销（数学只占 ~1.9ms），d/t 仅 0.29，必须靠 70–90% 的接受率才回本 ——
+那需要同源蒸馏 draft。详见 docs/NOTES_t7.md 的 G14 补记。
+
+正确性（`cuda_test ..\models\qwen05` → `test_cuda: all OK`）：
+`[spec] qwen05 draft==target 接受率 100% (20/20)、24 tok == 非 spec greedy ✓`；
+`[spec] tinyllama+llama-160m 接受率 13.3% (8/60)、24 tok == 非 spec greedy ✓`
+（接受率与改前完全一致，说明流水线没有改变输出语义）；`[batch]`（B=4 现在走
+small-M GEMV）batched == single-stream OK；`[long]`/`[w8]`/`[fp16]`/`[gpt2]` 无回归。
+
+
 
 工具：`tests/bench_prefill.ps1`（qwen05，ctx=16384，rounds=2 取优，GPU 空载）。
 
