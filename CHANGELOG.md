@@ -2,7 +2,7 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — 2026-10-27 「缺口关闭 G1–G10」
+## [v0.3.0] — 2026-10-27 「缺口关闭 G1–G10」
 
 本批处理 TODO_PROMPTS.md v0.2 列出的缺口。测量口径与全部数字见
 [docs/NOTES_gaps.md](docs/NOTES_gaps.md)（重要：本机空闲显存常小于模型常驻量，
