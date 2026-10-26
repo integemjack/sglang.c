@@ -18,6 +18,14 @@ typedef struct {
   sgl_tensor q_norm, k_norm;                  /* [D] Qwen2 的 QK-Norm；无则 null */
   sgl_tensor post_norm;                      /* [E] */
   sgl_tensor gate_w, up_w, down_w;           /* [I,E] [I,E] [E,I] */
+  /* G9 qwen3-next linear_attention（gated deltanet）：kind==linear 层填充，其余层为空 */
+  sgl_tensor lin_qkvz_w;                     /* [2*key_dim+2*value_dim, E]（按 k-head 组交错布局）*/
+  sgl_tensor lin_ba_w;                       /* [2*nvh, E]（按 k-head 组交错 b/a）*/
+  sgl_tensor lin_conv_w;                     /* [conv_dim, K] 因果 depthwise 卷积（无 bias）*/
+  sgl_tensor lin_norm_w;                     /* [vd] gated RMSNorm 权重 */
+  sgl_tensor lin_out_w;                      /* [E, value_dim] */
+  float *lin_a_log, *lin_dt_bias;            /* [nvh]（堆拷贝，sgl_xfree）*/
+  int lin_idx;                               /* 递归状态池的层内序号；非 linear = -1 */
   /* int8 权量化（SGL_W8=1）：与上面 f32 权重并存，前向二选一 */
   int8_t *q8, *k8, *v8, *o8, *g8, *u8, *d8;  /* 同布局 [N,K] */
   float *sq8, *sk8, *sv8, *so8, *sg8, *su8, *sd8; /* per-channel scale 数组 [N]，量化时分配 */
@@ -28,6 +36,13 @@ typedef struct {
   int head_dim, kv_dim, q_dim; /* q_dim = n_head*head_dim (q rows & attn rows; == n_embd unless explicit head_dim, e.g. qwen3) */
   int sliding_window;        /* t9 mistral: >0 = banded causal mask (attend max p in [pos-win+1, pos]) */
   float gemma_scale;         /* t9 gemma: >0 = multiply embeddings by sqrt(E) (hidden normalizer) */
+  /* ---- G9 gemma: embedding tanh 软上限（hidden_softcap；0=off）。先 emb=cap*tanh(emb/cap)，再乘 sqrt(E) ---- */
+  float emb_softcap;
+  /* ---- G9 rope_scaling / layer_types（每层 rope 基频、窗口、类型）---- */
+  int *layer_kind;           /* [n_layer] 0=full 1=sliding 2=linear；NULL=无 layer_types（全按旧行为）*/
+  double *layer_invf;        /* [n_layer][head_dim/2] 每层预计算 rope 逆频率（含 scaling/局部基频）*/
+  int *layer_window;         /* [n_layer] 每层 sliding 窗口（0=无）*/
+  double rope_pos_scale;     /* rope_type=linear: 1/factor；否则 1.0（角度 = pos*scale*invf）*/
   float rms_eps;
   double rope_theta;
   int tie_embeddings;
@@ -50,6 +65,17 @@ typedef struct {
   float *kcs, *vcs;   /* kv8=1 时每层每页的量化 scale */
   int n_pool, n_free;
   int *free_pages, *page_refs;
+  /* ---- G9 linear attention（gated deltanet）状态池：按序列首 KV 页 slot_idx[0] 归属 ---- */
+  int lin_nk, lin_nh, lin_kd, lin_vd, lin_conv, lin_ratio; /* config linear_* 维度；nk=0=无 linear 层 */
+  int n_lin, n_lin_slots;
+  float *lin_state;          /* [n_lin][slot][nh*kd*vd] 每 v-head 递归状态 S[kd][vd] */
+  float *lin_hist;           /* [n_lin][slot][conv_dim*(K-1)] conv 输入历史（旧→新）*/
+  int *lin_owner;            /* [slot] 归属首页第号（-1=空闲）*/
+  int *lin_pos;              /* [slot] 下一个期望位置 */
+  int *lin_free;             /* 空闲槽栈 */
+  int lin_nfree;
+  float *ls_qkvz, *ls_ba, *ls_conv, *ls_o; /* 单 token scratch（递归本身串行）*/
+  float *ls_qn, *ls_kn;                    /* l2norm 后的 q/k（各 [key_dim]）*/
 } sgl_llama;
 
 sgl_llama *sgl_llama_load(const char *model_dir);

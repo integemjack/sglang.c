@@ -1,4 +1,4 @@
-/* test_lora_multi.c - 多 LoRA 运行时热切换（方案 B：多实例池）验证
+﻿/* test_lora_multi.c - 多 LoRA 运行时热切换（方案 B：多实例池）验证
  * invariant: 同一调度器内多个 LoRA 实例（base+N 份合并副本）按请求名路由，
  * 各实例的 greedy 输出必须与「单独加载该 adapter 的 numpy 参考」全等；
  * 并发混跑（不同实例请求交错进同一连续批处理）结果与串行一致。

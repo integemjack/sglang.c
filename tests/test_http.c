@@ -1,4 +1,4 @@
-/* test_http.c — HTTP 服务端到端测试（进程内起服务 + winsock 客户端）
+﻿/* test_http.c — HTTP 服务端到端测试（进程内起服务 + winsock 客户端）
  * 验证：
  *   1. GET /health
  *   2. POST /generate（greedy，与已验证的参考续写精确比对）

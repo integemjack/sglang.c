@@ -38,6 +38,8 @@ typedef struct {
   int n_streamed; /* 已被流式取走的生成 token 数（≤ n_gen）*/
   int streaming;  /* 流式请求：poll 不回收（由 stream 结束时 reclaim）*/
   int inst;       /* 路由到的实例下标（0=base，≥1=lora）*/
+  float *feats;   /* G8: 视觉 token embedding [n_img][E_lm]（sgl_xmalloc，prefill 后释放）*/
+  int n_img;      /* G8: 视觉 token 数（0 = 纯文本）*/
 } sgl_req;
 
 struct sgl_scheduler {
@@ -102,6 +104,7 @@ void sgl_sched_free(sgl_scheduler *s) {
     sgl_xfree(s->reqs[i].prompt);
     sgl_xfree(s->reqs[i].gen);
     sgl_xfree(s->reqs[i].pages);
+    sgl_xfree(s->reqs[i].feats); /* G8: 未走到 prefill 就结束的请求在这回收 */
   }
   sgl_xfree(s->reqs);
   sgl_xfree(s->b_tokens); sgl_xfree(s->b_pages);
@@ -180,12 +183,13 @@ static int req_sample_append(sgl_scheduler *s, sgl_req *r, const float *logits) 
 static int step_prefill(sgl_scheduler *s, sgl_req *r) {
   sgl_inst *in = &s->insts[r->inst];
   sgl_model *m = in->model;
-  int need_total = r->n_prompt + r->max_new + 1;
+  int need_total = r->n_prompt + r->n_img + r->max_new + 1;
   r->cap_pages = need_total;
   r->pages = (int *)sgl_xmalloc(sizeof(int) * (size_t)need_total);
 
-  /* 1) 前缀匹配：命中的页借用（引用 +1，防驱逐）*/
-  int matched = sgl_radix_match(in->radix, r->prompt, r->n_prompt, r->pages);
+  /* 1) 前缀匹配：命中的页借用（引用 +1，防驱逐）
+   * G8: 带视觉 token 的请求不走 RadixCache（前缀语义不同：KV 里混了图片 emb）*/
+  int matched = r->n_img > 0 ? 0 : sgl_radix_match(in->radix, r->prompt, r->n_prompt, r->pages);
   r->hit_len = matched;
   for (int i = 0; i < matched; i++) sgl_model_page_ref(m, r->pages[i], +1);
   s->stats.cache_hit_tokens += matched;
@@ -209,6 +213,16 @@ static int step_prefill(sgl_scheduler *s, sgl_req *r) {
   if (sgl_model_prefill(m, r->prompt + from, n_suf, from, r->pages, lg) != 0) return -1;
   s->stats.prefill_tokens += n_suf;
   r->kv_len = r->n_prompt;
+  /* G8: 视觉 token 接在 prompt 后面进同一页表，首 token 的 logits 取最后一个视觉 token */
+  if (r->n_img > 0) {
+    if (sgl_model_prefill_emb(m, r->feats, r->n_img, r->n_prompt, r->pages, lg) != 0)
+      return -1;
+    s->stats.prefill_tokens += r->n_img;
+    r->kv_len += r->n_img;
+    sgl_xfree(r->feats);
+    r->feats = NULL;
+    r->n_img = 0;
+  }
   r->state = SGL_REQ_RUNNING;
   if (req_sample_append(s, r, lg)) req_finish(s, r);
   return 0;
@@ -416,6 +430,27 @@ static int submit_impl(sgl_scheduler *s, const char *text, int max_new,
 int sgl_sched_submit_lora(sgl_scheduler *s, const char *text, int max_new,
                           const sgl_sampling_params *sp, const char *lora) {
   return submit_impl(s, text, max_new, sp, lora, 0);
+}
+
+/* G8: 带视觉特征的提交。feats [n_img][E_lm] 的所有权转给调度器（sgl_xmalloc 分配，
+ * prefill 用完 sgl_xfree）。失败（模型不支 emb / 页不够）返回 -1 并接管释放 feats。 */
+int sgl_sched_submit_img(sgl_scheduler *s, const char *text, int max_new,
+                         const sgl_sampling_params *sp, float *feats, int n_img) {
+  if (!s || !feats || n_img <= 0) { sgl_xfree(feats); return -1; }
+  int inst = 0;
+  sgl_req *r = req_new(s, text, max_new, sp, inst);
+  if (!r) { sgl_xfree(feats); return -1; }
+  r->feats = feats;
+  r->n_img = n_img;
+  int need = r->n_prompt + n_img + r->max_new + 1;
+  if (need > sgl_model_pool_pages(s->insts[inst].model)) {
+    SGL_ERROR("submit_img: need %d pages > pool %d", need,
+              sgl_model_pool_pages(s->insts[inst].model));
+    r->state = SGL_REQ_DONE;
+    r->n_gen = -1;
+    return -1;
+  }
+  return r->id;
 }
 
 int sgl_sched_submit_stream_lora(sgl_scheduler *s, const char *text, int max_new,

@@ -115,6 +115,14 @@ int sgl_model_prefill(sgl_model *m, const int *tokens, int n, int pos0,
     : sgl_llama_forward((sgl_llama *)m->impl, tokens, n, pos0, idx, logits_out);
 }
 
+int sgl_model_prefill_emb(sgl_model *m, const float *emb, int n, int pos0,
+                          const int *idx, float *logits_out) {
+  if (m->kind == 1)
+    return sgl_llama_forward_emb((sgl_llama *)m->impl, emb, n, pos0, idx, logits_out);
+  SGL_ERROR("model: emb prefill（多模态）仅 llama 后端支持（kind=%d）", m->kind);
+  return -1;
+}
+
 int sgl_model_decode_batch(sgl_model *m, const int *tokens, int *const *idx,
                            const int *seq_lens, int B, float *logits_out) {
   return m->kind == 0

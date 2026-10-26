@@ -29,6 +29,10 @@
  * beyond that the two-pass chunked kernel removes the shared-memory cap. */
 #define SGL_ATTN_SHORT_MAX 4096
 #define SGL_ATTN_CHUNK 1024
+#define SGL_PROF_MAXL 64 /* G1: per-layer attention event pairs (max L) */
+/* G3: gexec[B] sentinel meaning "capturing a graph for this B failed". The
+ * batch size then runs the plain path; invalidate_graphs() clears it. */
+#define SGL_NO_GRAPH ((void *)~(size_t)0)
 
 /* t8 W8A8 per-channel int8 weights: w[N,K] int8 + scale[N]. */
 typedef struct { int8_t *w; float *scale; } sgl_w8w;
@@ -91,6 +95,20 @@ struct sgl_cuda_model {
   /* CUDA Graph cache, one captured decode step per batch size (M26b) */
   void *graphs[33];         /* cudaGraph_t per B (index = B) */
   void *gexec[33];          /* cudaGraphExec_t per B */
+
+  /* G1 profiling: SGL_CUDA_PROF=1 brackets each layer's attention launch with
+   * a CUDA event pair on the forward stream; summed at the end of the forward
+   * this is the attention share of prefill time (no intermediate syncs, so the
+   * measurement does not serialise the pipeline). */
+  int prof;
+  cudaEvent_t pf0[SGL_PROF_MAXL], pf1[SGL_PROF_MAXL];
+
+  /* G2: int8 activations + int32 accumulators for the IMMA big-M path.
+   * Sized with the workspace (ws_cap rows x max(E,I) cols): every W8
+   * projection has K <= max(E,I) and N <= max(E,I). */
+  int8_t *w8_a8;   /* [ws_cap][max(E,I)] */
+  int32_t *w8_c32; /* [ws_cap][max(E,I)] */
+  float *w8_as;    /* [ws_cap] per-row activation scales */
 };
 
 __global__ void k_embed(const float *wte, const int *tok, float *x, int n, int E) {
@@ -491,6 +509,157 @@ __global__ void k_attn_long_batch(const float *q, const float *kc, const float *
   for (int d = threadIdx.x; d < D; d += blockDim.x) o[d] *= invsum;
 }
 
+/* ------------------------------------------------------------------------
+ * G1: single-pass tiled flash attention for long-context prefill.
+ *
+ * The two-pass k_attn_long above costs 66.2s for an 8192-token qwen05 prefill.
+ * Measured cause (SGL_CUDA_PROF=1 per-stage events, docs/NOTES_g1.md): the
+ * kernel is global-memory bound, not FLOP bound -- one block per (token, head)
+ * with a thread-per-position dot loop reads K[p][0..D) one float at a time,
+ * so consecutive lanes touch addresses HK*D floats apart: every 32-lane load
+ * moves 128 B of useful data spread over 32 sectors => ~1/8 sector efficiency,
+ * and the whole KV range is re-read for every one of the n tokens (twice,
+ * because pass 2 recomputes the scores).
+ *
+ * This kernel keeps the same math but reorganises it:
+ *   block  = (tile of TQ query tokens, head), 8 warps, 256 threads
+ *   warp w = QPW consecutive queries, lane j = KV position c0+j (TK per tile)
+ *   K/V tiles are cooperatively staged into shared memory (coalesced along d,
+ *   read ONCE per TQ-token block instead of once per token), the dot loop
+ *   reads Qs broadcast + Ks with pitch D+1 (bank-conflict-free), the online
+ *   softmax (running max/sum) is a warp reduction, and each lane's weight is
+ *   __shfl-broadcast into the per-lane output accumulator (ND = D/32 dims).
+ * K is dot-producted exactly once: no second pass.
+ * ------------------------------------------------------------------------ */
+template <int D, int QPW, int TK>
+__global__ __launch_bounds__(256) void k_attn_flash(
+    const float *q, const float *kc, const float *vc, float *out,
+    int pos0, int kv_base, int n, int H, int HK, float scale, int win) {
+  const int TQ = 8 * QPW;
+  const int ND = D / 32;
+  __shared__ float Qs[TQ][D + 1];
+  __shared__ float Ks[TK][D + 1];
+  __shared__ float Vs[TK][D + 1];
+
+  int th = blockIdx.x;
+  int tile = th / H, h = th % H;
+  int tq0 = tile * TQ;
+  int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int hkv = h / (H / HK);
+
+  for (int idx = threadIdx.x; idx < TQ * D; idx += 256) {
+    int t = idx / D, d = idx - t * D;
+    int tq = tq0 + t;
+    Qs[t][d] = (tq < n) ? q[((long) tq * H + h) * D + d] : 0.0f;
+  }
+  __syncthreads();
+
+  int tlast = (tq0 + TQ <= n) ? (tq0 + TQ - 1) : (n - 1);
+  int upto = pos0 + tlast + 1;
+  int from = 0;
+  if (win > 0) { int lo = pos0 + tq0 + 1 - win; from = lo > 0 ? lo : 0; }
+
+  float mrun[QPW], lrun[QPW], acc[QPW][ND];
+#pragma unroll
+  for (int i = 0; i < QPW; i++) {
+    mrun[i] = -1e30f;
+    lrun[i] = 0.0f;
+#pragma unroll
+    for (int nd = 0; nd < ND; nd++) acc[i][nd] = 0.0f;
+  }
+
+  for (int c0 = from; c0 < upto; c0 += TK) {
+    int ce = c0 + TK;
+    if (ce > upto) ce = upto;
+    for (int idx = threadIdx.x; idx < TK * D; idx += 256) {
+      int p = idx / D, d = idx - p * D;
+      int gp = c0 + p;
+      if (gp < ce) {
+        long o = ((long) (kv_base + gp) * HK + hkv) * D + d;
+        Ks[p][d] = kc[o];
+        Vs[p][d] = vc[o];
+      } else {
+        Ks[p][d] = 0.0f;
+        Vs[p][d] = 0.0f;
+      }
+    }
+    __syncthreads();
+
+    int gp = c0 + lane;
+    float e[QPW];
+#pragma unroll
+    for (int i = 0; i < QPW; i++) {
+      int qi = w * QPW + i;
+      int tq = tq0 + qi;
+      float s = 0.0f;
+#pragma unroll
+      for (int d = 0; d < D; d++) s += Qs[qi][d] * Ks[lane][d];
+      s *= scale;
+      int hi = pos0 + tq;
+      int lo = (win > 0) ? (pos0 + tq + 1 - win) : 0;
+      if (lo < 0) lo = 0;
+      if (gp > hi || gp < lo || gp >= ce) s = -1e30f;
+      float mt = s;
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, off));
+      float mn = fmaxf(mrun[i], mt);
+      float alpha = (mrun[i] <= -1e29f) ? 0.0f : __expf(mrun[i] - mn);
+      e[i] = (s <= -1e29f) ? 0.0f : __expf(s - mn);
+      float esum = e[i];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) esum += __shfl_xor_sync(0xffffffffu, esum, off);
+      lrun[i] = lrun[i] * alpha + esum;
+#pragma unroll
+      for (int nd = 0; nd < ND; nd++) acc[i][nd] *= alpha;
+      mrun[i] = mn;
+    }
+#pragma unroll
+    for (int pp = 0; pp < TK; pp++) {
+#pragma unroll
+      for (int i = 0; i < QPW; i++) {
+        float wp = __shfl_sync(0xffffffffu, e[i], pp);
+#pragma unroll
+        for (int nd = 0; nd < ND; nd++) acc[i][nd] += wp * Vs[pp][lane + 32 * nd];
+      }
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int i = 0; i < QPW; i++) {
+    int qi = w * QPW + i, tq = tq0 + qi;
+    if (tq >= n) continue;
+    float inv = 1.0f / lrun[i];
+    float *o = out + ((long) tq * H + h) * D;
+#pragma unroll
+    for (int nd = 0; nd < ND; nd++) o[lane + 32 * nd] = acc[i][nd] * inv;
+  }
+}
+
+/* flash launch: TQ/TK chosen per head_dim so shared memory stays under the
+ * 64 KB/SM budget (2 blocks/SM). Returns 0 on success, -1 if D is unsupported
+ * (caller then falls back to the two-pass kernel). */
+static int launch_flash(sgl_cuda_model *g, int l, int n, int pos0, int kv_base,
+                        float scale) {
+  int H = g->H, HK = g->HK, D = g->D, KD = g->KD;
+  const float *kc = g->kc + (long) l * g->ctx * KD;
+  const float *vc = g->vc + (long) l * g->ctx * KD;
+  int win = g->sliding_window;
+  cudaStream_t s = g->stream;
+  if (D == 64) {
+    const int TQ = 8 * 4;
+    k_attn_flash<64, 4, 32><<<(n + TQ - 1) / TQ * H, 256, 0, s>>>(
+        g->q, kc, vc, g->attn, pos0, kv_base, n, H, HK, scale, win);
+  } else if (D == 128) {
+    const int TQ = 8 * 2;
+    k_attn_flash<128, 2, 16><<<(n + TQ - 1) / TQ * H, 256, 0, s>>>(
+        g->q, kc, vc, g->attn, pos0, kv_base, n, H, HK, scale, win);
+  } else {
+    return -1;
+  }
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
 __global__ void k_silu_mul(float *gate, const float *up, long n) {
   long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -573,6 +742,71 @@ __global__ void k_gemm_w8a8(const float *A, const int8_t *W, const float *ws,
   }
   if (threadIdx.x == 0)
     C[(long)m * N + n] = (float)iacc[0] * as * ws[n] + (bias ? bias[n] : 0.f);
+}
+
+/* G2: big-M int8 path. The dp4a kernel above is a per-(m,n) GEMV that
+ * re-derives the activation row absmax once per output channel (N times per
+ * row!) and reads int8 weights from global per (m,n) pair -- fine at M=1
+ * (decode), hopeless at M>1. sgl_cuda_gemm_bench measured, tinyllama
+ * [2048,2048] M=8: dp4a 0.9250 ms vs int8 IMMA 0.0692 ms (13.4x). So for
+ * prefill we quantize the activations ONCE into int8 and run the tensor-core
+ * IMMA GEMM (int8 x int8 -> int32, exact integer accumulation), then apply
+ * the per-row x per-channel scales in a dequant epilogue.
+ * Integer dot products are order-independent (no overflow: K<=4864, |sum| <=
+ * K*127*127 < 2^31), so the IMMA result is bit-identical to the dp4a result --
+ * switching paths cannot change W8 numerics, which cuda_test [w8] checks. */
+__global__ void k_quant_rows(const float *A, int8_t *A8, float *as, int M, int K) {
+  int m = blockIdx.x;
+  if (m >= M) return;
+  const float *a = A + (long) m * K;
+  int8_t *o = A8 + (long) m * K;
+  float amax = 0.f;
+  for (int i = threadIdx.x; i < K; i += blockDim.x) {
+    float v = fabsf(a[i]);
+    if (v > amax) amax = v;
+  }
+  __shared__ float red[256];
+  red[threadIdx.x] = amax;
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (threadIdx.x < s && red[threadIdx.x + s] > red[threadIdx.x]) red[threadIdx.x] = red[threadIdx.x + s];
+    __syncthreads();
+  }
+  float am0 = red[0];
+  float inv = am0 > 1e-8f ? 127.0f / am0 : 0.f;
+  if (threadIdx.x == 0) as[m] = am0 / 127.0f;
+  for (int i = threadIdx.x; i < K; i += blockDim.x) {
+    float q = __float2int_rn(a[i] * inv);
+    q = q > 127.f ? 127.f : (q < -127.f ? -127.f : q);
+    o[i] = (int8_t) q;
+  }
+}
+
+__global__ void k_w8_dequant(const int32_t *C32, const float *as, const float *ws,
+                             const float *bias, float *C, int M, int N) {
+  long i = blockIdx.x * (long) blockDim.x + threadIdx.x;
+  if (i >= (long) M * N) return;
+  int n = (int) (i % N);
+  C[i] = (float) C32[i] * as[i / N] * ws[n] + (bias ? bias[n] : 0.f);
+}
+
+/* returns 0 when the IMMA path ran, -1 when the caller must use dp4a */
+static int gemm_nt_w8_imma(sgl_cuda_model *g, const float *A, const sgl_w8w *W8,
+                           const float *bias, float *C, int M, int N, int K) {
+  /* G2 A/B knob: SGL_W8_DP4A=1 keeps the old per-(m,n) dp4a path for every M
+   * (read per call so cuda_test can compare both paths in one process). */
+  { const char *ab = getenv("SGL_W8_DP4A"); if (ab && atoi(ab)) return -1; }
+  if (M < 2 || (K % 4) || (N % 4) || !g->w8_a8 || !g->w8_c32) return -1;
+  const int32_t ai = 1, bi = 0;
+  k_quant_rows<<<M, 256, 0, g->stream>>>(A, g->w8_a8, g->w8_as, M, K);
+  cublasStatus_t st = cublasGemmEx(g->blas, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &ai,
+                                   W8->w, CUDA_R_8I, K, g->w8_a8, CUDA_R_8I, K, &bi,
+                                   g->w8_c32, CUDA_R_32I, N, CUBLAS_COMPUTE_32I,
+                                   CUBLAS_GEMM_DEFAULT);
+  if (st != CUBLAS_STATUS_SUCCESS) return -1;
+  k_w8_dequant<<<(int) (((long) M * N + 255) / 256), 256, 0, g->stream>>>(
+      g->w8_c32, g->w8_as, W8->scale, bias, C, M, N);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
 static void gemm_nt_cublas(cublasHandle_t h, cudaStream_t stream,
@@ -680,7 +914,10 @@ static __half *dev_copy_h(const float *src, size_t n) {
 static void invalidate_graphs(sgl_cuda_model *g) {
   for (int b = 0; b <= 32; b++) {
     if (g->graphs[b]) { cudaGraphDestroy((cudaGraph_t)g->graphs[b]); g->graphs[b] = NULL; }
-    if (g->gexec[b]) { cudaGraphExecDestroy((cudaGraphExec_t)g->gexec[b]); g->gexec[b] = NULL; }
+    if (g->gexec[b] && g->gexec[b] != SGL_NO_GRAPH) {
+      cudaGraphExecDestroy((cudaGraphExec_t)g->gexec[b]);
+    }
+    g->gexec[b] = NULL; /* also clears the per-B "cannot capture" marker */
   }
 }
 
@@ -721,6 +958,23 @@ static int sgl_cuda_reserve(sgl_cuda_model *g, int n) {
     }
     cudaFree(g->ha);
     g->ha = hn;
+  }
+  if (g->use_w8) {
+    /* G2: IMMA scratch. invalidate_graphs() already ran at the top of this
+     * function, so growing these buffers is graph-safe (rule 4). */
+    int EI = g->E > g->I ? g->E : g->I;
+    int8_t *a8 = NULL;
+    int32_t *c32 = NULL;
+    float *as = NULL;
+    if (cudaMalloc(&a8, (size_t)n * EI) != cudaSuccess ||
+        cudaMalloc(&c32, (size_t)n * EI * sizeof(int32_t)) != cudaSuccess ||
+        cudaMalloc(&as, (size_t)n * sizeof(float)) != cudaSuccess) {
+      cudaFree(a8); cudaFree(c32); cudaFree(as);
+      fprintf(stderr, "sgl_cuda_reserve(%d): out of VRAM (w8 imma scratch)\n", n);
+      return -1;
+    }
+    cudaFree(g->w8_a8); cudaFree(g->w8_c32); cudaFree(g->w8_as);
+    g->w8_a8 = a8; g->w8_c32 = c32; g->w8_as = as;
   }
   g->ws_cap = n;
   return 0;
@@ -868,12 +1122,16 @@ static void w8_free_layers(sgl_w8w *arr, int L) {
   free(arr);
 }
 
-/* t8 projection dispatch: W8A8 dp4a for every M when int8 weights exist
- * (prefill included — accuracy verified against fp32 greedy; fp32 originals
- * are NOT uploaded in W8 mode, that's where the VRAM saving comes from). */
+/* t8 projection dispatch: W8A8 for every M when int8 weights exist
+ * (prefill included -- accuracy verified against fp32 greedy; fp32 originals
+ * are NOT uploaded in W8 mode, that's where the VRAM saving comes from).
+ * G2: M>1 goes to the int8 tensor-core (IMMA) path; M==1 and the shapes IMMA
+ * cannot take stay on the hand dp4a GEMV, which is the faster of the two at
+ * batch 1 (weight bandwidth bound, one row of activations). */
 #define PROJ(g, A, Wf, Wh, W8, bias, C, M, N, K)                                   \
   do {                                                                             \
     if ((g)->use_w8 && (W8)) {                                                     \
+      if (gemm_nt_w8_imma(g, A, W8, bias, C, M, N, K) == 0) break;                 \
       k_gemm_w8a8<<<dim3(N, M), 256, 0, (g)->stream>>>(                            \
           A, (W8)->w, (W8)->scale, bias, C, M, N, K);                              \
       CK(cudaGetLastError());                                                      \
@@ -1219,6 +1477,7 @@ void sgl_cuda_free(sgl_cuda_model *g) {
   w8_free_layers(g->qw8, g->L); w8_free_layers(g->kw8, g->L); w8_free_layers(g->vw8, g->L);
   w8_free_layers(g->ow8, g->L); w8_free_layers(g->gw8, g->L); w8_free_layers(g->uw8, g->L);
   w8_free_layers(g->dw8, g->L);
+  cudaFree(g->w8_a8); cudaFree(g->w8_c32); cudaFree(g->w8_as); /* G2 IMMA scratch */
   for (int l = 0; l < g->L; l++) {
     if (g->ln1 && g->ln1[l]) cudaFree(g->ln1[l]);
     if (g->qw && g->qw[l]) cudaFree(g->qw[l]);
@@ -1255,6 +1514,83 @@ long sgl_cuda_free_mem_mb(void) {
 }
 
 int sgl_cuda_ctx(const sgl_cuda_model *m) { return m->ctx; }
+
+/* G6: 把 [src_base, src_base+len) 这 len 行的 KV（所有层、k 和 v）拷到
+ * [dst_base, dst_base+len)。服务端前缀缓存用：命中的前缀不必重算 prefill，
+ * 直接把已租让段里的 KV 行搬过来。RoPE 把位置编进了 K，所以只有当两边
+ * 都是从位置 0 开始的前缀时才能复用（服务端正是：每条序列在自己的段内
+ * pos0 从 0 起）。src==dst 时 no-op。返回 0 成功。 */
+int sgl_cuda_copy_kv(sgl_cuda_model *g, int src_base, int dst_base, int len) {
+  if (!g || len <= 0) return 0;
+  if (src_base == dst_base) return 0;
+  if (src_base < 0 || dst_base < 0 || src_base + len > g->ctx || dst_base + len > g->ctx)
+    return -1;
+  size_t bytes = (size_t) len * g->KD * sizeof(float); /* 同层内行连续：一次 1-D 拷贝 */
+  for (int l = 0; l < g->L; l++) {
+    size_t off = (size_t) l * g->ctx * g->KD;
+    if (cudaMemcpyAsync(g->kc + off + (size_t) dst_base * g->KD,
+                        g->kc + off + (size_t) src_base * g->KD,
+                        bytes, cudaMemcpyDeviceToDevice, g->stream) != cudaSuccess)
+      return -1;
+    if (cudaMemcpyAsync(g->vc + off + (size_t) dst_base * g->KD,
+                        g->vc + off + (size_t) src_base * g->KD,
+                        bytes, cudaMemcpyDeviceToDevice, g->stream) != cudaSuccess)
+      return -1;
+  }
+  return cudaStreamSynchronize(g->stream) == cudaSuccess ? 0 : -1;
+}
+
+/* ---- G5: 上传前的显存预检 ----
+ * 口径与 sgl_cuda_from_llama 的分配一致（同一个环境变量开关决定权重位宽）：
+ *   权重   embed V*E + (不 tied 时 lm_head V*E)
+ *          + L*(q E*E + o E*E + k KD*E + v KD*E + gate/up/down 3*I*E)
+ *   KV     2 * L * ctx * KD * 4
+ *   工作区 rows 行：x/h/attn(E) + q(E) + k/v(KD) + gate/up(I)
+ *          + fp16 镜像 rows*max(E,I)*2 + int8 暂存 rows*max(E,I)*(1+4+4)
+ *   logits 设备镜像 V*4 * conc
+ *   cublas workspace 32MB
+ *   CUDA 上下文 + 内核模块：本机实测（RTX 2060 / CUDA 13.3）第一次 cudaMalloc
+ *          之后 free 掉约 300MB，取 320MB。
+ * 估算不是精确值，所以调用方还要留余量（cuda_http 用 192MB）。 */
+long sgl_cuda_estimate_vram_mb(const void *llama_model, int ctx, int rows) {
+  const sgl_llama *m = (const sgl_llama *)llama_model;
+  if (!m) return -1;
+  if (ctx <= 0) ctx = m->n_ctx;
+  if (rows <= 0) rows = ctx / 8;
+  int L = m->n_layer, E = m->n_embd, I = m->n_inter, V = m->vocab;
+  int KD = m->kv_dim > 0 ? m->kv_dim : m->n_embd;
+  const char *fe = getenv("SGL_CUDA_FP16");
+  int fp16 = (fe && atoi(fe)) ? 1 : 0;
+  const char *we = getenv("SGL_CUDA_W8");
+  int w8 = (we && atoi(we)) ? 1 : 0;
+  if (w8) fp16 = 1; /* embed stays fp16, projections go int8 */
+  double wsz = fp16 ? 2.0 : 4.0;   /* embed / lm_head element size */
+  double psz = w8 ? 1.0 : wsz;     /* projection element size */
+  double ei = (double)(E > I ? E : I);
+  double bytes = 0;
+  bytes += (double)V * E * wsz;                          /* wte */
+  if (m->lm_head.data && m->lm_head.data != m->wte.data) /* untied lm_head */
+    bytes += (double)V * E * wsz;
+  bytes += (double)L * (2.0 * E * E + 2.0 * KD * E + 3.0 * I * E) * psz;
+  bytes += (double)L * (6.0 * E + 2.0 * I) * 4.0;        /* norms + biases fp32 */
+  bytes += 2.0 * L * ctx * KD * 4.0;                     /* KV pool */
+  bytes += (4.0 * E + 2.0 * KD + 2.0 * I) * rows * 4.0;  /* activation workspace */
+  if (fp16) bytes += ei * rows * 2.0;                    /* cublas fp16 input mirror */
+  if (w8) bytes += ei * rows * 9.0;                      /* int8 A + int32 C + scales */
+  bytes += (double)V * 4.0 * 33.0;                       /* d_lgb grows to 32*B rows */
+  bytes += 32.0 * 1048576.0;                             /* cublas workspace */
+  bytes += 320.0 * 1048576.0;                            /* context + loaded modules */
+  return (long)(bytes / 1048576.0);
+}
+
+long sgl_cuda_avail_vram_mb(void) {
+  size_t free_b = 0, total_b = 0;
+  if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+    cudaGetLastError();
+    return -1;
+  }
+  return (long)(free_b / 1048576);
+}
 
 int sgl_cuda_forward(sgl_cuda_model *g, const int *tokens, int n, int pos0,
                      float *logits_out) {
@@ -1351,6 +1687,23 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
   if (sgl_cuda_reserve(g, n) != 0) return -1;
   if (sgl_cuda_ensure_io(g, n) != 0) return -1;
 
+  /* G1 profiling: event-pair every attention launch (see struct comment). */
+  {
+    static int prof_env = -1;
+    if (prof_env < 0) {
+      const char *pe = getenv("SGL_CUDA_PROF");
+      prof_env = (pe && atoi(pe)) ? 1 : 0;
+    }
+    g->prof = (prof_env && g->L <= SGL_PROF_MAXL) ? 1 : 0;
+    if (g->prof && g->pf0[0] == NULL) {
+      for (int l = 0; l < g->L; l++) {
+        cudaEventCreate(&g->pf0[l]);
+        cudaEventCreate(&g->pf1[l]);
+      }
+    }
+  }
+  const int prof = g->prof;
+
   if (emb) {
     /* visual tokens: activations come precomputed from the host (CLIP+projector) */
     CK(cudaMemcpyAsync(g->x, emb, sizeof(float) * (size_t)n * E,
@@ -1397,24 +1750,43 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
     }
     /* M26a: attention path split. <= SGL_ATTN_SHORT_MAX keeps the original
      * shared-scores kernel (numerics untouched; shared sized to the real
-     * row length instead of the full ctx). Longer rows go to the two-pass
-     * chunked kernel, lifting the shared-memory/context cap. Same stream
-     * as the D2D KV copies above, so no device sync is needed here.
-     * SGL_FORCE_LONG_ATTN=1 runs every prompt through the two-pass kernel
-     * (testing: it must agree with the short kernel within fp noise). */
+     * row length instead of the full ctx). Longer rows go to the flash
+     * kernel (G1: single-pass, shared-tiled KV), lifting the shared-memory
+     * context cap. Same stream as the D2D KV copies above, so no device sync
+     * is needed here.
+     * SGL_FORCE_LONG_ATTN=1 runs every prompt through the long kernel
+     * (testing: it must agree with the short kernel within fp noise).
+     * SGL_ATTN_TWOPASS=1 forces the old two-pass kernel (A/B benchmark).
+     * SGL_CUDA_PROF=1 brackets every attention launch with CUDA events and
+     * prints the attention share of the forward at the end (G1 step 1). */
     {
       const char *fe = getenv("SGL_FORCE_LONG_ATTN");
+      const char *tp = getenv("SGL_ATTN_TWOPASS");
       int force_long = (fe && atoi(fe)) ? 1 : 0;
-      if (force_long || pos0 + n > SGL_ATTN_SHORT_MAX) {
-        k_attn_long<<<n * H, 256, 0, g->stream>>>(
-            g->q, g->kc + (long)l * g->ctx * KD, g->vc + (long)l * g->ctx * KD,
-            g->attn, pos0, kv_base, n, H, HK, D, 1.0f / sqrtf((float)D),
-            g->sliding_window);
+      int two_pass = (tp && atoi(tp)) ? 1 : 0;
+      float sc = 1.0f / sqrtf((float)D);
+      if (prof && g->L <= SGL_PROF_MAXL) {
+        cudaEventRecord(g->pf0[l], g->stream);
+        if (two_pass || force_long || pos0 + n > SGL_ATTN_SHORT_MAX) {
+          if (two_pass || launch_flash(g, l, n, pos0, kv_base, sc) != 0)
+            k_attn_long<<<n * H, 256, 0, g->stream>>>(
+                g->q, g->kc + (long) l * g->ctx * KD, g->vc + (long) l * g->ctx * KD,
+                g->attn, pos0, kv_base, n, H, HK, D, sc, g->sliding_window);
+        } else {
+          k_attn<<<n * H, 256, (size_t)(pos0 + n) * sizeof(float), g->stream>>>(
+              g->q, g->kc + (long) l * g->ctx * KD, g->vc + (long) l * g->ctx * KD,
+              g->attn, pos0, kv_base, n, H, HK, D, sc, E, g->sliding_window);
+        }
+        cudaEventRecord(g->pf1[l], g->stream);
+      } else if (two_pass || force_long || pos0 + n > SGL_ATTN_SHORT_MAX) {
+        if (two_pass || launch_flash(g, l, n, pos0, kv_base, sc) != 0)
+          k_attn_long<<<n * H, 256, 0, g->stream>>>(
+              g->q, g->kc + (long) l * g->ctx * KD, g->vc + (long) l * g->ctx * KD,
+              g->attn, pos0, kv_base, n, H, HK, D, sc, g->sliding_window);
       } else {
         k_attn<<<n * H, 256, (size_t)(pos0 + n) * sizeof(float), g->stream>>>(
-            g->q, g->kc + (long)l * g->ctx * KD, g->vc + (long)l * g->ctx * KD,
-            g->attn, pos0, kv_base, n, H, HK, D, 1.0f / sqrtf((float)D), E,
-            g->sliding_window);
+            g->q, g->kc + (long) l * g->ctx * KD, g->vc + (long) l * g->ctx * KD,
+            g->attn, pos0, kv_base, n, H, HK, D, sc, E, g->sliding_window);
       }
     }
     CK(cudaGetLastError());
@@ -1474,6 +1846,18 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
       CK(cudaStreamSynchronize(g->stream));
       memcpy(logits_out, g->h_lgb, sizeof(float) * (size_t)g->V);
     }
+  }
+  if (prof) {
+    CK(cudaStreamSynchronize(g->stream));
+    float tot = 0.0f;
+    for (int l = 0; l < g->L; l++) {
+      float ms = 0.0f;
+      cudaEventElapsedTime(&ms, g->pf0[l], g->pf1[l]);
+      tot += ms;
+    }
+    printf("[prof] attention %.1f ms / %d layers (n=%d pos0=%d kv_base=%d)\n",
+           tot, g->L, n, pos0, kv_base);
+    fflush(stdout);
   }
   return 0;
 }
@@ -1581,6 +1965,155 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
   return 0;
 }
 
+/* G3: capture one decode-step graph for batch size B.
+ * Two stability fixes over the original inline capture:
+ *  (1) WARM-UP RUN before capturing. With CUDA_MODULE_LOADING=LAZY (the CUDA
+ *      13 default) the first launch of a kernel loads its module, and cuBLAS
+ *      picks (and may allocate for) an algorithm on its first call per shape;
+ *      doing that inside stream capture is what made captures fail
+ *      intermittently. One plain step first, then capture.
+ *  (2) PER-B FAILURE. A failed capture used to set a process-global
+ *      "graphs off" flag, so one unlucky capture degraded every batch size for
+ *      the rest of the server's life (the "capture fails then decode crawls"
+ *      symptom). Now only this B is marked SGL_NO_GRAPH; other batch sizes
+ *      keep replaying their graphs, and a later buffer growth
+ *      (invalidate_graphs) clears the marker so B gets another chance. */
+static int capture_decode_graph(sgl_cuda_model *g, int B) {
+  int H = g->H, HK = g->HK;
+  cudaGraph_t graph = NULL;
+  cudaGraphExec_t exec = NULL;
+  if (B < 1 || B > 32) return -1;
+  if (sgl_cuda_reserve(g, B) != 0) return -1;
+  if (sgl_cuda_ensure_io(g, B) != 0) return -1;
+  if (sgl_cuda_ensure_lgb(g, B) != 0) return -1;
+  CK(cudaStreamSynchronize(g->stream));
+  /* (1) warm-up: a full plain step with the mirrors as they are. The device
+   * mirrors must be loaded from the host mirrors FIRST: ensure_io() only
+   * cudaMallocs them (uninitialized), and launching with garbage base_pos
+   * reads KV out of range -> illegal access (this is what the original
+   * capture avoided by never executing the step during capture). */
+  if (cudaMemcpyAsync(g->d_tok, g->h_tok, sizeof(int) * (size_t) B,
+                      cudaMemcpyHostToDevice, g->stream) != cudaSuccess) return -1;
+  if (cudaMemcpyAsync(g->d_base, g->h_base, sizeof(int) * (size_t) B,
+                      cudaMemcpyHostToDevice, g->stream) != cudaSuccess) return -1;
+  if (cudaMemcpyAsync(g->d_lens, g->h_lens, sizeof(int) * (size_t) B,
+                      cudaMemcpyHostToDevice, g->stream) != cudaSuccess) return -1;
+  if (cudaMemcpyAsync(g->d_pq, g->h_pq, sizeof(int) * (size_t) B * H,
+                      cudaMemcpyHostToDevice, g->stream) != cudaSuccess) return -1;
+  if (cudaMemcpyAsync(g->d_pk, g->h_pk, sizeof(int) * (size_t) B * HK,
+                      cudaMemcpyHostToDevice, g->stream) != cudaSuccess) return -1;
+  if (decode_step_launch(g, B, g->ctx + 1) != 0) return -1;
+  if (cudaMemcpyAsync(g->h_lgb, g->d_lgb, sizeof(float) * (size_t)B * g->V,
+                      cudaMemcpyDeviceToHost, g->stream) != cudaSuccess) return -1;
+  if (cudaStreamSynchronize(g->stream) != cudaSuccess) return -1;
+
+  if (cudaStreamBeginCapture(g->stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+    g->gexec[B] = SGL_NO_GRAPH;
+    return -1;
+  }
+  /* the input upload from the pinned mirrors is part of the graph: every
+   * replay re-copies whatever the caller wrote into the mirrors */
+  int rc = 0;
+  rc |= cudaMemcpyAsync(g->d_tok, g->h_tok, sizeof(int) * (size_t)B,
+                        cudaMemcpyHostToDevice, g->stream) == cudaSuccess ? 0 : -1;
+  rc |= cudaMemcpyAsync(g->d_base, g->h_base, sizeof(int) * (size_t)B,
+                        cudaMemcpyHostToDevice, g->stream) == cudaSuccess ? 0 : -1;
+  rc |= cudaMemcpyAsync(g->d_lens, g->h_lens, sizeof(int) * (size_t)B,
+                        cudaMemcpyHostToDevice, g->stream) == cudaSuccess ? 0 : -1;
+  rc |= cudaMemcpyAsync(g->d_pq, g->h_pq, sizeof(int) * (size_t)B * H,
+                        cudaMemcpyHostToDevice, g->stream) == cudaSuccess ? 0 : -1;
+  rc |= cudaMemcpyAsync(g->d_pk, g->h_pk, sizeof(int) * (size_t)B * HK,
+                        cudaMemcpyHostToDevice, g->stream) == cudaSuccess ? 0 : -1;
+  rc |= decode_step_launch(g, B, g->ctx + 1 /* force long-path kernel */);
+  if (rc == 0)
+    rc = cudaMemcpyAsync(g->h_lgb, g->d_lgb, sizeof(float) * (size_t)B * g->V,
+                         cudaMemcpyDeviceToHost, g->stream) == cudaSuccess ? 0 : -1;
+  if (rc != 0) {
+    cudaStreamEndCapture(g->stream, &graph); /* abort the capture */
+    if (graph) cudaGraphDestroy(graph);
+    g->gexec[B] = SGL_NO_GRAPH;
+    fprintf(stderr, "[cuda] decode graph capture failed (B=%d); this size runs plain\n", B);
+    cudaGetLastError(); /* clear any sticky error from the aborted capture */
+    return -1;
+  }
+  if (cudaStreamEndCapture(g->stream, &graph) != cudaSuccess || !graph) {
+    if (graph) cudaGraphDestroy(graph);
+    g->gexec[B] = SGL_NO_GRAPH;
+    fprintf(stderr, "[cuda] decode graph end-capture failed (B=%d)\n", B);
+    cudaGetLastError();
+    return -1;
+  }
+  if (cudaGraphInstantiate(&exec, graph, NULL, NULL, 0) != cudaSuccess) {
+    cudaGraphDestroy(graph);
+    g->gexec[B] = SGL_NO_GRAPH;
+    fprintf(stderr, "[cuda] decode graph instantiate failed (B=%d)\n", B);
+    cudaGetLastError();
+    return -1;
+  }
+  g->graphs[B] = graph;
+  g->gexec[B] = exec;
+  size_t nn = 0;
+  cudaGraphGetNodes(graph, NULL, &nn);
+  printf("[cuda] decode graph captured (B=%d, %d nodes)\n", B, (int)nn);
+  fflush(stdout); /* server log must show captures even when piped */
+  return 0;
+}
+
+/* G3: pre-warm everything the decode graphs bake in, then capture the graphs
+ * for B = 1..max_b. Call once at startup (before serving): the activation
+ * workspace then never grows (rows = the largest prefill chunk the server will
+ * issue), so the cached graphs stay valid for the whole server lifetime, and
+ * the ~0.5s capture cost per B is paid before the first request instead of
+ * inside a live batch. Returns the number of graphs captured, or -1. */
+int sgl_cuda_prewarm(sgl_cuda_model *g, int rows, int max_b) {
+  if (!g) return -1;
+  if (rows < 1) rows = 1;
+  if (max_b < 1) max_b = 1;
+  if (max_b > 32) max_b = 32;
+  if (sgl_cuda_reserve(g, rows) != 0) return -1;
+  if (sgl_cuda_ensure_io(g, max_b) != 0) return -1;
+  if (sgl_cuda_ensure_lgb(g, max_b) != 0) return -1;
+  /* mirrors: any values in range; the capture only reads the addresses */
+  for (int b = 0; b < max_b; b++) {
+    g->h_tok[b] = 1;
+    g->h_base[b] = b * (g->ctx / max_b);
+    g->h_lens[b] = 16;
+    for (int h = 0; h < g->H; h++) g->h_pq[b * g->H + h] = 16;
+    for (int hk = 0; hk < g->HK; hk++) g->h_pk[b * g->HK + hk] = 16;
+    if (g->h_base[b] + 17 >= g->ctx) g->h_base[b] = g->ctx - 18;
+    if (g->h_base[b] < 0) g->h_base[b] = 0;
+  }
+  int got = 0;
+  for (int B = 1; B <= max_b; B++) {
+    if (!g->gexec[B]) {
+      if (capture_decode_graph(g, B) == 0) got++;
+    } else got++;
+  }
+  /* Prefill warm-up too: the first real prompt otherwise pays the lazy kernel
+   * load of the prefill-only kernels (rope rows / short + flash attention /
+   * silu) and cuBLAS algorithm selection for the M>1 shapes — measured as a
+   * ~20s first round under 12-way concurrency vs ~4s afterwards. Any KV the
+   * warm-up writes is overwritten by the first real prefill of that segment,
+   * and attention only reads [kv_base, kv_base+len) of the requesting
+   * sequence, so the garbage rows can never be attended. */
+  {
+    int wn = rows < 64 ? rows : 64;
+    int *wt = (int *)malloc(sizeof(int) * (size_t)wn);
+    if (wt) {
+      float *wl = (float *)malloc(sizeof(float) * (size_t)g->V);
+      for (int i = 0; i < wn; i++) wt[i] = 1 + (i % 100);
+      if (wl) {
+        if (sgl_cuda_forward_seg(g, wt, wn, 0, 0, wl) != 0)
+          fprintf(stderr, "[cuda] prewarm prefill failed (rows=%d)\n", wn);
+        free(wl);
+      }
+      free(wt);
+    }
+  }
+  CK(cudaStreamSynchronize(g->stream));
+  return got;
+}
+
 int sgl_cuda_decode_batch(sgl_cuda_model *g, const int *tokens, const int *base_pos,
                           const int *lens, int B, float *logits_out) {
   int H = g->H, HK = g->HK;
@@ -1619,51 +2152,11 @@ int sgl_cuda_decode_batch(sgl_cuda_model *g, const int *tokens, const int *base_
      * forced to the two-pass kernel (fixed shared memory): the captured
      * grid must stay valid as lens[] grows across replays. */
     if (!g->gexec[B]) {
-      cudaGraph_t graph = NULL;
-      cudaGraphExec_t exec = NULL;
-      int rc;
-      CK(cudaStreamSynchronize(g->stream));
-      CK(cudaStreamBeginCapture(g->stream, cudaStreamCaptureModeThreadLocal));
-      /* the input upload from the pinned mirrors is part of the graph:
-       * every replay re-copies whatever the caller wrote into the mirrors */
-      cudaMemcpyAsync(g->d_tok, g->h_tok, sizeof(int) * (size_t)B,
-                      cudaMemcpyHostToDevice, g->stream);
-      cudaMemcpyAsync(g->d_base, g->h_base, sizeof(int) * (size_t)B,
-                      cudaMemcpyHostToDevice, g->stream);
-      cudaMemcpyAsync(g->d_lens, g->h_lens, sizeof(int) * (size_t)B,
-                      cudaMemcpyHostToDevice, g->stream);
-      cudaMemcpyAsync(g->d_pq, g->h_pq, sizeof(int) * (size_t)B * H,
-                      cudaMemcpyHostToDevice, g->stream);
-      cudaMemcpyAsync(g->d_pk, g->h_pk, sizeof(int) * (size_t)B * HK,
-                      cudaMemcpyHostToDevice, g->stream);
-      rc = decode_step_launch(g, B, g->ctx + 1 /* force long-path kernel */);
-      if (rc == 0) {
-        rc = cudaMemcpyAsync(g->h_lgb, g->d_lgb,
-                             sizeof(float) * (size_t)B * g->V,
-                             cudaMemcpyDeviceToHost, g->stream) == cudaSuccess ? 0 : -1;
-      }
-      if (rc == 0) {
-        rc = cudaStreamEndCapture(g->stream, &graph) == cudaSuccess ? 0 : -1;
-      } else {
-        cudaStreamEndCapture(g->stream, &graph);
-      }
-      if (rc != 0 || !graph) {
-        fprintf(stderr, "cuda capture failed; falling back to plain decode\n");
-        if (graph) cudaGraphDestroy(graph);
-        use_graph = 0;
-      } else if (cudaGraphInstantiate(&exec, graph, NULL, NULL, 0) != cudaSuccess) {
-        fprintf(stderr, "cudaGraphInstantiate failed; falling back\n");
-        cudaGraphDestroy(graph);
-        use_graph = 0;
-      } else {
-        g->graphs[B] = graph;
-        g->gexec[B] = exec;
-        size_t nn = 0;
-        cudaGraphGetNodes(graph, NULL, &nn);
-        printf("[cuda] decode graph captured (B=%d, %d nodes)\n", B, (int)nn);
+      if (capture_decode_graph(g, B) != 0) {
+        /* (G3) only this B gave up; fall through to the plain path below */
       }
     }
-    if (use_graph && g->gexec[B]) {
+    if (g->gexec[B] && g->gexec[B] != SGL_NO_GRAPH) {
       if (cudaGraphLaunch((cudaGraphExec_t)g->gexec[B], g->stream) != cudaSuccess)
         return -1;
       CK(cudaStreamSynchronize(g->stream));

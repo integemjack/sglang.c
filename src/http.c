@@ -1,6 +1,8 @@
 ﻿/* sgl http 实现：winsock2 + 每连接一线程 + worker 驱动调度器 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/http.h"
+
+#include "sgl/image.h"
 #include "sgl/log.h"
 
 #include <stdio.h>
@@ -61,11 +63,26 @@ struct sgl_http_server {
   pthread_cond_t cv_done;  /* 有请求完成 */
   pthread_t worker, acceptor;
   int stop;            /* worker 停止标志 */
+  /* G4: active_conns 以前挂在 srv->lock 上，而 worker 每推进一步都持有
+   * srv->lock 做前向计算（CPU 上一个 step 可达百毫秒）。高并发时 acceptor
+   * 抢不到登记锁 → 内核已完成 TCP 握手、连接却长时间不建线程 → 客户端
+   * “连上但没响应”（实测 CPU 版 12 并发下 6.7% 的 /health 10s 无首字节，
+   * 而 POST /generate 同时刻正常）。现在单独一把 conns_lock，acceptor 不
+   * 再排在计算锁后面。 */
+  pthread_mutex_t conns_lock;
   int active_conns;    /* 挡 acceptor 退出时的悬挂连接 */
   pthread_cond_t cv_conns_zero;
   done_item *done_head, *done_tail;
   long req_counter;    /* OpenAI id 生成 */
+  sgl_http_vision_fn vision;   /* G8: 图片→视觉 token 回调（NULL = 不支持图片）*/
+  void *vision_ud;
 };
+
+void sgl_http_set_vision(sgl_http_server *srv, sgl_http_vision_fn fn, void *ud) {
+  if (!srv) return;
+  srv->vision = fn;
+  srv->vision_ud = ud;
+}
 
 /* ---------- 响应构造：动态字符串 + JSON 转义 ---------- */
 
@@ -322,6 +339,12 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
   char stops[4][128];
   int n_stops = 0;
   int n_choices = 1;
+  /* G8: 多模态（仅 chat 路径会填）*/
+  float *feats = NULL;
+  long n_feats = 0; /* 已拼的 float 个数（只为日志）*/
+  int feat_row = 0, n_img_tok = 0;
+  const char *img_err = NULL;
+  (void)n_feats;
 
   sgl_json *j = sgl_json_parse(req->body, req->body_len);
   if (!j) { respond_error(fd, 400, "invalid JSON body"); return; }
@@ -360,14 +383,61 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     }
     sbuf ml;
     sb_init(&ml);
+    /* G8: content[] 里的 image_url → 视觉 token（多张图按顺序拼接）
+     * feats/n_img_tok/img_err 在函数开头声明，提交阶段要用 */
     for (int i = 0; i < msgs->count; i++) {
       const sgl_json *m = msgs->items[i];
       const char *role = sgl_json_get_str(m, "role", "user");
-      const char *content = sgl_json_get_str(m, "content", "");
+      const sgl_json *cj = sgl_json_get(m, "content");
+      int is_arr = cj && cj->type == SGL_JSON_ARRAY;
       sb_puts(&ml, "<|im_start|>");
       sb_puts(&ml, role);
       sb_puts(&ml, "\n");
-      sb_puts(&ml, content);
+      if (is_arr) {
+        for (int k = 0; k < cj->count; k++) {
+          const sgl_json *part = cj->items[k];
+          const char *ptype = sgl_json_get_str(part, "type", "text");
+          if (strcmp(ptype, "image_url") != 0) {
+            sb_puts(&ml, sgl_json_get_str(part, "text", ""));
+            continue;
+          }
+          sb_puts(&ml, "<image>"); /* 文本里放占位，真融合走 emb */
+          if (img_err) continue;
+          if (!srv->vision) { img_err = "server has no vision tower (use --vision)"; continue; }
+          const sgl_json *iu = sgl_json_get(part, "image_url");
+          const char *url = iu ? sgl_json_get_str(iu, "url", "") : "";
+          const char *b64 = url;
+          const char *cm = strchr(url, ',');
+          if (!strncmp(url, "data:", 5) && cm) b64 = cm + 1; /* data:image/x;base64, */
+          unsigned char *bytes = NULL;
+          size_t bn = 0;
+          if (sgl_base64_decode(b64, strlen(b64), &bytes, &bn) != 0) {
+            img_err = "image_url base64 decode failed";
+            continue;
+          }
+          int ni = 0, el = 0;
+          float *f = srv->vision(srv->vision_ud, bytes, bn, &ni, &el);
+          sgl_xfree(bytes);
+          if (!f || ni <= 0 || el <= 0) {
+            sgl_xfree(f);
+            img_err = "image decode / vision encode failed";
+            continue;
+          }
+          if (feat_row == 0) feat_row = el;
+          if (feat_row != el) {
+            sgl_xfree(f);
+            img_err = "images with different feature width";
+            continue;
+          }
+          feats = (float *)sgl_xrealloc(feats, sizeof(float) * (size_t)(n_feats + (long)ni * el));
+          memcpy(feats + n_feats, f, sizeof(float) * (size_t)ni * el);
+          n_feats += (long)ni * el;
+          n_img_tok += ni;
+          sgl_xfree(f);
+        }
+      } else {
+        sb_puts(&ml, sgl_json_get_str(m, "content", ""));
+      }
       sb_puts(&ml, "<|im_end|>\n");
     }
     sb_puts(&ml, "<|im_start|>assistant\n");
@@ -436,7 +506,22 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
    * body parks BPE encode for minutes on the CPU stack too. */
   if (strlen(text) > 65536) {
     sgl_xfree(prompt_copy);
+    sgl_xfree(feats);
     respond_error(fd, 503, "prompt too long (>64KB)");
+    return;
+  }
+
+  /* G8: 图片请求——emb 级融合只在非流式、n=1、base 实例下接线（其余组合明确拒）*/
+  if (img_err) {
+    sgl_xfree(prompt_copy);
+    sgl_xfree(feats);
+    respond_error(fd, 400, img_err);
+    return;
+  }
+  if (feats && (is_stream || n_choices > 1 || (lor && *lor))) {
+    sgl_xfree(prompt_copy);
+    sgl_xfree(feats);
+    respond_error(fd, 400, "image_url supports only non-streaming n=1 on the base instance");
     return;
   }
 
@@ -448,7 +533,9 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     if (i > 0) spi.seed = sp.seed ? sp.seed + (uint64_t)i : (uint64_t)(0x1234 + i);
     ids[i] = is_stream
         ? sgl_sched_submit_stream_lora(srv->sched, text, max_new, &spi, lor)
-        : sgl_sched_submit_lora(srv->sched, text, max_new, &spi, lor);
+        : feats ? sgl_sched_submit_img(srv->sched, text, max_new, &spi, feats, n_img_tok)
+                : sgl_sched_submit_lora(srv->sched, text, max_new, &spi, lor);
+    if (feats) feats = NULL; /* 所有权已转给调度器（失败时 submit_img 自己回收）*/
     if (ids[i] < 0) break;
   }
   pthread_mutex_unlock(&srv->lock);
@@ -620,9 +707,9 @@ static void *conn_fn(void *arg) {
     sgl_xfree(req.body);
   }
   closesocket(ctx->fd);
-  pthread_mutex_lock(&ctx->srv->lock);
+  pthread_mutex_lock(&ctx->srv->conns_lock);
   if (--ctx->srv->active_conns == 0) pthread_cond_broadcast(&ctx->srv->cv_conns_zero);
-  pthread_mutex_unlock(&ctx->srv->lock);
+  pthread_mutex_unlock(&ctx->srv->conns_lock);
   sgl_xfree(ctx);
   return NULL;
 }
@@ -644,17 +731,17 @@ static void *acceptor_fn(void *arg) {
       break; /* listen socket 关闭（stop）*/
     }
     if (srv->stop) { closesocket(c); break; }
-    pthread_mutex_lock(&srv->lock);
+    pthread_mutex_lock(&srv->conns_lock);
     srv->active_conns++;
-    pthread_mutex_unlock(&srv->lock);
+    pthread_mutex_unlock(&srv->conns_lock);
     conn_ctx *ctx = (conn_ctx *)sgl_xmalloc(sizeof(*ctx));
     ctx->srv = srv; ctx->fd = c;
     pthread_t t;
     if (pthread_create(&t, NULL, conn_fn, ctx) != 0) {
       closesocket(c);
-      pthread_mutex_lock(&srv->lock);
+      pthread_mutex_lock(&srv->conns_lock);
       srv->active_conns--;
-      pthread_mutex_unlock(&srv->lock);
+      pthread_mutex_unlock(&srv->conns_lock);
       sgl_xfree(ctx);
     } else {
       pthread_detach(t);
@@ -672,6 +759,7 @@ sgl_http_server *sgl_http_serve(sgl_scheduler *sched, const char *host, int port
   srv->sched = sched;
   srv->listen_fd = INVALID_SOCKET;
   pthread_mutex_init(&srv->lock, NULL);
+  pthread_mutex_init(&srv->conns_lock, NULL); /* G4 */
   pthread_cond_init(&srv->cv_work, NULL);
   pthread_cond_init(&srv->cv_done, NULL);
   pthread_cond_init(&srv->cv_conns_zero, NULL);
@@ -707,7 +795,7 @@ sgl_http_server *sgl_http_serve(sgl_scheduler *sched, const char *host, int port
 fail:
   if (srv->listen_fd != INVALID_SOCKET) closesocket(srv->listen_fd);
   pthread_cond_destroy(&srv->cv_work); pthread_cond_destroy(&srv->cv_done); pthread_cond_destroy(&srv->cv_conns_zero);
-  pthread_mutex_destroy(&srv->lock);
+  pthread_mutex_destroy(&srv->lock); pthread_mutex_destroy(&srv->conns_lock);
   sgl_xfree(srv);
   WSACleanup();
   return NULL;
@@ -724,6 +812,11 @@ void sgl_http_stop(sgl_http_server *srv) {
     closesocket(srv->listen_fd); /* 令 accept 退出 */
     sgl_sleep_ms(100);
     pthread_mutex_lock(&srv->lock);
+    /* G4: 计数归 conns_lock 管，隔着 srv->lock 看不算数 */
+    pthread_mutex_lock(&srv->conns_lock);
+    int still = srv->active_conns;
+    pthread_mutex_unlock(&srv->conns_lock);
+    if (still == 0) break;
   }
   pthread_mutex_unlock(&srv->lock);
   closesocket(srv->listen_fd);
@@ -735,7 +828,7 @@ void sgl_http_stop(sgl_http_server *srv) {
     sgl_xfree(d->text); sgl_xfree(d->ids); sgl_xfree(d);
   }
   pthread_cond_destroy(&srv->cv_work); pthread_cond_destroy(&srv->cv_done); pthread_cond_destroy(&srv->cv_conns_zero);
-  pthread_mutex_destroy(&srv->lock);
+  pthread_mutex_destroy(&srv->lock); pthread_mutex_destroy(&srv->conns_lock);
   sgl_xfree(srv);
   WSACleanup();
 }

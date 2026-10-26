@@ -1,4 +1,4 @@
-/* test_bpe.c — BPE tokenizer 测试（需要 tokenizer.json；HF 官方 GPT-2 样例）*/
+﻿/* test_bpe.c — BPE tokenizer 测试（需要 tokenizer.json；HF 官方 GPT-2 样例）*/
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>

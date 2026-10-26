@@ -84,4 +84,12 @@ int sgl_sched_submit_lora(sgl_scheduler *s, const char *text, int max_new,
 int sgl_sched_submit_stream_lora(sgl_scheduler *s, const char *text, int max_new,
                                  const sgl_sampling_params *sp, const char *lora);
 
+/* ---- G8 多模态（LLaVA 风格 embedding 级融合，CPU 路径）----
+ * feats: [n_img][E_lm] 视觉 token（由调用方的视觉塔+projector 算好，sgl_xmalloc 分配），
+ * 接在 prompt token 后面进同一页表；首 token 的 logits 取最后一个视觉 token。
+ * 所有权转给调度器（prefill 完即释放）；失败也接管释放。仅 llama 后端支持。
+ * 返回请求 id，失败 -1。 */
+int sgl_sched_submit_img(sgl_scheduler *s, const char *text, int max_new,
+                         const sgl_sampling_params *sp, float *feats, int n_img);
+
 #endif

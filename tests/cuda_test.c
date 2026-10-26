@@ -335,6 +335,67 @@ int main(int argc, char **argv) {
       sgl_cuda_free(gpu16);
     }
   }
+  /* ---- G2 W8A8 int8 projections ----
+   * t8 established W8 == fp32 greedy for 10 steps with the dp4a GEMV used at
+   * every batch size. G2 moved M>1 (prefill, batched decode) to the int8
+   * tensor-core (IMMA) path -- 3.7x faster at M=8, 27-148x at M=64 (see the
+   * gemm-bench lines below). IMMA accumulates the exact same integer dot
+   * products as dp4a (int32, no overflow at these K), activations are
+   * quantized once per row with the identical absmax scheme, so the two paths
+   * must agree to float rounding. Checked here:
+   *   (a) W8/IMMA prefill vs W8/dp4a prefill: maxerr ~ 0 (path equivalence),
+   *   (b) W8 prefill top1 + logits budget vs the fp32 GPU model,
+   *   (c) greedy 10 decode steps W8 vs fp32: 10/10 (t8 acceptance re-run). */
+  {
+    printf("[w8] uploading int8 model...\n");
+    _putenv("SGL_CUDA_W8=1");
+    sgl_cuda_model *gw8 = sgl_cuda_from_llama(cpu);
+    _putenv("SGL_CUDA_W8=0");
+    CHECK(gw8, "w8 upload");
+    if (gw8) {
+      float *l8 = (float *)sgl_xmalloc(sizeof(float) * (size_t) V);
+      float *l8b = (float *)sgl_xmalloc(sizeof(float) * (size_t) V);
+      CHECK(l8 && l8b, "w8 logits alloc");
+      /* refresh the fp32 reference: lg holds the last decode step of the
+       * fp16 cross-check above, not the prefill logits */
+      CHECK(sgl_cuda_forward(gpu, ids, np, 0, lg) == 0, "fp32 prefill refresh (w8)");
+      CHECK(sgl_cuda_forward(gw8, ids, np, 0, l8) == 0, "w8 prefill (imma)");
+      _putenv("SGL_W8_DP4A=1");
+      CHECK(sgl_cuda_forward(gw8, ids, np, 0, l8b) == 0, "w8 prefill (dp4a)");
+      _putenv("SGL_W8_DP4A=0");
+      float me_ab = 0.f;
+      for (int i = 0; i < V; i++) {
+        float d = fabsf(l8[i] - l8b[i]);
+        if (d > me_ab) me_ab = d;
+      }
+      printf("[w8] imma vs dp4a prefill maxerr = %g\n", me_ab);
+      CHECK(me_ab < 1e-4f, "W8 IMMA path diverges from dp4a path");
+      float me8 = 0.f, mref = 0.f;
+      for (int i = 0; i < V; i++) {
+        float d = fabsf(l8[i] - lg[i]);
+        if (d > me8) me8 = d;
+        if (fabsf(lg[i]) > mref) mref = fabsf(lg[i]);
+      }
+      int t8 = sgl_sample_greedy(l8, V), t32 = sgl_sample_greedy(lg, V);
+      printf("[w8] prefill vs fp32: maxerr = %g (fp32 max|logit| %g, rel %.3f%%); top1 w8=%d fp32=%d\n",
+             me8, mref, 100.0 * me8 / (mref > 0 ? mref : 1.f), t8, t32);
+      CHECK(me8 / (mref > 0 ? mref : 1.f) < 0.30, "W8 prefill logits deviation too large");
+      CHECK(t8 == t32, "w8 prefill top1 != fp32");
+      int len8 = np, g8 = 0;
+      for (int s = 0; s < 10; s++) {
+        CHECK(sgl_cuda_forward(gpu, &t32, 1, len8, lg) == 0, "w8 cmp fp32 step");
+        CHECK(sgl_cuda_forward(gw8, &t8, 1, len8, l8) == 0, "w8 step");
+        len8++;
+        t32 = sgl_sample_greedy(lg, V);
+        t8 = sgl_sample_greedy(l8, V);
+        if (t8 == t32) g8++;
+      }
+      printf("[w8] greedy 10 decode steps: %d/10 match fp32\n", g8);
+      CHECK(g8 == 10, "W8 changed greedy decode");
+      sgl_xfree(l8); sgl_xfree(l8b);
+      sgl_cuda_free(gw8);
+    }
+  }
   /* GEMM bench (sgemm vs hgemm on real shapes; also hand M=1 kernels) */
   sgl_cuda_gemm_bench();
 
@@ -560,6 +621,84 @@ int main(int argc, char **argv) {
   }
 
   sgl_xfree(whole); sgl_xfree(pg); sgl_xfree(lc); sgl_xfree(lg); sgl_xfree(ids);
+
+  /* ---- G6: 前缀缓存（KV 行复用）与重算逐位相等 ----
+   * 服务端命中前缀时不重算前缀部分，而是把已租让段里的前 L 行 KV 搬过来。
+   * 验收：同一个 prompt B = P + S2，两条路径算出的最后位 logits 必须逐位相等：
+   *   (a) 完整 prefill（基准）；
+   *   (b) 先用另一个 prompt A = P + S1 填好 P 那 L 行 KV，sgl_cuda_copy_kv 搬到
+   *       B 的段头，再只 prefill 后缀 S2。
+   * A 的前 L 行 KV 只依赖 P（因果性），所以与 B 自己算的前 L 行应当一致。
+   * 三段互不重叠：A@0、B(复用)@4096、B(基准)@8192。 */
+  {
+    int gctx6 = sgl_cuda_ctx(gpu);
+    const int segA = 0, segB = 4096, segC = 8192, cap = 4096;
+    const int plen = 300, slen = 48;
+    if (gctx6 >= segC + plen + slen + 64) {
+      int *ta = (int *)sgl_xmalloc(sizeof(int) * (size_t)(plen + slen));
+      int *tb = (int *)sgl_xmalloc(sizeof(int) * (size_t)(plen + slen));
+      float *lA = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+      float *lreuse = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+      float *lfull = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+      CHECK(ta && tb && lA && lreuse && lfull, "prefix alloc");
+      if (ta && tb && lA && lreuse && lfull) {
+        for (int i = 0; i < plen; i++) { ta[i] = tb[i] = 100 + (i % 900); }
+        for (int i = 0; i < slen; i++) {
+          ta[plen + i] = 1000 + (i % 500);
+          tb[plen + i] = 900 + (i % 500); /* 同前缀、不同后缀 */
+        }
+        /* 1) A 填满 [segA, segA+plen+slen)：前 plen 行就是 P 的 KV */
+        CHECK(sgl_cuda_forward_seg(gpu, ta, plen + slen, 0, segA, lA) == 0, "prefix A prefill");
+        /* 2) 搬前缀行 -> B 段 */
+        double tc0 = now_sec();
+        CHECK(sgl_cuda_copy_kv(gpu, segA, segB, plen) == 0, "prefix copy");
+        double tcopy = now_sec() - tc0;
+        /* 3) 只 prefill 后缀 */
+        double tr0 = now_sec();
+        CHECK(sgl_cuda_forward_seg(gpu, tb + plen, slen, plen, segB, lreuse) == 0,
+              "prefix suffix prefill");
+        double treuse = now_sec() - tr0;
+        /* 4) 基准：完整 prefill B（另一段） */
+        double tf0 = now_sec();
+        CHECK(sgl_cuda_forward_seg(gpu, tb, plen + slen, 0, segC, lfull) == 0,
+              "prefix full prefill (reference)");
+        double tfull = now_sec() - tf0;
+        double me6 = 0;
+        for (int i = 0; i < V; i++) {
+          double e = fabs((double) lreuse[i] - (double) lfull[i]);
+          if (e > me6) me6 = e;
+        }
+        int g6a = sgl_sample_greedy(lreuse, V), g6b = sgl_sample_greedy(lfull, V);
+        /* 5) 接着各 decode 6 步，逐 token 对拍 */
+        int same = g6a == g6b, steps = 6;
+        int base6[2], len6[2], tok6[2];
+        float *l6 = (float *)sgl_xmalloc(sizeof(float) * (size_t)V * 2);
+        for (int s = 0; s < steps && same; s++) {
+          base6[0] = segB; base6[1] = segC;
+          len6[0] = len6[1] = plen + slen + s;
+          tok6[0] = g6a; tok6[1] = g6b;
+          CHECK(sgl_cuda_decode_batch(gpu, tok6, base6, len6, 2, l6) == 0, "prefix decode step");
+          g6a = sgl_sample_greedy(l6, V);
+          g6b = sgl_sample_greedy(l6 + V, V);
+          if (g6a != g6b) same = 0;
+        }
+        printf("[prefix] reuse vs full: maxerr = %g; greedy %s; prefill %.1fms vs %.1fms (copy %.1fms, 省 %.1fx)\n",
+               me6, same ? "6/6 SAME" : "DIFF", treuse * 1e3, tfull * 1e3, tcopy * 1e3,
+               treuse > 0 ? tfull / treuse : 0.0);
+        /* 不是逐位相等而是 fp 噪声级（实测 1.43e-05，和 two-pass vs
+         * shared-scores 的 2.19e-05、CPU vs GPU 的 3.5e-05 同量级）：后缀单独
+         * prefill 时 M 不同，cuBLAS 会选不同的 kernel/累加顺序。用项目已有的
+         * LOGITS_MAXERR_LIMIT 标准，另外 greedy 必须逐 token 全同。 */
+        CHECK(me6 < LOGITS_MAXERR_LIMIT, "prefix reuse logits differ beyond fp noise (%g)", me6);
+        CHECK(same, "prefix reuse greedy diverged");
+        CHECK(treuse < tfull, "prefix reuse did not save prefill time");
+        sgl_xfree(l6);
+      }
+      sgl_xfree(ta); sgl_xfree(tb); sgl_xfree(lA); sgl_xfree(lreuse); sgl_xfree(lfull);
+    } else {
+      printf("[prefix] SKIP: gpu ctx %d < %d\n", gctx6, segC + plen + slen + 64);
+    }
+  }
 
   sgl_cuda_free(gpu);
   sgl_llama_free(cpu);

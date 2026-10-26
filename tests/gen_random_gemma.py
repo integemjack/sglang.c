@@ -1,10 +1,12 @@
-"""t9: 生成随机权重的 Mistral 结构小模型（sliding window 测试用）。
-结构 = llama + config.sliding_window；权重与 qwen2 同名（q/k/v/o + qk 无 norm 无 bias）。
-用法: python gen_random_mistral.py <out_dir>"""
+"""t9: 生成随机权重的 Gemma 结构小模型（含 G9：hidden_softcap / rope_scaling / layer_types）。
+结构 = llama + sqrt(E) embedding scale；argv[2]="dynamic" 时生成 Gemma-2 风变体
+（dynamic NTK rope、无 layer_types）给 gemma2-rand。
+用法: python gen_random_gemma.py <out_dir> [linear|dynamic]"""
 import json, os, sys
 import numpy as np
 
 out = sys.argv[1] if len(sys.argv) > 1 else "models/gemma-rand"
+variant = sys.argv[2] if len(sys.argv) > 2 else "linear"
 L, H, KVH, E, I, V, SW = 2, 4, 2, 64, 128, 151936, 0
 D = E // H
 rng = np.random.default_rng(42)
@@ -17,7 +19,18 @@ cfg = {
     "head_dim": D, "vocab_size": V, "rms_norm_eps": 1e-5,
     "rope_theta": 10000.0, "max_position_embeddings": 512,
     "attention_bias": False, "mlp_bias": False, "tie_word_embeddings": True,
+    # G9: embedding tanh 软上限（Gemma-3 hidden_softcap）
+    "hidden_softcap": 30.0 if variant == "linear" else 50.0,
+    # G9: rope_scaling + Gemma-3 风全局/局部基频
+    "rope_scaling": {"rope_type": variant, "factor": 2.0,
+                     "global_base_freq": 1000000.0},
 }
+if variant == "linear":
+    # Gemma-3 风：sliding 层用局部基频 1e4，full 层用 rope_scaling.global_base_freq 1e6；
+    # 随机模型 L=2，取 [sliding, full] 覆盖两种 rope。
+    cfg["rope_local_base_freq"] = 10000.0
+    cfg["sliding_window"] = 8
+    cfg["layer_types"] = ["sliding_attention", "full_attention"]
 json.dump(cfg, open(f"{out}/config.json", "w"), indent=1)
 
 W = {"model.embed_tokens.weight": rng.normal(0, 0.02, (V, E)).astype(np.float32),

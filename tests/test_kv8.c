@@ -1,4 +1,4 @@
-/* test_kv8.c — int8 KV cache 验证（SGL_KV8 开关）
+﻿/* test_kv8.c — int8 KV cache 验证（SGL_KV8 开关）
  * 方法：f32 KV vs int8 KV 同输入对照 logits/greedy；KV 是后置缓存
  * （写入的 k/v 是精确 f32 投影结果），per-page 对称量化往返误差 ~0.4%。 */
 #define _CRT_SECURE_NO_WARNINGS

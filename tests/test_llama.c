@@ -1,4 +1,4 @@
-/* test_llama.c — Llama 前向数值对照（tiny-random 权重）
+﻿/* test_llama.c — Llama 前向数值对照（tiny-random 权重）
  * 参考：tests/ref_llama.py 用 numpy + HF tokenizers(Rust) 独立生成
  * tests/ref_tinyllama.json（含编码 ids / top5 logits / greedy 续写）。 */
 #define _CRT_SECURE_NO_WARNINGS

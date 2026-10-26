@@ -1,4 +1,4 @@
-/* sgl/cuda.h — CUDA 后端（M9 v1）：llama 系模型的 GPU 单流前向
+﻿/* sgl/cuda.h — CUDA 后端（M9 v1）：llama 系模型的 GPU 单流前向
  * 权重在加载时上传设备；KV 连续存储（不分页，v1）；采样在主机。
  * 复用 llama.c 的加载器（sgl_llama*）作为权重源与配置来源。 */
 #ifndef SGL_CUDA_H
@@ -43,6 +43,24 @@ int sgl_cuda_ctx(const sgl_cuda_model *m);
  * logits_out needs B*vocab floats. */
 int sgl_cuda_decode_batch(sgl_cuda_model *m, const int *tokens, const int *base_pos,
                           const int *lens, int B, float *logits_out);
+
+/* G3: 预热 + 预捕获。把激活工作区一次性撑到 rows（服务端 = 最大 prefill 块），
+ * batch 镜像撑到 max_b，然后为 B=1..max_b 各捕获一张 decode graph。返回捕获成功
+ * 的张数，失败 -1。服务端在起服务前调用：之后 ws_cap 不再增长，缓存的 graph 全程
+ * 有效（增长会 invalidate 全部 graph 并在下一次 decode 重新捕获，~0.5s/张）。 */
+int sgl_cuda_prewarm(sgl_cuda_model *m, int rows, int max_b);
+
+/* G6: 前缀缓存的 KV 搬运：把 [src,src+len) 行（所有层 k+v）拷到 [dst,dst+len)。
+ * 只有两边都从位置 0 开始（同一段内）才能复用——RoPE 把位置写进了 K。
+ * 成功 0；越界/拷贝失败 -1；src==dst 或 len<=0 直接算成功。 */
+int sgl_cuda_copy_kv(sgl_cuda_model *m, int src, int dst, int len);
+
+/* G5: 上传前的显存估算（MB）。按与 sgl_cuda_from_llama 相同的分配口径算：
+ * 权重（fp32/fp16/int8 按当前环境变量开关）+ KV 池(ctx) + 激活工作区(rows) +
+ * logits 设备镜像 + cublas workspace。llama_model 为 sgl_llama*。 */
+long sgl_cuda_estimate_vram_mb(const void *llama_model, int ctx, int rows);
+/* G5: 当前可用显存（cudaMemGetInfo 的 free，MB）；失败返回 -1 */
+long sgl_cuda_avail_vram_mb(void);
 
 /* GEMM micro-benchmark (t1): times cublasSgemm vs fp16 cublasGemmEx on real
  * model shapes (qwen05 / tinyllama), M in {1,8,64}; prints ms and ratio.

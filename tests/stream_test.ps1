@@ -1,6 +1,8 @@
-# t5 验收：流式==非流式；并发>8 排队完成；finish_reason=length 正确
+﻿# t5 验收：流式==非流式；并发>8 排队完成；finish_reason=length 正确
+# G3: 加 -Port 参数（默认仍是 30002），这样同一份脚本能验 CPU 版和 GPU 版
+param([int]$Port = 30002)
 $ErrorActionPreference = 'Stop'
-$base = 'http://127.0.0.1:30002'
+$base = "http://127.0.0.1:$Port"
 function PF($ok) { if ($ok) { 'PASS' } else { 'FAIL' } }
 
 # 1) 流式 vs 非流式（chat，同 prompt 同参数）—— body 走临时文件（PS5.1 内联引号会被剥）
@@ -29,9 +31,9 @@ foreach ($p in $prompts) {
   $t = Join-Path $env:TEMP "q12_$i.json"
   @{ text = $p; max_tokens = 16; temperature = 0 } | ConvertTo-Json -Compress | Set-Content -Path $t -Encoding ascii
   $jobs += Start-Job -ScriptBlock {
-    param($f)
-    curl.exe -s -m 120 -X POST 'http://127.0.0.1:30002/generate' -H 'Content-Type: application/json' --data-binary "@$f"
-  } -ArgumentList $t
+    param($f, $u)
+    curl.exe -s -m 120 -X POST "$u/generate" -H 'Content-Type: application/json' --data-binary "@$f"
+  } -ArgumentList $t, $base
   $i++
 }
 $jobs | Wait-Job | Out-Null

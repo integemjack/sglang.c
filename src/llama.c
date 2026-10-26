@@ -179,6 +179,71 @@ sgl_llama *sgl_llama_load(const char *dir) {
     const char *mt = sgl_json_get_str(cfg, "model_type", "");
     m->gemma_scale = !strcmp(mt, "gemma") ? sqrtf((float)m->n_embd) : 0.0f;
   }
+  /* ---- G9: gemma hidden_softcap / rope_scaling / layer_types / qwen3-next linear dims ---- */
+  m->emb_softcap = (float)sgl_json_get_num(cfg, "hidden_softcap", 0.0);
+  m->rope_pos_scale = 1.0;
+  {
+    const sgl_json *rs = sgl_json_get(cfg, "rope_scaling");
+    const char *rtype = rs ? sgl_json_get_str(rs, "rope_type", "default") : "default";
+    double factor = rs ? sgl_json_get_num(rs, "factor", 1.0) : 1.0;
+    double global_base = rs ? sgl_json_get_num(rs, "global_base_freq", 0.0) : 0.0;
+    double local_base = sgl_json_get_num(cfg, "rope_local_base_freq", 0.0);
+    if (factor <= 0.0) factor = 1.0;
+    /* layer_types：按字符串判类型；不认识的字符串宽松忽略（按 full_attention）*/
+    const sgl_json *lt = sgl_json_get(cfg, "layer_types");
+    if (lt && lt->type == SGL_JSON_ARRAY && lt->count == m->n_layer) {
+      m->layer_kind = (int *)sgl_xmalloc(sizeof(int) * (size_t)m->n_layer);
+      for (int l = 0; l < m->n_layer; l++) {
+        const sgl_json *it = lt->items[l];
+        const char *s = (it && it->type == SGL_JSON_STRING) ? it->str : "full_attention";
+        if (!strcmp(s, "linear_attention")) m->layer_kind[l] = 2;
+        else if (!strcmp(s, "sliding_attention")) m->layer_kind[l] = 1;
+        else {
+          if (strcmp(s, "full_attention")) SGL_INFO("layer_types[%d]=%s unknown, treat as full", l, s);
+          m->layer_kind[l] = 0;
+        }
+      }
+    } else if (lt && lt->type == SGL_JSON_ARRAY && lt->count > 0) {
+      SGL_INFO("layer_types count %d != num_hidden_layers %d, ignored", lt->count, m->n_layer);
+    }
+    /* qwen3-next linear attention 维度（无 layer_types 时这些字段无害，nk 仅备查）*/
+    m->lin_nk = sgl_json_get_int(cfg, "linear_num_key_heads", 0);
+    m->lin_nh = sgl_json_get_int(cfg, "linear_num_value_heads", m->lin_nk);
+    m->lin_kd = sgl_json_get_int(cfg, "linear_key_head_dim", 0);
+    m->lin_vd = sgl_json_get_int(cfg, "linear_value_head_dim", m->lin_kd);
+    m->lin_conv = sgl_json_get_int(cfg, "linear_conv_kernel_dim", 0);
+    m->lin_ratio = m->lin_nk > 0 ? m->lin_nh / m->lin_nk : 1;
+    for (int l = 0; m->layer_kind && l < m->n_layer; l++)
+      if (m->layer_kind[l] == 2 && (m->lin_nk <= 0 || m->lin_kd <= 0 || m->lin_conv <= 0 ||
+          m->lin_nh % m->lin_nk)) {
+        SGL_ERROR("linear_attention layer but linear_* config invalid");
+        sgl_llama_free(m);
+        sgl_json_free(cfg);
+        return NULL;
+      }
+    /* 每层 rope 逆频率：sliding 层用 rope_local_base_freq（Gemma-3 局部 1e4），
+     * 其余层用 rope_scaling.global_base_freq（缺省 rope_theta）；
+     * rope_type=linear → 角度除以 factor；dynamic → NTK 基频缩放 theta*factor^(D/(D-2))
+     *（注：HF 的 dynamic_rope_update 是按运行时序列长度插值的另一套公式，这里取
+     *  静态 NTK 形式，随机模型 numpy 参考按同一公式，见 docs/NOTES_g9.md）。*/
+    int half = m->head_dim / 2;
+    m->layer_invf = (double *)sgl_xmalloc(sizeof(double) * (size_t)m->n_layer * (size_t)half);
+    m->layer_window = (int *)sgl_xmalloc(sizeof(int) * (size_t)m->n_layer);
+    if (!strcmp(rtype, "linear")) m->rope_pos_scale = 1.0 / factor;
+    for (int l = 0; l < m->n_layer; l++) {
+      int kind = m->layer_kind ? m->layer_kind[l] : (m->sliding_window > 0 ? 1 : 0);
+      double base = m->rope_theta;
+      if (m->layer_kind && kind == 1 && local_base > 0) base = local_base;
+      else if (m->layer_kind && kind != 2 && global_base > 0) base = global_base;
+      if (!strcmp(rtype, "dynamic"))
+        base *= pow(factor, (double)m->head_dim / (double)(m->head_dim - 2));
+      for (int i = 0; i < half; i++)
+        m->layer_invf[(size_t)l * half + i] = pow(base, -(double)(2 * i) / (double)m->head_dim);
+      /* 无 layer_types：全局 sliding_window 对所有层生效（mistral 旧行为）；
+       * 有 layer_types：仅 sliding_attention 层开窗 */
+      m->layer_window[l] = (kind == 1) ? m->sliding_window : 0;
+    }
+  }
   sgl_json_free(cfg);
   if (m->n_layer <= 0 || m->n_head <= 0 || m->n_embd <= 0 || m->vocab <= 0 ||
       m->n_kv_head <= 0 || m->n_embd % m->n_head) {
@@ -215,6 +280,7 @@ sgl_llama *sgl_llama_load(const char *dir) {
   for (int l = 0; l < m->n_layer; l++) {
     char name[128];
     sgl_llama_layer *L = &m->layers[l];
+    L->lin_idx = -1;
     snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", l);
     L->inp_norm = sgl_st_get(m->st, name, 1, (int64_t[]){E});
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", l);
@@ -270,12 +336,55 @@ sgl_llama *sgl_llama_load(const char *dir) {
     L->up_w = sgl_st_get(m->st, name, 2, (int64_t[]){I, E});
     snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", l);
     L->down_w = sgl_st_get(m->st, name, 2, (int64_t[]){E, I});
-    if (!L->inp_norm.data || !L->q_w.data || !L->k_w.data || !L->v_w.data ||
-        !L->o_w.data || !L->post_norm.data || !L->gate_w.data || !L->up_w.data ||
+    if (!L->inp_norm.data || !L->post_norm.data || !L->gate_w.data || !L->up_w.data ||
         !L->down_w.data) {
       SGL_ERROR("layer %d weights missing", l);
       sgl_llama_free(m);
       return NULL;
+    }
+    /* G9 linear_attention 层：gated deltanet 权重（名字与 HF Qwen3Next 检查点对齐）*/
+    if (m->layer_kind && m->layer_kind[l] == 2) {
+      int keyd = m->lin_nk * m->lin_kd, vald = m->lin_nh * m->lin_vd;
+      int convd = 2 * keyd + vald;
+      snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkvz.weight", l);
+      L->lin_qkvz_w = sgl_st_get(m->st, name, 2, (int64_t[]){2 * keyd + 2 * vald, E});
+      snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_ba.weight", l);
+      L->lin_ba_w = sgl_st_get(m->st, name, 2, (int64_t[]){2 * m->lin_nh, E});
+      snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", l);
+      L->lin_conv_w = sgl_st_get(m->st, name, 3, (int64_t[]){convd, 1, m->lin_conv});
+      if (!L->lin_conv_w.data) /* 允许 2D [convd,K] 简化布局 */
+        L->lin_conv_w = sgl_st_get(m->st, name, 2, (int64_t[]){convd, m->lin_conv});
+      snprintf(name, sizeof(name), "model.layers.%d.linear_attn.norm.weight", l);
+      L->lin_norm_w = sgl_st_get(m->st, name, 1, (int64_t[]){m->lin_vd});
+      snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", l);
+      L->lin_out_w = sgl_st_get(m->st, name, 2, (int64_t[]){E, vald});
+      sgl_tensor alog, dtb;
+      snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", l);
+      alog = sgl_st_get(m->st, name, 1, (int64_t[]){m->lin_nh});
+      snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", l);
+      dtb = sgl_st_get(m->st, name, 1, (int64_t[]){m->lin_nh});
+      if (alog.data) {
+        L->lin_a_log = (float *)sgl_xmalloc(sizeof(float) * (size_t)m->lin_nh);
+        memcpy(L->lin_a_log, alog.data, sizeof(float) * (size_t)m->lin_nh);
+      }
+      if (dtb.data) {
+        L->lin_dt_bias = (float *)sgl_xmalloc(sizeof(float) * (size_t)m->lin_nh);
+        memcpy(L->lin_dt_bias, dtb.data, sizeof(float) * (size_t)m->lin_nh);
+      }
+      if (!L->lin_qkvz_w.data || !L->lin_ba_w.data || !L->lin_conv_w.data ||
+          !L->lin_norm_w.data || !L->lin_out_w.data || !L->lin_a_log || !L->lin_dt_bias) {
+        SGL_ERROR("layer %d linear_attn weights missing", l);
+        sgl_llama_free(m);
+        return NULL;
+      }
+      L->lin_idx = m->n_lin++;
+    } else {
+      /* full/sliding：标准注意力权重必备 */
+      if (!L->q_w.data || !L->k_w.data || !L->v_w.data || !L->o_w.data) {
+        SGL_ERROR("layer %d weights missing", l);
+        sgl_llama_free(m);
+        return NULL;
+      }
     }
   }
 
@@ -336,6 +445,32 @@ sgl_llama *sgl_llama_load(const char *dir) {
   for (int i = 0; i < m->n_pool; i++) m->free_pages[i] = m->n_pool - 1 - i;
   m->n_free = m->n_pool;
 
+  /* G9: linear attention 递归状态池（按序列首 KV 页归属；CPU 参考路径，槽位有限）*/
+  if (m->n_lin > 0) {
+    int keyd = m->lin_nk * m->lin_kd, vald = m->lin_nh * m->lin_vd;
+    int convd = 2 * keyd + vald;
+    m->n_lin_slots = 64;
+    { const char *e = getenv("SGL_LIN_SLOTS"); if (e && atoi(e) > 0) m->n_lin_slots = atoi(e); }
+    size_t sh = (size_t)m->lin_nh * m->lin_kd * m->lin_vd;          /* 每层每槽状态元素 */
+    size_t hh = (size_t)convd * (m->lin_conv > 1 ? m->lin_conv - 1 : 0); /* conv 历史 */
+    m->lin_state = (float *)sgl_xcalloc((size_t)m->n_lin * m->n_lin_slots, sh * sizeof(float));
+    m->lin_hist = (float *)sgl_xcalloc((size_t)m->n_lin * m->n_lin_slots, hh ? hh * sizeof(float) : 1);
+    m->lin_owner = (int *)sgl_xmalloc(sizeof(int) * (size_t)m->n_lin_slots);
+    m->lin_pos = (int *)sgl_xmalloc(sizeof(int) * (size_t)m->n_lin * m->n_lin_slots);
+    m->lin_free = (int *)sgl_xmalloc(sizeof(int) * (size_t)m->n_lin_slots);
+    for (int i = 0; i < m->n_lin_slots; i++) { m->lin_owner[i] = -1; m->lin_free[i] = m->n_lin_slots - 1 - i; }
+    for (size_t i = 0; i < (size_t)m->n_lin * m->n_lin_slots; i++) m->lin_pos[i] = -1;
+    m->lin_nfree = m->n_lin_slots;
+    m->ls_qkvz = (float *)sgl_xmalloc(sizeof(float) * (size_t)(2 * keyd + 2 * vald));
+    m->ls_ba = (float *)sgl_xmalloc(sizeof(float) * (size_t)(2 * m->lin_nh));
+    m->ls_conv = (float *)sgl_xmalloc(sizeof(float) * (size_t)convd);
+    m->ls_o = (float *)sgl_xmalloc(sizeof(float) * (size_t)vald);
+    m->ls_qn = (float *)sgl_xmalloc(sizeof(float) * (size_t)keyd);
+    m->ls_kn = (float *)sgl_xmalloc(sizeof(float) * (size_t)keyd);
+    SGL_INFO("G9: %d linear_attention layers, %d recurrent state slots (nh=%d nk=%d kd=%d vd=%d conv=%d)",
+             m->n_lin, m->n_lin_slots, m->lin_nh, m->lin_nk, m->lin_kd, m->lin_vd, m->lin_conv);
+  }
+
   /* W8: quantize all projection weights after load (env SGL_W8=1) */
   {
     const char *env = getenv("SGL_W8");
@@ -344,6 +479,7 @@ sgl_llama *sgl_llama_load(const char *dir) {
       clock_t tq = clock();
       for (int l = 0; l < m->n_layer; l++) {
         sgl_llama_layer *Lq = &m->layers[l];
+        if (Lq->lin_idx >= 0) continue; /* G9: linear 层不参与 W8（无 qkv/o 权重）*/
         w8_quant(Lq->q_w.data, &Lq->q8, &Lq->sq8, E, E);
         w8_quant(Lq->k_w.data, &Lq->k8, &Lq->sk8, K, E);
         w8_quant(Lq->v_w.data, &Lq->v8, &Lq->sv8, K, E);
@@ -375,6 +511,7 @@ void sgl_llama_free(sgl_llama *m) {
     sgl_xfree(L->g8); sgl_xfree(L->u8); sgl_xfree(L->d8);
     sgl_xfree(L->sq8); sgl_xfree(L->sk8); sgl_xfree(L->sv8); sgl_xfree(L->so8);
     sgl_xfree(L->sg8); sgl_xfree(L->su8); sgl_xfree(L->sd8);
+    sgl_xfree(L->lin_a_log); sgl_xfree(L->lin_dt_bias); /* G9 */
   }
   sgl_xfree(m->x); sgl_xfree(m->h); sgl_xfree(m->q); sgl_xfree(m->k); sgl_xfree(m->v);
   sgl_xfree(m->attn); sgl_xfree(m->gate); sgl_xfree(m->up); sgl_xfree(m->scores);
@@ -382,6 +519,12 @@ void sgl_llama_free(sgl_llama *m) {
   sgl_xfree(m->kc); sgl_xfree(m->vc);
   sgl_xfree(m->kc8); sgl_xfree(m->vc8); sgl_xfree(m->kcs); sgl_xfree(m->vcs);
   sgl_xfree(m->free_pages); sgl_xfree(m->page_refs);
+  /* G9 */
+  sgl_xfree(m->layer_kind); sgl_xfree(m->layer_invf); sgl_xfree(m->layer_window);
+  sgl_xfree(m->lin_state); sgl_xfree(m->lin_hist);
+  sgl_xfree(m->lin_owner); sgl_xfree(m->lin_pos); sgl_xfree(m->lin_free);
+  sgl_xfree(m->ls_qkvz); sgl_xfree(m->ls_ba); sgl_xfree(m->ls_conv);
+  sgl_xfree(m->ls_o); sgl_xfree(m->ls_qn); sgl_xfree(m->ls_kn);
   sgl_xfree(m->layers);
   sgl_st_close(m->st);
   sgl_xfree(m);
@@ -425,6 +568,153 @@ static void proj_nt(sgl_llama *m, const float *A, const sgl_tensor *W,
   }
 }
 
+/* G9: 每层 rope（预计算逆频率，支持 linear 位置缩放 / 局部-全局基频 / dynamic NTK）。
+ * 公式与 sgl_rope_inplace 同（double pow/cos/sin，float 乘加）：无 scaling 时
+ * 逐位一致，既有 family 测试不受影响。pos 已含 rope_pos_scale。 */
+static void rope_layer(const sgl_llama *m, int l, float *qk, int n_heads, int D, double pos) {
+  int half = D / 2;
+  const double *invf = m->layer_invf + (size_t)l * (size_t)half;
+  for (int h = 0; h < n_heads; h++) {
+    float *head = qk + (size_t)h * D;
+    for (int i = 0; i < half; i++) {
+      double ang = pos * invf[i];
+      float c = (float)cos(ang), s = (float)sin(ang);
+      float a = head[i], b = head[i + half];
+      head[i] = a * c - b * s;
+      head[i + half] = a * s + b * c;
+    }
+  }
+}
+
+/* G9: 取/初始化某序列在 linear 层 ll 的递归状态槽。
+ * 归属键 = 序列首 KV 页号 slot_idx[0]（同一页表内稳定）；位置不连续
+ * （新序列/页被复用）则清零状态。局限：两条序列共享首页（radix 前缀复用）
+ * 会互相踩状态 —— CPU 参考路径限制，见 docs/NOTES_g9.md。 */
+static int lin_slot_get(sgl_llama *m, int ll, int first_page, int pos) {
+  int s = -1;
+  for (int i = 0; i < m->n_lin_slots; i++)
+    if (m->lin_owner[i] == first_page) { s = i; break; }
+  if (s < 0) {
+    if (m->lin_nfree <= 0) {
+      SGL_ERROR("linear attn: no free state slot (SGL_LIN_SLOTS=%d)", m->n_lin_slots);
+      return -1;
+    }
+    s = m->lin_free[--m->lin_nfree];
+    m->lin_owner[s] = first_page;
+  }
+  /* lin_pos 按（层，槽）记录：同一序列在多个 linear 层共享槽号但各自独立推进 */
+  int *lp = &m->lin_pos[(size_t)ll * m->n_lin_slots + s];
+  if (*lp != pos) {
+    int keyd = m->lin_nk * m->lin_kd, vald = m->lin_nh * m->lin_vd;
+    size_t sh = (size_t)m->lin_nh * m->lin_kd * m->lin_vd;
+    size_t hh = (size_t)(2 * keyd + vald) * (m->lin_conv > 1 ? m->lin_conv - 1 : 0);
+    *lp = pos;
+    memset(m->lin_state + ((size_t)ll * m->n_lin_slots + s) * sh, 0, sh * sizeof(float));
+    if (hh) memset(m->lin_hist + ((size_t)ll * m->n_lin_slots + s) * hh, 0, hh * sizeof(float));
+  }
+  return s;
+}
+
+/* G9 qwen3-next linear_attention 层单 token 步进：按 HF transformers
+ * modeling_qwen3_next.py 的 Qwen3NextGatedDeltaNet 公式实现：
+ *   1) in_proj_qkvz / in_proj_ba（按 k-head 组交错 [q|k|v|z]、[b|a]）；
+ *   2) 因果 depthwise conv1d（核 K，零历史）+ SiLU；
+ *   3) beta=sigmoid(b)，g=-exp(A_log)*softplus(a+dt_bias)；
+ *   4) q/k l2norm（FLA 式 x/sqrt(sum x^2 + 1e-6)），q 再除 sqrt(kd)；
+ *   5) 递归：S*=exp(g); delta=(v-S^T k)*beta; S+=k⊗delta; out=S^T q；
+ *   6) gated RMSNorm（先 norm 后 *silu(z)，eps=rms_norm_eps）；out_proj。
+ * 与真实模型的差距：未实现 full 层的 q-gate/partial rope/(1+w) norm/MoE（只按
+ * layer_types 分支）；状态按序列首页归属（不支持前缀共享）。 */
+static int lin_attn_step(sgl_llama *m, const sgl_llama_layer *L, const float *hrow,
+                         int first_page, int pos, float *orow) {
+  int nk = m->lin_nk, nh = m->lin_nh, kd = m->lin_kd, vd = m->lin_vd;
+  int K = m->lin_conv, ratio = m->lin_ratio;
+  int keyd = nk * kd, vald = nh * vd, convd = 2 * keyd + vald;
+  int ll = L->lin_idx;
+  int slot = lin_slot_get(m, ll, first_page, pos);
+  if (slot < 0) return -1;
+  /* 1) 投影 */
+  sgl_matmul_nt(hrow, L->lin_qkvz_w.data, NULL, m->ls_qkvz, 1, 2 * keyd + 2 * vald, m->n_embd);
+  sgl_matmul_nt(hrow, L->lin_ba_w.data, NULL, m->ls_ba, 1, 2 * nh, m->n_embd);
+  /* 2) 拼 mixed_qkv [q|k|v]（conv 在非交错布局上操作，同 HF）*/
+  int gw = 2 * kd + 2 * ratio * vd; /* 每 k-head 组宽 */
+  for (int g = 0; g < nk; g++) {
+    const float *base = m->ls_qkvz + (size_t)g * gw;
+    memcpy(m->ls_conv + (size_t)g * kd, base, sizeof(float) * kd);
+    memcpy(m->ls_conv + keyd + (size_t)g * kd, base + kd, sizeof(float) * kd);
+    memcpy(m->ls_conv + 2 * keyd + (size_t)g * ratio * vd, base + 2 * kd,
+           sizeof(float) * (ratio * vd));
+  }
+  /* 3) 因果 depthwise conv + SiLU */
+  float *hist = m->lin_hist + ((size_t)ll * m->n_lin_slots + slot) * convd * (K > 1 ? K - 1 : 0);
+  const float *cw = L->lin_conv_w.data; /* [convd, K] */
+  for (int c = 0; c < convd; c++) {
+    float x = m->ls_conv[c];
+    const float *wc = cw + (size_t)c * K;
+    float acc = wc[K - 1] * x;
+    for (int j = 0; j < K - 1; j++) acc += wc[j] * hist[(size_t)c * (K - 1) + j];
+    for (int j = 0; j + 1 < K - 1; j++) hist[(size_t)c * (K - 1) + j] = hist[(size_t)c * (K - 1) + j + 1];
+    if (K > 1) hist[(size_t)c * (K - 1) + K - 2] = x;
+    m->ls_conv[c] = acc / (1.0f + expf(-acc));
+  }
+  /* 4) l2norm q/k（每 k-head 一次；v-head 通过 h/ratio 复用，同 repeat_interleave）*/
+  const float *qc = m->ls_conv, *kc = m->ls_conv + keyd, *vc = m->ls_conv + 2 * keyd;
+  float inv_sqrt_kd = 1.0f / sqrtf((float)kd);
+  for (int g = 0; g < nk; g++) {
+    float ss = 0; const float *src = qc + (size_t)g * kd; float *dst = m->ls_qn + (size_t)g * kd;
+    for (int d = 0; d < kd; d++) ss += src[d] * src[d];
+    float inv = 1.0f / sqrtf(ss + 1e-6f);
+    for (int d = 0; d < kd; d++) dst[d] = src[d] * inv * inv_sqrt_kd;
+    ss = 0; src = kc + (size_t)g * kd; dst = m->ls_kn + (size_t)g * kd;
+    for (int d = 0; d < kd; d++) ss += src[d] * src[d];
+    inv = 1.0f / sqrtf(ss + 1e-6f);
+    for (int d = 0; d < kd; d++) dst[d] = src[d] * inv;
+  }
+  /* 5) 每 v-head 递归状态更新 */
+  float *S = m->lin_state + ((size_t)ll * m->n_lin_slots + slot) * (size_t)nh * kd * vd;
+  float *out = m->ls_o;
+  int gw2 = 2 * ratio;
+  for (int h = 0; h < nh; h++) {
+    const float *qh = m->ls_qn + (size_t)(h / ratio) * kd;
+    const float *kh = m->ls_kn + (size_t)(h / ratio) * kd;
+    const float *vh = vc + (size_t)h * vd;
+    float *Sh = S + (size_t)h * kd * vd;
+    int ba_off = (size_t)(h / ratio) * gw2 + (h % ratio);
+    float bval = m->ls_ba[ba_off], aval = m->ls_ba[ba_off + ratio];
+    float beta = 1.0f / (1.0f + expf(-bval));
+    float ax = aval + L->lin_dt_bias[h];
+    float sp = ax > 20.0f ? ax : log1pf(expf(ax));
+    float alpha = expf(-expf(L->lin_a_log[h]) * sp);
+    for (size_t e = 0; e < (size_t)kd * vd; e++) Sh[e] *= alpha;
+    float *oh = out + (size_t)h * vd;
+    for (int d = 0; d < vd; d++) {
+      float mem = 0;
+      for (int i = 0; i < kd; i++) mem += Sh[(size_t)i * vd + d] * kh[i];
+      float delta = (vh[d] - mem) * beta;
+      for (int i = 0; i < kd; i++) Sh[(size_t)i * vd + d] += kh[i] * delta;
+      float o = 0;
+      for (int i = 0; i < kd; i++) o += Sh[(size_t)i * vd + d] * qh[i];
+      oh[d] = o;
+    }
+  }
+  /* 6) gated RMSNorm（先 norm 后 * silu(z)）*/
+  for (int h = 0; h < nh; h++) {
+    float *oh = out + (size_t)h * vd;
+    double ss = 0;
+    for (int d = 0; d < vd; d++) ss += (double)oh[d] * oh[d];
+    float inv = (float)(1.0 / sqrt(ss / vd + (double)m->rms_eps));
+    const float *zh = m->ls_qkvz + (size_t)(h / ratio) * gw + 2 * kd + (size_t)(ratio * vd) + (size_t)(h % ratio) * vd;
+    for (int d = 0; d < vd; d++) {
+      float zg = zh[d];
+      oh[d] = oh[d] * inv * L->lin_norm_w.data[d] * (zg / (1.0f + expf(-zg)));
+    }
+  }
+  /* 7) out_proj */
+  sgl_matmul_nt(out, L->lin_out_w.data, NULL, orow, 1, m->n_embd, vald);
+  m->lin_pos[(size_t)ll * m->n_lin_slots + slot] = pos + 1;
+  return 0;
+}
+
 /* 共享实现：logits_rows==0 时只在 logits_out 返回末位分布（旧语义）；
  * logits_rows==n 时在 logits_all 返回全部 n 位分布（sgl_llama_forward_n）。 */
 static int llama_forward_emb_impl(sgl_llama *m, const int *tokens, const float *emb,
@@ -458,12 +748,26 @@ static int llama_forward_emb_impl(sgl_llama *m, const int *tokens, const float *
     memcpy(m->x, emb, sizeof(float) * (size_t)n * E);
   else
     sgl_embedding_get(m->wte.data, tokens, n, E, m->x);
+  if (m->emb_softcap > 0) /* G9 gemma-3: emb = cap*tanh(emb/cap)，在 sqrt(E) scale 前 */
+    for (size_t i = 0; i < (size_t)n * E; i++)
+      m->x[i] = m->emb_softcap * tanhf(m->x[i] / m->emb_softcap);
   if (m->gemma_scale > 0) /* t9 gemma: x *= sqrt(E) after embedding */
     for (size_t i = 0; i < (size_t)n * E; i++) m->x[i] *= m->gemma_scale;
 
   for (int l = 0; l < m->n_layer; l++) {
     sgl_llama_layer *L = &m->layers[l];
     sgl_rmsnorm(m->x, L->inp_norm.data, m->h, n, E, m->rms_eps);
+    if (L->lin_idx >= 0) {
+      /* G9 linear_attention：无 KV 页，逐 token 递归（串行）；out_proj 写回 h 行 t
+       * 时 h 行已被投影消费，不别名冲突（matmul 输入是 ls_o）。 */
+      for (int t = 0; t < n; t++) {
+        if (lin_attn_step(m, L, m->h + (size_t)t * E, slot_idx[0], pos0 + t,
+                          m->h + (size_t)t * E) != 0)
+          return -1;
+        for (int e = 0; e < E; e++)
+          m->x[(size_t)t * E + e] += m->h[(size_t)t * E + e];
+      }
+    } else {
     proj_nt(m, m->h, &L->q_w, L->q8, L->sq8, L->q_b.data, m->q, n, m->q_dim, E);
     proj_nt(m, m->h, &L->k_w, L->k8, L->sk8, L->k_b.data, m->k, n, m->kv_dim, E);
     proj_nt(m, m->h, &L->v_w, L->v8, L->sv8, L->v_b.data, m->v, n, m->kv_dim, E);
@@ -478,10 +782,11 @@ static int llama_forward_emb_impl(sgl_llama *m, const int *tokens, const float *
         for (int hk = 0; hk < HK; hk++)
           sgl_rmsnorm(m->k + (size_t)t * m->kv_dim + hk * D, L->k_norm.data,
                       m->k + (size_t)t * m->kv_dim + hk * D, 1, D, 1e-6f);
-    /* rope: per-token position (rows of the same token share pos0+t) */
+    /* rope: per-token position (rows of the same token share pos0+t)；G9 每层预计算逆频率 */
     for (int t = 0; t < n; t++) {
-      sgl_rope_inplace(m->q + (size_t)t * m->q_dim, H, D, pos0 + t, m->rope_theta);
-      sgl_rope_inplace(m->k + (size_t)t * m->kv_dim, HK, D, pos0 + t, m->rope_theta);
+      double pos = (double)(pos0 + t) * m->rope_pos_scale;
+      rope_layer(m, l, m->q + (size_t)t * m->q_dim, H, D, pos);
+      rope_layer(m, l, m->k + (size_t)t * m->kv_dim, HK, D, pos);
     }
 
     /* write KV via page table (kv8: per-page quantize) */
@@ -528,8 +833,9 @@ static int llama_forward_emb_impl(sgl_llama *m, const int *tokens, const float *
           const float *qh = qrow + h * D;
           size_t hoff = (size_t)(h / (H / HK)) * D;
           int upto = pos0 + t + 1;
-          /* t9 mistral: sliding window — only p in [pos-win+1, pos] */
-          int from = m->sliding_window > 0 && upto > m->sliding_window ? upto - m->sliding_window : 0;
+          /* t9 mistral / G9 layer_types: sliding 层窗口（每层 layer_window[l]，0=关）*/
+          int win = m->layer_window[l];
+          int from = win > 0 && upto > win ? upto - win : 0;
           float maxv = -1e30f;
           for (int p = from; p < upto; p++) {
             int pg = slot_idx[p];
@@ -572,6 +878,7 @@ static int llama_forward_emb_impl(sgl_llama *m, const int *tokens, const float *
     for (int t = 0; t < n; t++)
       for (int k = 0; k < E; k++)
         m->x[(size_t)t * E + k] += m->h[(size_t)t * E + k];
+    } /* end else (full/sliding attention branch) */
 
     /* SwiGLU MLP */
     sgl_rmsnorm(m->x, L->post_norm.data, m->h, n, E, m->rms_eps);
@@ -627,12 +934,25 @@ int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx
   }
 
   sgl_embedding_get(m->wte.data, tokens, B, E, m->x);
+  if (m->emb_softcap > 0) /* G9 gemma-3 embedding softcap */
+    for (size_t i = 0; i < (size_t)B * E; i++)
+      m->x[i] = m->emb_softcap * tanhf(m->x[i] / m->emb_softcap);
   if (m->gemma_scale > 0)
     for (size_t i = 0; i < (size_t)B * E; i++) m->x[i] *= m->gemma_scale;
 
   for (int l = 0; l < m->n_layer; l++) {
     sgl_llama_layer *L = &m->layers[l];
     sgl_rmsnorm(m->x, L->inp_norm.data, m->h, B, E, m->rms_eps);
+    if (L->lin_idx >= 0) {
+      /* G9 linear_attention：每序列单 token 递归（按各自首页归属状态）*/
+      for (int b = 0; b < B; b++) {
+        if (lin_attn_step(m, L, m->h + (size_t)b * E, slot_idx[b][0], seq_lens[b],
+                          m->h + (size_t)b * E) != 0)
+          return -1;
+        for (int e = 0; e < E; e++)
+          m->x[(size_t)b * E + e] += m->h[(size_t)b * E + e];
+      }
+    } else {
     proj_nt(m, m->h, &L->q_w, L->q8, L->sq8, L->q_b.data, m->q, B, m->q_dim, E);
     proj_nt(m, m->h, &L->k_w, L->k8, L->sk8, L->k_b.data, m->k, B, m->kv_dim, E);
     proj_nt(m, m->h, &L->v_w, L->v8, L->sv8, L->v_b.data, m->v, B, m->kv_dim, E);
@@ -648,10 +968,12 @@ int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx
                       m->k + (size_t)b * m->kv_dim + hk * D, 1, D, 1e-6f);
     /* rope at each sequence's own position (heads = H/HK: the op rotates
      * n head rows at one pos — passing 1 left heads 1..H-1 un-rotated,
-     * which diverged decode_batch from single-stream on the 2nd token) */
+     * which diverged decode_batch from single-stream on the 2nd token)；
+     * G9：与单流同用每层预计算逆频率 */
     for (int b = 0; b < B; b++) {
-      sgl_rope_inplace(m->q + (size_t)b * m->q_dim, H, D, seq_lens[b], m->rope_theta);
-      sgl_rope_inplace(m->k + (size_t)b * m->kv_dim, HK, D, seq_lens[b], m->rope_theta);
+      double pos = (double)seq_lens[b] * m->rope_pos_scale;
+      rope_layer(m, l, m->q + (size_t)b * m->q_dim, H, D, pos);
+      rope_layer(m, l, m->k + (size_t)b * m->kv_dim, HK, D, pos);
     }
 
     if (m->kv8) {
@@ -696,8 +1018,9 @@ int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx
         size_t hoff = (size_t)(h / (H / HK)) * D;
         const int *idx = slot_idx[b];
         int upto = seq_lens[b] + 1;
-        /* t9 mistral: sliding window */
-        int from = m->sliding_window > 0 && upto > m->sliding_window ? upto - m->sliding_window : 0;
+        /* t9 mistral / G9 layer_types: 每层窗口 */
+        int win = m->layer_window[l];
+        int from = win > 0 && upto > win ? upto - win : 0;
         float maxv = -1e30f;
         for (int p = from; p < upto; p++) {
           int pg = idx[p];
@@ -739,6 +1062,7 @@ int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx
     for (int b = 0; b < B; b++)
       for (int k = 0; k < E; k++)
         m->x[(size_t)b * E + k] += m->h[(size_t)b * E + k];
+    } /* end else (full/sliding attention branch) */
 
     sgl_rmsnorm(m->x, L->post_norm.data, m->h, B, E, m->rms_eps);
     proj_nt(m, m->h, &L->gate_w, L->g8, L->sg8, NULL, m->gate, B, m->n_inter, E);

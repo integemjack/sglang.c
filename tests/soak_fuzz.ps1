@@ -1,4 +1,4 @@
-param([int]$Port = 30002, [int]$Rounds = 40, [switch]$SkipEnvDependent)
+﻿param([int]$Port = 30002, [int]$Rounds = 40, [switch]$SkipEnvDependent)
 # -SkipEnvDependent: 本机 winsock 对无 body 请求/大响应间歇卡（CPU/GPU 两实现同现象，
 # 见 NOTES_t11.md）；跳过 health/concurrent/huge 三项（生成路径已由 soak+fuzz 其余项覆盖）
 # t11: soak + fuzz + graceful degradation for cuda_http

@@ -1,4 +1,4 @@
-/* test_spec.c — speculative decoding 验证
+﻿/* test_spec.c — speculative decoding 验证
  * 不变量：greedy 下 spec（draft+target）输出与 target-only greedy 逐 token 全等
  * （每步最终 token 都是 target argmax 的数学保证）。另报接受率与加速。 */
 #define _CRT_SECURE_NO_WARNINGS

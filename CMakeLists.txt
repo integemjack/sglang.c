@@ -26,7 +26,9 @@ if(MSVC)
   list(REMOVE_ITEM SGL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/http.c)
 endif()
 add_library(sgl STATIC ${SGL_SOURCES})
-target_include_directories(sgl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# third_party/stb：图片解码（G8，single-header，MIT）
+target_include_directories(sgl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
 
 # OpenMP：不用 find_package 的导入目标（它会写死 libgomp.dll.a 绝对路径，
 # 绕过 -static），改由 gcc 驱动链接，-static 下自动选静态 libgomp。
@@ -118,7 +120,7 @@ foreach(t ${SGL_TESTS})
   add_executable(${name} ${t})
   target_link_libraries(${name} PRIVATE sgl)
   add_test(NAME ${name} COMMAND ${name})
-  set_tests_properties(${name} PROPERTIES ENVIRONMENT "SGL_TEST_MODEL=${SGL_MODELS_DIR}/gpt2;SGL_TEST_LLAMA=${SGL_MODELS_DIR}/tiny-llama;SGL_TEST_LLAMA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_tinyllama.json;SGL_TEST_TINYLLAMA=${SGL_MODELS_DIR}/tinyllama;SGL_TEST_QWEN=${SGL_MODELS_DIR}/qwen05;SGL_TEST_LORA=${SGL_MODELS_DIR}/test-lora;SGL_TEST_LORA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora.json;SGL_TEST_LORA_S1=${SGL_MODELS_DIR}/test-lora-s1;SGL_TEST_LORA_S2=${SGL_MODELS_DIR}/test-lora-s2;SGL_TEST_LORA_REF_S1=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s1.json;SGL_TEST_LORA_REF_S2=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s2.json;SGL_TEST_LLAVA=${SGL_MODELS_DIR}/llava-rand")
+  set_tests_properties(${name} PROPERTIES ENVIRONMENT "SGL_TEST_MODEL=${SGL_MODELS_DIR}/gpt2;SGL_TEST_LLAMA=${SGL_MODELS_DIR}/tiny-llama;SGL_TEST_LLAMA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_tinyllama.json;SGL_TEST_TINYLLAMA=${SGL_MODELS_DIR}/tinyllama;SGL_TEST_QWEN=${SGL_MODELS_DIR}/qwen05;SGL_TEST_LORA=${SGL_MODELS_DIR}/test-lora;SGL_TEST_LORA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora.json;SGL_TEST_LORA_S1=${SGL_MODELS_DIR}/test-lora-s1;SGL_TEST_LORA_S2=${SGL_MODELS_DIR}/test-lora-s2;SGL_TEST_LORA_REF_S1=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s1.json;SGL_TEST_LORA_REF_S2=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s2.json;SGL_TEST_LLAVA=${SGL_MODELS_DIR}/llava-rand;SGL_TEST_CLIP_REAL=${SGL_MODELS_DIR}/clip-vit-base-patch32")
 endforeach()
 
 # ---- t10 llava 多模态：给 glob 生成的 test_llava 指定模型目录（存在才设）----
@@ -127,8 +129,16 @@ if(EXISTS ${SGL_MODELS_DIR}/llava-rand/clip_model.safetensors AND EXISTS ${SGL_M
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 endif()
 
-# ---- t9 模型族对照（models/ 下存在对应（生成或下载的）目录时才注册，防 fresh-clone 红）----
-foreach(fam mistral gemma qwen3)
+# ---- G8 真实 CLIP 权重分层对照（下载 + 跑 tests/clip_real_ref.py 后才注册，防 fresh-clone 红）----
+if(EXISTS ${SGL_MODELS_DIR}/clip-vit-base-patch32/model.safetensors AND
+   EXISTS ${SGL_MODELS_DIR}/clip-vit-base-patch32/ref/pv.npy)
+  set_tests_properties(test_clip_real PROPERTIES DEPENDS test_llava
+    ENVIRONMENT "SGL_TEST_CLIP_REAL=${SGL_MODELS_DIR}/clip-vit-base-patch32")
+endif()
+
+# ---- t9/G9 模型族对照（models/ 下存在对应（生成或下载的）目录时才注册，防 fresh-clone 红）----
+# G9 新增 gemma2（dynamic NTK rope 变体）/ qwen3next（layer_types 混合 linear_attention）
+foreach(fam mistral gemma gemma2 qwen3 qwen3next)
   if(EXISTS ${SGL_MODELS_DIR}/${fam}-rand/model.safetensors OR EXISTS ${SGL_MODELS_DIR}/qwen3-06/model.safetensors)
     if(fam STREQUAL "qwen3")
       set(_d ${SGL_MODELS_DIR}/qwen3-06)
@@ -193,7 +203,8 @@ if(SGL_CUDA)
       src/alloc.c src/log.c src/json.c src/tensor.c src/safetensors.c
       src/bpe.c src/ops.c src/quant.c src/llama.c src/gpt2.c src/sampling.c src/clip.c)
   add_library(sgl_cuda STATIC ${SGL_CORE_SRC} ${SGL_CUDA_OBJ})
-  target_include_directories(sgl_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_include_directories(sgl_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb) # G8: image.c 在 SGL_CORE_SRC 里，stb 头要能找到
   if(MSVC)
     # /utf-8 只给 C 源（nvcc 不认该旗标；.cu 已纯 ASCII，头文件带 BOM）
     target_compile_options(sgl_cuda PUBLIC /O2 "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>")
@@ -205,10 +216,12 @@ if(SGL_CUDA)
   target_link_libraries(cuda_cli PRIVATE sgl_cuda)
   add_executable(long_vcpu tests/long_vcpu.c)  # t2 acceptance: 8K prefill GPU vs CPU
   target_link_libraries(long_vcpu PRIVATE sgl_cuda)
+  add_executable(cuda_perf tests/cuda_perf.c)  # G1/G2/G3 perf A/B (no assertions)
+  target_link_libraries(cuda_perf PRIVATE sgl_cuda)
   add_executable(cuda_http apps/cuda_http.c)
   target_link_libraries(cuda_http PRIVATE sgl_cuda ws2_32)
   if(MSVC)
-    foreach(t cuda_test cuda_cli long_vcpu cuda_http)
+    foreach(t cuda_test cuda_cli long_vcpu cuda_perf cuda_http)
       target_link_libraries(${t} PRIVATE
           "${CUDA_TOOLKIT_DIR}/lib/x64/cudart_static.lib"
           "${CUDA_TOOLKIT_DIR}/lib/x64/cublas.lib")

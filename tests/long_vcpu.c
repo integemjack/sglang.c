@@ -1,4 +1,4 @@
-/* _long_vcpu.c — t2 验收：8K-token 重复文本 prompt，GPU forward_seg prefill
+﻿/* _long_vcpu.c — t2 验收：8K-token 重复文本 prompt，GPU forward_seg prefill
  * logits vs CPU sgl_llama_forward 同 ids 的 maxerr（要求 < 1e-3）。
  * 一次性验收工具（不进 ctest）：CPU 8K prefill 需数分钟。 */
 #define _CRT_SECURE_NO_WARNINGS

@@ -1,4 +1,4 @@
-/* test_json.c — JSON 解析器测试 */
+﻿/* test_json.c — JSON 解析器测试 */
 #include <math.h>
 #include <stdio.h>
 #include <string.h>

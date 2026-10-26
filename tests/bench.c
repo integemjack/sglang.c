@@ -1,4 +1,4 @@
-/* bench.c — GEMM/点积基准（M14 SIMD 前后对比用；不进 ctest 断言，只打印）*/
+﻿/* bench.c — GEMM/点积基准（M14 SIMD 前后对比用；不进 ctest 断言，只打印）*/
 #define _CRT_SECURE_NO_WARNINGS
 #include <math.h>
 #include <stdio.h>

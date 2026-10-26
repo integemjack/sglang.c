@@ -1,4 +1,4 @@
-/* test_radix.c — RadixCache 前缀复用测试
+﻿/* test_radix.c — RadixCache 前缀复用测试
  * 验证（全部与冷启动参考对照，greedy）：
  *   1. 同 prompt 第二次：hit = prompt 长度，输出与第一次完全一致
  *   2. 前缀扩展 prompt（共享前缀）：hit = 共享长度，输出与冷参考一致

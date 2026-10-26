@@ -31,4 +31,9 @@ int sgl_model_prefill(sgl_model *m, const int *tokens, int n, int pos0,
 int sgl_model_decode_batch(sgl_model *m, const int *tokens, int *const *idx,
                            const int *seq_lens, int B, float *logits_out);
 
+/* G8 多模态：emb 版 prefill（[n][E_lm] 直接进模型，页表语义同 sgl_model_prefill）。
+ * 只有 llama 后端支持；gpt2 返回 -1。 */
+int sgl_model_prefill_emb(sgl_model *m, const float *emb, int n, int pos0,
+                          const int *idx, float *logits_out);
+
 #endif

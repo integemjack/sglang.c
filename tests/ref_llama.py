@@ -47,6 +47,36 @@ IS_QWEN = "model.layers.0.self_attn.q_proj.bias" in W or \
     any(".q_norm.weight" in k for k in W)
 eps = cfg["rms_norm_eps"]
 theta = cfg.get("rope_theta", 10000.0)
+# G9 gemma-3: embedding tanh 软上限（在 sqrt(E) scale 前）
+SOFTCAP = float(cfg.get("hidden_softcap", 0) or 0)
+# G9: rope_scaling（linear：角度除以 factor；dynamic：NTK 基频缩放 theta*factor^(D/(D-2))）
+#     + layer_types（sliding_attention 层用 rope_local_base_freq，其余用
+#       rope_scaling.global_base_freq；无 layer_types 时保持旧行为：全局 sliding_window）
+RS = cfg.get("rope_scaling") or {}
+RTYPE = RS.get("rope_type", "default")
+RFACTOR = float(RS.get("factor", 1.0) or 1.0)
+POS_SCALE = 1.0 / RFACTOR if RTYPE == "linear" else 1.0
+LOCAL_BASE = float(cfg.get("rope_local_base_freq", 0) or 0)
+GLOBAL_BASE = float(RS.get("global_base_freq", 0) or 0)
+LAYER_TYPES = cfg.get("layer_types") or None
+
+
+def layer_rope(l):
+    """G9：第 l 层的 (rope 基频, sliding 窗口)。无 layer_types 时同旧行为。"""
+    if LAYER_TYPES:
+        t = LAYER_TYPES[l]
+        kind = "sliding" if t == "sliding_attention" else "full"
+    else:
+        kind = "sliding" if cfg.get("sliding_window") else "full"
+    base = theta
+    if LAYER_TYPES and kind == "sliding" and LOCAL_BASE > 0:
+        base = LOCAL_BASE
+    elif LAYER_TYPES and kind == "full" and GLOBAL_BASE > 0:
+        base = GLOBAL_BASE
+    if RTYPE == "dynamic":
+        base = base * RFACTOR ** (Dh / (Dh - 2))
+    win = (cfg.get("sliding_window") or 0) if kind == "sliding" else 0
+    return base, win
 
 
 def f32(a):
@@ -57,11 +87,13 @@ def rms(x, w):
     return x / np.sqrt((x * x).mean(-1, keepdims=True) + eps) * w
 
 
-def rope(x, pos):  # x: [n, heads, Dh]
+def rope(x, pos, base=None):  # x: [n, heads, Dh]；G9：基频/位置缩放可按层不传 base 用全局 theta
     half = Dh // 2
-    inv = theta ** (-np.arange(0, half, dtype=np.float32) * 2 / Dh)
-    ang = np.arange(pos, pos + x.shape[0], dtype=np.float32)[:, None] * inv[None, :]  # [n, half]
-    cos, sin = np.cos(ang)[:, None, :], np.sin(ang)[:, None, :]  # [n,1,half]
+    if base is None:
+        base = theta
+    inv = base ** (-np.arange(0, half, dtype=np.float64) * 2 / Dh)
+    ang = (np.arange(pos, pos + x.shape[0], dtype=np.float64) * POS_SCALE)[:, None] * inv[None, :]  # [n, half]
+    cos, sin = np.cos(ang).astype(np.float32)[:, None, :], np.sin(ang).astype(np.float32)[:, None, :]  # [n,1,half]
     x0, x1 = x[..., :half], x[..., half:]
     # HF llama: rotate_half: cat(-x1, x0)；q_embed = q*cos + rotate_half(q)*sin
     return np.concatenate([x0 * cos - x1 * sin, x0 * sin + x1 * cos], -1)
@@ -70,16 +102,17 @@ def rope(x, pos):  # x: [n, heads, Dh]
 def forward(ids):
     n = len(ids)
     x = f32(W["model.embed_tokens.weight"][ids])
+    if SOFTCAP:  # G9 gemma-3: emb = cap*tanh(emb/cap)，在 sqrt(E) scale 前
+        x = f32(np.float32(SOFTCAP) * np.tanh(x / np.float32(SOFTCAP)))
     if cfg.get("model_type") == "gemma":  # t9: hidden normalizer
         x = x * np.sqrt(E, dtype=np.float32)
-    mask = np.triu(np.full((n, n), -1e9, dtype=np.float32), 1)
-    # t9 mistral: sliding window banded mask (attend only p in [q-win+1, q])
-    if cfg.get("sliding_window"):
-        win = cfg["sliding_window"]
-        band = np.abs(np.subtract.outer(np.arange(n), np.arange(n))) >= win
-        mask = mask + np.where(band, -1e9, 0).astype(np.float32)
     for l in range(L):
         p = f"model.layers.{l}"
+        base_l, win_l = layer_rope(l)
+        mask = np.triu(np.full((n, n), -1e9, dtype=np.float32), 1)
+        if win_l:  # t9 mistral / G9 sliding 层：带状 mask（attend p in [q-win+1, q]）
+            band = np.abs(np.subtract.outer(np.arange(n), np.arange(n))) >= win_l
+            mask = mask + np.where(band, -1e9, 0).astype(np.float32)
         h = rms(x, f32(W[f"{p}.input_layernorm.weight"]))
         q = h @ f32(W[f"{p}.self_attn.q_proj.weight"]).T
         k = h @ f32(W[f"{p}.self_attn.k_proj.weight"]).T
@@ -96,8 +129,8 @@ def forward(ids):
                 kn = f32(W[f"{p}.self_attn.k_norm.weight"])
                 q = q / np.sqrt((q * q).mean(-1, keepdims=True) + 1e-6) * qn
                 k = k / np.sqrt((k * k).mean(-1, keepdims=True) + 1e-6) * kn
-        q = rope(q, 0)
-        k = rope(k, 0)
+        q = rope(q, 0, base_l)
+        k = rope(k, 0, base_l)
         rep = H // KVH
         k = np.repeat(k, rep, axis=1)
         v = np.repeat(v.reshape(n, KVH, Dh), rep, axis=1)

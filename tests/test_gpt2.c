@@ -1,4 +1,4 @@
-/* test_gpt2.c — GPT-2 前向正确性测试（需要真实权重；没有则 SKIP）
+﻿/* test_gpt2.c — GPT-2 前向正确性测试（需要真实权重；没有则 SKIP）
  * 验证方式与 sglang 的模型 CI 相同：固定输入 → 固定输出 token（greedy）。*/
 #define _CRT_SECURE_NO_WARNINGS
 #include <math.h>

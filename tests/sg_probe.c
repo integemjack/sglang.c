@@ -1,4 +1,4 @@
-/* sg_probe.c - MinGW single-stream forward, print greedy token ids
+﻿/* sg_probe.c - MinGW single-stream forward, print greedy token ids
  * usage: sg_probe.exe <model_dir> "<prompt>" [n] */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>

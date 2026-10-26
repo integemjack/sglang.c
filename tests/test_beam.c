@@ -1,4 +1,4 @@
-/* test_beam.c — beam search 验证
+﻿/* test_beam.c — beam search 验证
  * 核心不变量：beam_width=4 的最优累计 logprob ≥ beam_width=1（=greedy）的
  * logprob —— W=1 恰是 greedy，W=4 的保留集是其超集（每步每 beam 展开的候选
  * 覆盖 greedy 路径），故数学上必然成立。另验输出非空、按 lp 降序。 */

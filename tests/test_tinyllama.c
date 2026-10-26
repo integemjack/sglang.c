@@ -1,4 +1,4 @@
-/* test_tinyllama.c — TinyLlama-1.1B 真实权重端到端生成（走调度器抽象层）
+﻿/* test_tinyllama.c — TinyLlama-1.1B 真实权重端到端生成（走调度器抽象层）
  * 验证：
  *   1. 1.1B F16 权重加载（2.2GB → fp32 计算）
  *   2. 调度器 submit/step/poll 全链路（llama 后端 + 批处理 + radix）

@@ -1,4 +1,4 @@
-/* test_qwen.c — Qwen2.5-0.5B-Instruct chat 端到端（ChatML 模板 + 调度器）
+﻿/* test_qwen.c — Qwen2.5-0.5B-Instruct chat 端到端（ChatML 模板 + 调度器）
  * 验证：bias/QK-Norm 路径的真实推理 + chat 模板渲染 + eos=<|im_end|> 停止 */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>

@@ -21,6 +21,17 @@ typedef struct sgl_http_server sgl_http_server;
 /* 启动服务（acceptor + worker 线程已在跑），失败返回 NULL */
 sgl_http_server *sgl_http_serve(sgl_scheduler *sched, const char *host, int port);
 
+/* ---- G8 多模态入口（CPU 路径）----
+ * 服务端注册一个「图片字节 → LM 空间视觉 token」回调：
+ * /v1/chat/completions 的 content[] 里出现
+ *   {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}
+ * 时，http.c 先 base64 解码，再把图片字节交给回调；回调返
+ * sgl_xmalloc 的 [n_img][E_lm]（所有权转给 http.c，最终交给调度器），*n_img 回填。
+ * 未注册回调时遇到 image_url 直接 400。 */
+typedef float *(*sgl_http_vision_fn)(void *ud, const unsigned char *bytes,
+                                     size_t n, int *n_img, int *e_lm);
+void sgl_http_set_vision(sgl_http_server *srv, sgl_http_vision_fn fn, void *ud);
+
 /* 停止并释放（断开监听，等待线程退出）*/
 void sgl_http_stop(sgl_http_server *srv);
 

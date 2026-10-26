@@ -6,11 +6,15 @@
 #include <time.h>
 
 #include "sgl/bpe.h"
+#include "sgl/clip.h"
 #include "sgl/generate.h"
 #include "sgl/gpt2.h"
+#include "sgl/image.h"
+#include "sgl/json.h"
 #include "sgl/log.h"
 #include "sgl/alloc.h"
 #include "sgl/http.h"
+#include "sgl/safetensors.h"
 #include "sgl/scheduler.h"
 
 typedef struct {
@@ -29,6 +33,76 @@ static double now_sec(void) {
   struct timespec ts;
   timespec_get(&ts, TIME_UTC);
   return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* ---- G8 多模态（--vision <clip 目录> --projector <projector.safetensors>）----
+ * http.c 收到 OpenAI vision 风格的 image_url 后，把图片字节交给这个回调：
+ * 解码 → resize/crop → 归一化 → CLIP 视觉塔 → mm_projector → [n_img][E_lm]。 */
+static sgl_clip *g_clip;
+static float *g_pj_w, *g_pj_b;
+static int g_e_lm;
+
+static float *vision_cb(void *ud, const unsigned char *bytes, size_t n,
+                        int *n_img, int *e_lm) {
+  (void)ud;
+  if (!g_clip || !g_pj_w) return NULL;
+  float *out = NULL;
+  int nn = 0;
+  if (sgl_clip_project_bytes(bytes, n, g_clip, g_pj_w, g_pj_b, g_e_lm, &out, &nn) != 0)
+    return NULL;
+  *n_img = g_clip->n_patch;
+  *e_lm = g_e_lm;
+  return out;
+}
+
+/* 读模型 config.json 的 hidden_size / n_embd（LM embedding 宽）*/
+static int cfg_e_lm(const char *dir) {
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/config.json", dir);
+  FILE *f = NULL;
+  fopen_s(&f, path, "rb");
+  if (!f) return 0;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  char *buf = (char *)sgl_xmalloc((size_t)sz + 1);
+  if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); sgl_xfree(buf); return 0; }
+  buf[sz] = 0;
+  fclose(f);
+  sgl_json *j = sgl_json_parse(buf, (size_t)sz);
+  sgl_xfree(buf);
+  if (!j) return 0;
+  int e = sgl_json_get_int(j, "hidden_size", sgl_json_get_int(j, "n_embd", 0));
+  sgl_json_free(j);
+  return e;
+}
+
+static int vision_load(const char *clip_dir, const char *proj_path, int e_lm) {
+  g_clip = sgl_clip_load(clip_dir);
+  if (!g_clip) return -1;
+  sgl_st_ctx *st = sgl_st_open(proj_path);
+  if (!st) { sgl_clip_free(g_clip); g_clip = NULL; return -1; }
+  sgl_tensor w = sgl_st_get(st, "linear_1.weight", 2, (int64_t[]){e_lm, g_clip->E});
+  sgl_tensor b = sgl_st_get(st, "linear_1.bias", 1, (int64_t[]){e_lm});
+  if (!w.data) {
+    SGL_ERROR("vision: %s 里没 linear_1.weight [%d,%d]", proj_path, e_lm, g_clip->E);
+    sgl_st_close(st);
+    sgl_clip_free(g_clip);
+    g_clip = NULL;
+    return -1;
+  }
+  g_pj_w = (float *)sgl_xmalloc(sizeof(float) * (size_t)e_lm * (size_t)g_clip->E);
+  memcpy(g_pj_w, w.data, sizeof(float) * (size_t)e_lm * (size_t)g_clip->E);
+  if (b.data) {
+    g_pj_b = (float *)sgl_xmalloc(sizeof(float) * (size_t)e_lm);
+    memcpy(g_pj_b, b.data, sizeof(float) * (size_t)e_lm);
+  }
+  sgl_st_close(st);
+  g_e_lm = e_lm;
+  SGL_INFO("vision ready: CLIP E=%d L=%d P=%d img=%d NP=%d quick_gelu=%d, projector [%d,%d]",
+           g_clip->E, g_clip->L, g_clip->P, g_clip->img, g_clip->n_patch,
+           g_clip->act == SGL_CLIP_ACT_QUICK, e_lm, g_clip->E);
+  return 0;
 }
 
 static void usage(const char *prog) {
@@ -66,6 +140,7 @@ static int sched_add_loras(sgl_scheduler *sc, const char *model_dir,
 int main(int argc, char **argv) {
   const char *model_dir = NULL, *prompt = "The meaning of life is";
   const char *host = "127.0.0.1";
+  const char *vision_dir = NULL, *proj_path = NULL; /* G8 */
   int max_new = 32, port = 30000, serve = 0, w8 = 0, kv8 = 0;
   sgl_sampling_params sp = {0.8f, 50, 0.95f, 0};
   lora_spec loras[16];
@@ -73,6 +148,8 @@ int main(int argc, char **argv) {
 
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
+    else if (!strcmp(argv[i], "--vision") && i + 1 < argc) vision_dir = argv[++i];
+    else if (!strcmp(argv[i], "--projector") && i + 1 < argc) proj_path = argv[++i];
     else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
     else if (!strcmp(argv[i], "--max-new") && i + 1 < argc) max_new = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--temperature") && i + 1 < argc) sp.temperature = (float)atof(argv[++i]);
@@ -130,6 +207,20 @@ int main(int argc, char **argv) {
     SGL_INFO("model loaded in %.2fs", now_sec() - t0);
     sgl_http_server *srv = sgl_http_serve(sched, host, port);
     if (!srv) { sgl_sched_free(sched); return 2; }
+    /* G8: 装了视觉塔就注册图片回调（/v1/chat/completions 的 image_url）*/
+    if (vision_dir) {
+      char pj[1024];
+      if (!proj_path) {
+        snprintf(pj, sizeof(pj), "%s/projector.safetensors", vision_dir);
+        proj_path = pj;
+      }
+      int e_lm = cfg_e_lm(model_dir);
+      if (e_lm <= 0 || vision_load(vision_dir, proj_path, e_lm) != 0) {
+        SGL_ERROR("--vision 初始化失败（检查 %s / %s，LM E=%d）", vision_dir, proj_path, e_lm);
+        sgl_http_stop(srv); sgl_sched_free(sched); return 2;
+      }
+      sgl_http_set_vision(srv, vision_cb, NULL);
+    }
     fputs("press Enter to stop...\n", stderr);
     getchar(); /* 简单退出方式：Ctrl+C 或回车 */
     sgl_http_stop(srv);

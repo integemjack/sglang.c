@@ -1,4 +1,4 @@
-/* test_tensor.c — 张量与算子测试 */
+﻿/* test_tensor.c — 张量与算子测试 */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

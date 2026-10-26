@@ -48,6 +48,7 @@ typedef struct request {
   uint64_t rng;
   int seg;             /* kv segment index, -1 until assigned */
   int seg_len;         /* segment capacity in positions */
+  int reached_run;     /* G6: prefill 跑成功过（才能登记前缀租让） */
   float *logits;       /* host buffer vocab floats (last step) */
   int has_logits;
   char *text_out;      /* decoded completion (malloc) */
@@ -77,9 +78,84 @@ typedef struct {
   CONDITION_VARIABLE cv_work;   /* worker waits for requests */
   CONDITION_VARIABLE cv_step;   /* http threads wait for progress */
   volatile int stop;
+  char gpu_err[256];  /* G5: why the GPU engine is unavailable (degraded mode) */
+  int degraded;       /* G5: 1 = serving without GPU; every generate gets 503 */
 } engine;
 
 static engine E;
+
+/* ---- G6: GPU 前缀缓存（段租让） ----
+ * 同一个 system prompt 被多个请求共用时，第二个请求不必重算 prefill：把已经
+ * 算好的前缀 KV 从「租让中」的段拷到自己的段头 len 行，然后从 len 起接着
+ * prefill。租让 = 请求结束后不回收它的 KV 段，留给前缀相同的后续请求；表满
+ * 按 LRU 驱逐（驱逐后那个段才能给别人用）。
+ * 正确性：前缀必须都从位置 0 开始（RoPE 把位置编进了 K），服务端每条序列在
+ * 自己段内 pos0 都从 0 起，成立；搬来的行与重算的行逐位相等（同一套 kernel、
+ * 同样的计算顺序），所以命中与否输出一致（cuda_test [prefix] 逐 token 对拍）。 */
+#define PFX_MAX 16
+#define PFX_MIN 32 /* 短于这个的前缀不值得占一个段 */
+typedef struct {
+  int used;
+  int seg;    /* 租让的 KV 段号（base = seg * seg_len） */
+  int len;    /* 前缀 token 数 */
+  int *toks;  /* 前缀 token 副本（精确比对，不靠 hash 碰运气） */
+  unsigned long long use; /* LRU 时钟 */
+} pfx_slot;
+static pfx_slot g_pfx[PFX_MAX];
+static int g_pfx_of[MAX_CONC];             /* 段 -> 表项下标+1；0 = 未租让 */
+static unsigned long long g_pfx_clock;
+static long g_pfx_hits, g_pfx_hit_rows, g_pfx_leased_rows;
+
+static void pfx_drop(int idx) {
+  if (idx < 0 || idx >= PFX_MAX || !g_pfx[idx].used) return;
+  g_pfx_of[g_pfx[idx].seg] = 0;
+  free(g_pfx[idx].toks);
+  memset(&g_pfx[idx], 0, sizeof(g_pfx[idx]));
+}
+
+/* 最长公共前缀：返回长度（< PFX_MIN 视为没命中），*out_seg 给出来源段 */
+static int pfx_match(const int *toks, int n, int *out_seg) {
+  int best = 0, bseg = -1;
+  for (int i = 0; i < PFX_MAX; i++) {
+    if (!g_pfx[i].used) continue;
+    int m = g_pfx[i].len < n ? g_pfx[i].len : n;
+    int l = 0;
+    while (l < m && g_pfx[i].toks[l] == toks[l]) l++;
+    if (l > best) { best = l; bseg = g_pfx[i].seg; }
+  }
+  if (best < PFX_MIN) { *out_seg = -1; return 0; }
+  *out_seg = bseg;
+  for (int i = 0; i < PFX_MAX; i++)
+    if (g_pfx[i].used && g_pfx[i].seg == bseg) g_pfx[i].use = ++g_pfx_clock;
+  return best;
+}
+
+/* 请求结束后把它的段登记为前缀租让 */
+static void pfx_register(int seg, const int *toks, int len) {
+  if (len < PFX_MIN || seg < 0 || seg >= MAX_CONC) return;
+  int slot = -1, lru = 0;
+  unsigned long long oldest = ~0ull;
+  for (int i = 0; i < PFX_MAX; i++) {
+    if (!g_pfx[i].used) { slot = i; break; }
+    if (g_pfx[i].seg == seg) { slot = i; break; } /* 同段直接覆盖旧登记 */
+    if (g_pfx[i].use < oldest) { oldest = g_pfx[i].use; lru = i; }
+  }
+  if (slot < 0) pfx_drop(lru); /* LRU 驱逐：那个段从此可被复用 */
+  else if (slot < 0 || g_pfx[slot].used) { /* unreachable */ }
+  if (slot < 0) { pfx_drop(lru); slot = lru; }
+  if (g_pfx[slot].used && g_pfx[slot].seg != seg) pfx_drop(slot);
+  int *cp = (int *)malloc(sizeof(int) * (size_t)len);
+  if (!cp) return;
+  memcpy(cp, toks, sizeof(int) * (size_t)len);
+  free(g_pfx[slot].toks);
+  g_pfx[slot].toks = cp;
+  g_pfx[slot].used = 1;
+  g_pfx[slot].seg = seg;
+  g_pfx[slot].len = len;
+  g_pfx[slot].use = ++g_pfx_clock;
+  g_pfx_of[seg] = slot + 1;
+  g_pfx_leased_rows += len;
+}
 
 /* ---------------- request lifecycle ---------------- */
 
@@ -207,6 +283,11 @@ static DWORD WINAPI worker(LPVOID unused) {
     for (int i = 0; i < MAX_CONC; i++) {
       request *r = E.reqs[i];
       if (r && r->state == R_REAPED) {
+        /* G6: 跑过 prefill 的请求，把它的段登记为前缀租让（后面的请求就能复用）。
+         * 带图的请求不登记：视觉 token 接在 prompt 后，前缀语义不一样。 */
+        if (E.gpu && r->reached_run && r->n_img == 0 && r->seg == i &&
+            r->n_prompt >= PFX_MIN)
+          pfx_register(i, r->prompt, r->n_prompt);
         req_free(r);
         E.reqs[i] = NULL;
         E.n_active--;
@@ -250,11 +331,26 @@ static DWORD WINAPI worker(LPVOID unused) {
       int base = i * E.seg_len;
       LeaveCriticalSection(&E.lock);
       int rc;
+      /* G6: 前缀命中 -> 把租让段里的 KV 行搬进本段，prefill 从命中处起。
+       * 全命中时留最后一个 token 重算一遍（那一行 KV 值不变），否则本轮得
+       * 不到 logits。 */
+      int off = 0;
+      if (E.gpu && r->n_img == 0 && r->n_prompt >= PFX_MIN) {
+        int src_seg = -1;
+        int hit = pfx_match(r->prompt, r->n_prompt, &src_seg);
+        if (hit >= r->n_prompt) hit = r->n_prompt - 1;
+        if (hit > 0) {
+          if (src_seg != i) {
+            if (g_pfx_of[i]) pfx_drop(g_pfx_of[i] - 1); /* 本段旧租让要被覆盖了 */
+            if (sgl_cuda_copy_kv(E.gpu, src_seg * E.seg_len, base, hit) != 0) hit = 0;
+          }
+          if (hit > 0) { g_pfx_hits++; g_pfx_hit_rows += hit; off = hit; }
+        }
+      }
       if (r->n_prompt + r->n_img > r->seg_len) {
         rc = -2; /* prompt (+visual tokens) exceeds its KV segment capacity */
       } else {
         rc = 0;
-        int off = 0;
         while (off < r->n_prompt && rc == 0) {
           int chunk = r->n_prompt - off;
           /* only the last chunk needs the lm_head pass + logits D2H */
@@ -272,7 +368,7 @@ static DWORD WINAPI worker(LPVOID unused) {
       }
       EnterCriticalSection(&E.lock);
       if (rc != 0) { r->state = R_FAIL; }
-      else { r->state = R_RUN; r->has_logits = 1; }
+      else { r->state = R_RUN; r->has_logits = 1; r->reached_run = 1; }
       any = 1;
     }
     /* 2) batched decode of running requests
@@ -609,7 +705,19 @@ static int route(SOCKET fd, const http_req *req) {
    * `POST /health -d x` — body-carrying requests verified stable. */
   if (strcmp(req->path, "/health") == 0 &&
       (strcmp(req->method, "GET") == 0 || strcmp(req->method, "POST") == 0)) {
-    respond(fd, 200, "application/json", "{\"ok\":true}");
+    /* G5: health 说真话——降级（显存不够/上传失败）时 gpu:false + 原因，
+     * 监控能直接看到，而不是只看到端口连不上。 */
+    char body[512];
+    if (E.degraded)
+      snprintf(body, sizeof(body),
+               "{\"ok\":false,\"gpu\":false,\"degraded\":true,\"reason\":\"%s\"}", E.gpu_err);
+    else
+      snprintf(body, sizeof(body),
+               "{\"ok\":true,\"gpu\":true,\"ctx\":%d,\"seg\":%d,\"conc\":%d,"
+               "\"prefix\":{\"hits\":%ld,\"hit_rows\":%ld,\"leased_rows\":%ld}}",
+               sgl_cuda_ctx(E.gpu), E.seg_len, ACTIVE_CONC,
+               g_pfx_hits, g_pfx_hit_rows, g_pfx_leased_rows);
+    respond(fd, 200, "application/json", body);
     return 0;
   }
   if (strcmp(req->method, "POST") != 0) { respond_error(fd, 404, "not found"); return 0; }
@@ -617,6 +725,11 @@ static int route(SOCKET fd, const http_req *req) {
   int openai = strcmp(req->path, "/v1/completions") == 0;
   int gen = strcmp(req->path, "/generate") == 0;
   if (!chat && !openai && !gen) { respond_error(fd, 404, "unknown path"); return 0; }
+  /* G5: 降级模式——不排队、不假装有结果，直接 503 + 原因 */
+  if (E.degraded || !E.gpu) {
+    respond_error(fd, 503, E.gpu_err[0] ? E.gpu_err : "gpu engine unavailable");
+    return 0;
+  }
 
   sgl_json *j = sgl_json_parse(req->body, req->body_len);
   if (!j) { respond_error(fd, 400, "invalid JSON"); return 0; }
@@ -783,8 +896,42 @@ int main(int argc, char **argv) {
   double t0 = (double)clock() / CLOCKS_PER_SEC;
   E.cpu = sgl_llama_load(dir);
   if (!E.cpu) return 2;
-  E.gpu = sgl_cuda_from_llama(E.cpu);
-  if (!E.gpu) return 2;
+  /* G5: 上传前预检。以前显存不够 = 进程直接死（cudaMalloc 失败 → return 2），
+   * 监控/调用方只能看到连接被拒。现在先算账（权重 + KV(ctx) + 工作区 + 上下文
+   * 开销），不够就不上传，服务照常起，/health 报 degraded，generate 返 503 + 原因。
+   * Windows 上还有第二种更阴的情况：WDDM 把超出部分溢到系统内存，不报错但慢 3-20x
+   * （实测 8K prefill 2.8s → 10.4s），所以预检留 192MB 余量。 */
+  {
+    const char *ce = getenv("SGL_CUDA_CTX");
+    int cap = (ce && atoi(ce) > 0) ? atoi(ce) : 16384;
+    int want = E.cpu->n_ctx < cap ? E.cpu->n_ctx : cap;
+    const char *ec = getenv("SGL_HTTP_CONC");
+    int conc = ACTIVE_CONC;
+    if (ec) { int c = atoi(ec); if (c >= 1 && c <= MAX_CONC) conc = c; }
+    int rows = want / conc;
+    long need = sgl_cuda_estimate_vram_mb(E.cpu, want, rows);
+    long avail = sgl_cuda_avail_vram_mb();
+    printf("[engine] vram precheck: need ~%ldMB, free %ldMB (ctx=%d rows=%d)\n", need, avail, want, rows);
+    fflush(stdout);
+    if (need > 0 && avail > 0 && avail < need + 192) {
+      snprintf(E.gpu_err, sizeof(E.gpu_err),
+               "insufficient VRAM: model needs ~%ldMB, %ldMB free (lower SGL_CUDA_CTX or use SGL_CUDA_FP16=1/SGL_CUDA_W8=1)",
+               need, avail);
+      E.degraded = 1;
+      fprintf(stderr, "[engine] DEGRADED: %s\n", E.gpu_err);
+    }
+  }
+  if (!E.degraded) {
+    E.gpu = sgl_cuda_from_llama(E.cpu);
+    if (!E.gpu) {
+      snprintf(E.gpu_err, sizeof(E.gpu_err),
+               "GPU upload failed (out of VRAM); free %ldMB, try SGL_CUDA_CTX=8192 or SGL_CUDA_W8=1",
+               sgl_cuda_avail_vram_mb());
+      E.degraded = 1;
+      fprintf(stderr, "[engine] DEGRADED: %s\n", E.gpu_err);
+    }
+  }
+  if (E.degraded) E.seg_len = 0;
   char tpath[1024];
   snprintf(tpath, sizeof(tpath), "%s/tokenizer.json", dir);
   E.tok = sgl_tokenizer_load(tpath);
@@ -832,14 +979,23 @@ int main(int argc, char **argv) {
       if (c >= 1 && c <= MAX_CONC) ACTIVE_CONC = c;
     }
   }
-  E.seg_len = sgl_cuda_ctx(E.gpu) / ACTIVE_CONC;
-  /* t5: decode CUDA graphs are unstable under this server's dynamic batch
-   * sizes (intermittent sticky CUDA errors after B changes + buffer grows;
-   * single-batch cuda_test replays are fine). Default OFF here; set
-   * SGL_CUDA_GRAPH=1 explicitly to experiment. */
-  if (!getenv("SGL_CUDA_GRAPH")) _putenv_s("SGL_CUDA_GRAPH", "0");
-  printf("[engine] loaded in %.1fs; ctx=%d seg=%d conc=%d eos=%d\n",
-         (double)clock() / CLOCKS_PER_SEC - t0, sgl_cuda_ctx(E.gpu), E.seg_len, ACTIVE_CONC, E.eos);
+  E.seg_len = E.gpu ? sgl_cuda_ctx(E.gpu) / ACTIVE_CONC : 0;
+  /* G3: decode graphs 现在默认开。t5 当时强制关掉是因为：
+   *   (1) 捕获失败会把一个进程级 static 置为“graphs off”，一个 B 的偶然失败
+   *       就让所有 batch 永远走 plain（比 graph 慢 3-4x）—— 改成按 B 记录失败；
+   *   (2) 服务端 ws_cap 随最长 prompt 增长 → invalidate 全部 graph → 在下一次
+   *       decode 里重新捕获（实测每张 ~0.5s，夹在请求中间）—— 起服务前 prewarm
+   *       把 ws_cap / batch 镜像一次撑到位，之后 graph 缓存全程有效；
+   *   (3) 捕获时才开始 lazy-load 内核 / cublas 选算法，在 capture 里做这些事会
+   *       失败 —— capture 前先跑一次 plain step 预热。
+   * SGL_CUDA_GRAPH=0 仍可显式关闭。 */
+  if (E.gpu) {
+    int warmed = sgl_cuda_prewarm(E.gpu, E.seg_len, ACTIVE_CONC);
+    printf("[engine] prewarm: ws rows=%d, decode graphs %d/%d\n", E.seg_len, warmed, ACTIVE_CONC);
+  }
+  printf("[engine] loaded in %.1fs; ctx=%d seg=%d conc=%d eos=%d%s\n",
+         (double)clock() / CLOCKS_PER_SEC - t0, E.gpu ? sgl_cuda_ctx(E.gpu) : 0,
+         E.seg_len, ACTIVE_CONC, E.eos, E.degraded ? " [DEGRADED]" : "");
   fflush(stdout);
 
   HANDLE w = CreateThread(NULL, 0, worker, NULL, 0, NULL);

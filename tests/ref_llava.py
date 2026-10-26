@@ -1,4 +1,6 @@
 """t10 numpy 参考：CLIP encode + projector，与 clip.c 逐位对齐的独立实现。
+语义 = 真实 HF CLIPVisionModel（G8）：quick_gelu MLP、post_layernorm 只作用 pooled cls、
+encode 输出 last_hidden_state 的 patch 行（[n_patch][hidden_size]）。
 用法: python ref_llava.py <llava_dir> <out.json>"""
 import json, sys
 import numpy as np
@@ -9,6 +11,8 @@ cfg = json.load(open(f"{D}/clip_config.json"))
 E, H, L, P, IMG, I, PROJ = (cfg[k] for k in
     ("hidden_size", "num_heads", "num_hidden_layers", "patch_size",
      "image_size", "intermediate_size", "projection_dim"))
+EPS = float(cfg.get("layer_norm_eps", 1e-5))
+ACT = cfg.get("hidden_act", "quick_gelu")
 NP = (IMG // P) ** 2
 
 def load_st(path):
@@ -29,10 +33,11 @@ img = np.fromfile(f"{D}/image.raw", dtype=np.float32).reshape(3, IMG, IMG)
 def ln(x, w, b):
     m = x.mean(-1, keepdims=True)
     v = ((x - m) ** 2).mean(-1, keepdims=True)
-    return (x - m) / np.sqrt(v + 1e-5) * w + b
+    return (x - m) / np.sqrt(v + EPS) * w + b
 
-def gelu(x):
-    from math import erf
+def act(x):
+    if ACT == "quick_gelu":
+        return x * (1.0 / (1.0 + np.exp(-1.702 * x)))   # f8 计算，与 C 的 f32 式略有尾差
     from scipy.special import erf as serf
     return 0.5 * x * (1.0 + serf(x / np.sqrt(2.0)))
 
@@ -53,9 +58,14 @@ for py in range(side):
         patch = img[:, py * P:py * P + P, px * P:px * P + P].reshape(3 * P * P)
         x[pi + 1] = patch @ pw.T + pb
 x[0] = W["vision_model.embeddings.class_embedding"]
-x = x + W["vision_model.embeddings.position_embedding"]
-x = ln(x, W["vision_model.embeddings.pre_layernorm.weight"],
-       W["vision_model.embeddings.pre_layernorm.bias"])
+pos = W.get("vision_model.embeddings.position_embedding.weight",
+            W["vision_model.embeddings.position_embedding"])
+x = x + pos
+pre_w = W.get("vision_model.pre_layrnorm.weight",
+              W["vision_model.embeddings.pre_layernorm.weight"])
+pre_b = W.get("vision_model.pre_layrnorm.bias",
+              W["vision_model.embeddings.pre_layernorm.bias"])
+x = ln(x, pre_w, pre_b)
 for l in range(L):
     p = f"vision_model.encoder.layers.{l}"
     h = ln(x, W[f"{p}.layer_norm1.weight"], W[f"{p}.layer_norm1.bias"])
@@ -65,16 +75,22 @@ for l in range(L):
     o = attn(q, k, v) @ W[f"{p}.self_attn.out_proj.weight"].T + W[f"{p}.self_attn.out_proj.bias"]
     x = x + o
     h = ln(x, W[f"{p}.layer_norm2.weight"], W[f"{p}.layer_norm2.bias"])
-    mid = gelu(h @ W[f"{p}.mlp.fc1.weight"].T + W[f"{p}.mlp.fc1.bias"])
+    mid = act(h @ W[f"{p}.mlp.fc1.weight"].T + W[f"{p}.mlp.fc1.bias"])
     x = x + (mid @ W[f"{p}.mlp.fc2.weight"].T + W[f"{p}.mlp.fc2.bias"])
-x = ln(x, W["vision_model.post_layernorm.weight"], W["vision_model.post_layernorm.bias"])
-feats = x[1:] @ W["visual_projection.weight"].T          # [NP, PROJ]
+# last_hidden_state：不过 post_layernorm；LLaVA 取 patch 行
+feats = x[1:]                                            # [NP, E]
+pooled = ln(x[0], W["vision_model.post_layernorm.weight"],
+                  W["vision_model.post_layernorm.bias"])   # [E]
+img_emb = pooled @ W["visual_projection.weight"].T          # [PROJ]
 proj = feats @ PJ["linear_1.weight"].T + PJ["linear_1.bias"]  # [NP, LM_E]
 
-out = {"n_patch": NP, "proj_dim": PROJ,
+out = {"n_patch": NP, "feat_dim": E, "proj_dim": E,
        "feats_mean": float(feats.mean()), "feats_maxerr_base": float(np.abs(feats).mean()),
+       "pooled_checksum": float(pooled.sum()), "img_emb_checksum": float(img_emb.sum()),
        "proj_first": proj[0][:8].tolist(), "proj_last": proj[-1][:8].tolist(),
        "proj_checksum": float(proj.sum())}
 json.dump(out, open(OUT, "w"), indent=1)
-np.save(f"{D}/_ref_proj.npy", proj.astype(np.float32))  # scipy erf 升维 f8，拉回 f32 与 C 对齐
-print(f"saved {OUT}: NP={NP} proj_checksum={out['proj_checksum']:.6f}")
+np.save(f"{D}/_ref_proj.npy", proj.astype(np.float32))  # f8 升维计算，拉回 f32 与 C 对齐
+np.save(f"{D}/_ref_feats.npy", feats.astype(np.float32))
+np.save(f"{D}/_ref_imgemb.npy", img_emb.astype(np.float32))
+print(f"saved {OUT}: NP={NP} feat_dim={E} proj_checksum={out['proj_checksum']:.6f}")
