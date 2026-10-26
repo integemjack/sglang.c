@@ -35,6 +35,7 @@ typedef struct { int8_t *w; float *scale; } sgl_w8w;
 
 struct sgl_cuda_model {
   int L, H, HK, E, I, V, D, KD, ctx;
+  int sliding_window; /* t9: >0 = banded causal mask (mistral); gpt2 keeps 0 */
   float eps;
   double theta;
 
@@ -276,17 +277,17 @@ __global__ void k_rope_rows(float *qk, int n, int head_dim, const int *pos_row,
 
 __global__ void k_attn(const float *q, const float *kc, const float *vc,
                        float *out, int pos0, int kv_base, int n, int H, int HK, int D,
-                       float scale, int q_stride) {
+                       float scale, int q_stride, int win) {
   extern __shared__ float sc[];
   int th = blockIdx.x;
   int t = th / H, h = th % H;
   int upto = pos0 + t + 1;
-  /* q_stride: row width of the q buffer — E for llama, 3E when the fused
-   * gpt2 qkv buffer is passed directly (t4) */
+  /* win>0 (mistral sliding window): attend only p in [upto-win, upto) */
+  int from = (win > 0 && upto > win) ? upto - win : 0;
   const float *qh = q + (long)t * q_stride + h * D;
   int hkv = h / (H / HK);
   float maxv = -1e30f;
-  for (int p = threadIdx.x; p < upto; p += blockDim.x) {
+  for (int p = from + threadIdx.x; p < upto; p += blockDim.x) {
     const float *kh = kc + ((long)(kv_base + p) * HK + hkv) * D;
     float s = 0;
     for (int d = 0; d < D; d++) s += qh[d] * kh[d];
@@ -305,7 +306,7 @@ __global__ void k_attn(const float *q, const float *kc, const float *vc,
   }
   float invmax = shmax[0];
   float ssum = 0;
-  for (int p = threadIdx.x; p < upto; p += blockDim.x) {
+  for (int p = from + threadIdx.x; p < upto; p += blockDim.x) {
     sc[p] = __expf(sc[p] - invmax);
     ssum += sc[p];
   }
@@ -320,7 +321,7 @@ __global__ void k_attn(const float *q, const float *kc, const float *vc,
   float *o = out + ((long)t * H + h) * D;
   for (int d = threadIdx.x; d < D; d += blockDim.x) o[d] = 0;
   __syncthreads();
-  for (int p = 0; p < upto; p++) {
+  for (int p = from; p < upto; p++) {
     const float *vh = vc + ((long)(kv_base + p) * HK + hkv) * D;
     float w = sc[p] * invsum;
     for (int d = threadIdx.x; d < D; d += blockDim.x) o[d] += w * vh[d];
@@ -339,7 +340,7 @@ __global__ void k_attn(const float *q, const float *kc, const float *vc,
  * fixed shared-memory footprint independent of context length. */
 __global__ void k_attn_long(const float *q, const float *kc, const float *vc,
                             float *out, int pos0, int kv_base, int n, int H, int HK, int D,
-                            float scale) {
+                            float scale, int win) {
   __shared__ float sc[SGL_ATTN_CHUNK];
   __shared__ float red[256];
   int th = blockIdx.x;
@@ -347,10 +348,11 @@ __global__ void k_attn_long(const float *q, const float *kc, const float *vc,
   int upto = pos0 + t + 1;
   const float *qh = q + ((long)t * H + h) * D;
   int hkv = h / (H / HK);
+  int from = (win > 0 && upto > win) ? upto - win : 0; /* t9 sliding window */
 
   /* pass 1: global max + online sum of exp(score - running max) */
   float run_max = -1e30f, run_sum = 0.0f;
-  for (int c0 = 0; c0 < upto; c0 += SGL_ATTN_CHUNK) {
+  for (int c0 = from; c0 < upto; c0 += SGL_ATTN_CHUNK) {
     int ce = c0 + SGL_ATTN_CHUNK; if (ce > upto) ce = upto;
     float cmax = -1e30f;
     for (int p = c0 + threadIdx.x; p < ce; p += blockDim.x) {
@@ -393,7 +395,7 @@ __global__ void k_attn_long(const float *q, const float *kc, const float *vc,
   float *o = out + ((long)t * H + h) * D;
   for (int d = threadIdx.x; d < D; d += blockDim.x) o[d] = 0;
   __syncthreads();
-  for (int c0 = 0; c0 < upto; c0 += SGL_ATTN_CHUNK) {
+  for (int c0 = from; c0 < upto; c0 += SGL_ATTN_CHUNK) {
     int ce = c0 + SGL_ATTN_CHUNK; if (ce > upto) ce = upto;
     for (int p = c0 + threadIdx.x; p < ce; p += blockDim.x) {
       const float *kh = kc + ((long)(kv_base + p) * HK + hkv) * D;
@@ -416,7 +418,7 @@ __global__ void k_attn_long(const float *q, const float *kc, const float *vc,
  * attends lens[b] + 1 positions (M26a long-context path). */
 __global__ void k_attn_long_batch(const float *q, const float *kc, const float *vc,
                                   float *out, const int *base, const int *lens,
-                                  int B, int H, int HK, int D, float scale) {
+                                  int B, int H, int HK, int D, float scale, int win) {
   __shared__ float sc[SGL_ATTN_CHUNK];
   __shared__ float red[256];
   int th = blockIdx.x;
@@ -425,9 +427,10 @@ __global__ void k_attn_long_batch(const float *q, const float *kc, const float *
   int upto = lens[b] + 1;
   const float *qh = q + ((long)b * H + h) * D;
   int hkv = h / (H / HK);
+  int from = (win > 0 && upto > win) ? upto - win : 0; /* t9 sliding window */
 
   float run_max = -1e30f, run_sum = 0.0f;
-  for (int c0 = 0; c0 < upto; c0 += SGL_ATTN_CHUNK) {
+  for (int c0 = from; c0 < upto; c0 += SGL_ATTN_CHUNK) {
     int ce = c0 + SGL_ATTN_CHUNK; if (ce > upto) ce = upto;
     float cmax = -1e30f;
     for (int p = c0 + threadIdx.x; p < ce; p += blockDim.x) {
@@ -469,7 +472,7 @@ __global__ void k_attn_long_batch(const float *q, const float *kc, const float *
   float *o = out + ((long)b * H + h) * D;
   for (int d = threadIdx.x; d < D; d += blockDim.x) o[d] = 0;
   __syncthreads();
-  for (int c0 = 0; c0 < upto; c0 += SGL_ATTN_CHUNK) {
+  for (int c0 = from; c0 < upto; c0 += SGL_ATTN_CHUNK) {
     int ce = c0 + SGL_ATTN_CHUNK; if (ce > upto) ce = upto;
     for (int p = c0 + threadIdx.x; p < ce; p += blockDim.x) {
       const float *kh = kc + ((long)(base_p + p) * HK + hkv) * D;
@@ -769,7 +772,7 @@ static int sgl_cuda_ensure_lgb(sgl_cuda_model *g, int rows) {
 /* batch attention: block = (seq, head); kv at absolute (base+p) */
 __global__ void k_attn_batch(const float *q, const float *kc, const float *vc,
                              float *out, const int *base, const int *lens,
-                             int B, int H, int HK, int D, float scale) {
+                             int B, int H, int HK, int D, float scale, int win) {
   extern __shared__ float sc[];
   int th = blockIdx.x;
   int b = th / H, h = th % H;
@@ -777,8 +780,9 @@ __global__ void k_attn_batch(const float *q, const float *kc, const float *vc,
   int upto = lens[b] + 1;
   const float *qh = q + ((long)b * H + h) * D;
   int hkv = h / (H / HK);
+  int from = (win > 0 && upto > win) ? upto - win : 0; /* t9 sliding window */
   float maxv = -1e30f;
-  for (int p = threadIdx.x; p < upto; p += blockDim.x) {
+  for (int p = from + threadIdx.x; p < upto; p += blockDim.x) {
     const float *kh = kc + ((long)(base_p + p) * HK + hkv) * D;
     float s = 0;
     for (int d = 0; d < D; d++) s += qh[d] * kh[d];
@@ -797,7 +801,7 @@ __global__ void k_attn_batch(const float *q, const float *kc, const float *vc,
   }
   float invmax = shmax[0];
   float ssum = 0;
-  for (int p = threadIdx.x; p < upto; p += blockDim.x) {
+  for (int p = from + threadIdx.x; p < upto; p += blockDim.x) {
     sc[p] = __expf(sc[p] - invmax);
     ssum += sc[p];
   }
@@ -812,7 +816,7 @@ __global__ void k_attn_batch(const float *q, const float *kc, const float *vc,
   float *o = out + ((long)b * H + h) * D;
   for (int d = threadIdx.x; d < D; d += blockDim.x) o[d] = 0;
   __syncthreads();
-  for (int p = 0; p < upto; p++) {
+  for (int p = from; p < upto; p++) {
     const float *vh = vc + ((long)(base_p + p) * HK + hkv) * D;
     float w = sc[p] * invsum;
     for (int d = threadIdx.x; d < D; d += blockDim.x) o[d] += w * vh[d];
@@ -887,6 +891,7 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
   g->E = m->n_embd; g->I = m->n_inter; g->V = m->vocab;
   g->D = m->head_dim; g->KD = m->kv_dim; g->ctx = m->n_ctx;
   g->eps = m->rms_eps; g->theta = m->rope_theta;
+  g->sliding_window = m->sliding_window; /* t9: mistral banded mask, 0 = off */
   /* t1: fp16 weight storage, opt-in via SGL_CUDA_FP16 (default off = the
    * original all-fp32 path, bit-identical behavior). */
   {
@@ -1077,6 +1082,7 @@ sgl_cuda_model *sgl_cuda_from_gpt2(const void *gpt2_model) {
   g->E = m->n_embd; g->I = 4 * m->n_embd; g->V = m->vocab;
   g->D = m->n_embd / m->n_head; g->KD = m->n_embd; g->ctx = m->n_ctx;
   g->eps = m->ln_eps; g->theta = 10000.0; /* unused */
+  g->sliding_window = 0; /* gpt2: no sliding window */
   {
     const char *fe = getenv("SGL_CUDA_FP16");
     g->use_fp16 = (fe && atoi(fe)) ? 1 : 0; /* gpt2: no W8 path (t8 is llama-only) */
@@ -1299,7 +1305,8 @@ static int gpt2_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos
     }
     k_attn<<<n * H, 256, (size_t)(pos0 + n) * sizeof(float), g->stream>>>(
         g->q, g->kc + (long)l * g->ctx * KD, g->vc + (long)l * g->ctx * KD,
-        g->attn, pos0, kv_base, n, H, H, D, 1.0f / sqrtf((float)D), E3);
+        g->attn, pos0, kv_base, n, H, H, D, 1.0f / sqrtf((float)D), E3,
+        g->sliding_window);
     CK(cudaGetLastError());
     PROJ(g, g->attn, g->ow[l], g->ow_h ? g->ow_h[l] : NULL, g->ow8 ? &g->ow8[l] : NULL, g->ob[l],
          g->h, n, E, E);
@@ -1334,25 +1341,31 @@ static int gpt2_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos
   return 0;
 }
 
-int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
-                         int kv_base, float *logits_out) {
-  if (g->kind == 1) return gpt2_forward_seg(g, tokens, n, pos0, kv_base, logits_out);
+/* t10 llava: shared llama forward — tokens==NULL takes emb ([n][E] host,
+ * pre-fused visual embeddings) and skips the embed lookup; same layer loop. */
+static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
+                         int n, int pos0, int kv_base, float *logits_out) {
   int E = g->E, H = g->H, HK = g->HK, D = g->D, KD = g->KD;
   if (n <= 0 || pos0 + n > g->ctx) return -1;
   if (kv_base + pos0 + n > g->ctx) return -1;
   if (sgl_cuda_reserve(g, n) != 0) return -1;
   if (sgl_cuda_ensure_io(g, n) != 0) return -1;
 
-  /* input tokens go through the pinned mirror + async copy on g->stream
-   * (same ordering domain as the kernels; no per-step cudaMalloc) */
-  memcpy(g->h_tok, tokens, sizeof(int) * (size_t)n);
-  CK(cudaMemcpyAsync(g->d_tok, g->h_tok, sizeof(int) * (size_t)n,
-                     cudaMemcpyHostToDevice, g->stream));
-
-  if (g->use_fp16)
-    k_embed_h<<<(int)((n * (long)E + 255) / 256), 256, 0, g->stream>>>(g->wte_h, g->d_tok, g->x, n, E);
-  else
-    k_embed<<<(int)((n * (long)E + 255) / 256), 256, 0, g->stream>>>(g->wte, g->d_tok, g->x, n, E);
+  if (emb) {
+    /* visual tokens: activations come precomputed from the host (CLIP+projector) */
+    CK(cudaMemcpyAsync(g->x, emb, sizeof(float) * (size_t)n * E,
+                       cudaMemcpyHostToDevice, g->stream));
+  } else {
+    /* input tokens go through the pinned mirror + async copy on g->stream
+     * (same ordering domain as the kernels; no per-step cudaMalloc) */
+    memcpy(g->h_tok, tokens, sizeof(int) * (size_t)n);
+    CK(cudaMemcpyAsync(g->d_tok, g->h_tok, sizeof(int) * (size_t)n,
+                       cudaMemcpyHostToDevice, g->stream));
+    if (g->use_fp16)
+      k_embed_h<<<(int)((n * (long)E + 255) / 256), 256, 0, g->stream>>>(g->wte_h, g->d_tok, g->x, n, E);
+    else
+      k_embed<<<(int)((n * (long)E + 255) / 256), 256, 0, g->stream>>>(g->wte, g->d_tok, g->x, n, E);
+  }
   CK(cudaGetLastError());
 
   for (int l = 0; l < g->L; l++) {
@@ -1395,11 +1408,13 @@ int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
       if (force_long || pos0 + n > SGL_ATTN_SHORT_MAX) {
         k_attn_long<<<n * H, 256, 0, g->stream>>>(
             g->q, g->kc + (long)l * g->ctx * KD, g->vc + (long)l * g->ctx * KD,
-            g->attn, pos0, kv_base, n, H, HK, D, 1.0f / sqrtf((float)D));
+            g->attn, pos0, kv_base, n, H, HK, D, 1.0f / sqrtf((float)D),
+            g->sliding_window);
       } else {
         k_attn<<<n * H, 256, (size_t)(pos0 + n) * sizeof(float), g->stream>>>(
             g->q, g->kc + (long)l * g->ctx * KD, g->vc + (long)l * g->ctx * KD,
-            g->attn, pos0, kv_base, n, H, HK, D, 1.0f / sqrtf((float)D), E);
+            g->attn, pos0, kv_base, n, H, HK, D, 1.0f / sqrtf((float)D), E,
+            g->sliding_window);
       }
     }
     CK(cudaGetLastError());
@@ -1463,6 +1478,20 @@ int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
   return 0;
 }
 
+int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
+                         int kv_base, float *logits_out) {
+  if (g->kind == 1) return gpt2_forward_seg(g, tokens, n, pos0, kv_base, logits_out);
+  return fwd_seg_llama(g, tokens, NULL, n, pos0, kv_base, logits_out);
+}
+
+/* t10 llava: pre-fused visual embeddings [n][E] straight into the layer loop
+ * (llama path only; gpt2 returns -1). */
+int sgl_cuda_forward_seg_emb(sgl_cuda_model *g, const float *emb, int n, int pos0,
+                             int kv_base, float *logits_out) {
+  if (g->kind == 1) return -1;
+  return fwd_seg_llama(g, NULL, emb, n, pos0, kv_base, logits_out);
+}
+
 /* graph-safe KV row write (M26b): destination computed from the DEVICE
  * base/lens arrays, so a captured graph writes to the right slot even as
  * lens[] grows every decode step (the old host-computed D2D copies would
@@ -1518,11 +1547,13 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
     if (maxu > SGL_ATTN_SHORT_MAX) {
       k_attn_long_batch<<<B * H, 256, 0, s>>>(
           g->q, g->kc + (long)l * g->ctx * KD, g->vc + (long)l * g->ctx * KD,
-          g->attn, g->d_base, g->d_lens, B, H, HK, D, 1.0f / sqrtf((float)D));
+          g->attn, g->d_base, g->d_lens, B, H, HK, D, 1.0f / sqrtf((float)D),
+          g->sliding_window);
     } else {
       k_attn_batch<<<B * H, 256, (size_t)maxu * sizeof(float), s>>>(
           g->q, g->kc + (long)l * g->ctx * KD, g->vc + (long)l * g->ctx * KD,
-          g->attn, g->d_base, g->d_lens, B, H, HK, D, 1.0f / sqrtf((float)D));
+          g->attn, g->d_base, g->d_lens, B, H, HK, D, 1.0f / sqrtf((float)D),
+          g->sliding_window);
     }
     CK(cudaGetLastError());
     PROJ(g, g->attn, g->ow[l], g->ow_h ? g->ow_h[l] : NULL, g->ow8 ? &g->ow8[l] : NULL, NULL,
@@ -1688,12 +1719,19 @@ void sgl_cuda_gemm_bench(void) {
     int N = shapes[si].N, K = shapes[si].K;
     float *Wf = NULL, *Af = NULL, *Cf = NULL, *Af_h = NULL;
     __half *Wh = NULL, *Ah = NULL;
+    int8_t *Wi8 = NULL, *Ai8 = NULL; /* t8: IMMA vs dp4a bench buffers */
+    int *Ci32 = NULL;
+    float *Wsc = NULL, *Asc = NULL;
     if (cudaMalloc(&Wf, (size_t)N * K * 4) != cudaSuccess) goto next_shape;
     if (cudaMalloc(&Wh, (size_t)N * K * 2) != cudaSuccess) goto next_shape;
     if (cudaMalloc(&Af, (size_t)MMAX * K * 4) != cudaSuccess) goto next_shape;
     if (cudaMalloc(&Ah, (size_t)MMAX * K * 2) != cudaSuccess) goto next_shape;
     if (cudaMalloc(&Cf, (size_t)MMAX * N * 4) != cudaSuccess) goto next_shape;
     if (cudaMallocHost(&Af_h, (size_t)MMAX * K * 2) != cudaSuccess) goto next_shape;
+    if (cudaMalloc(&Wi8, (size_t)N * K) != cudaSuccess) goto next_shape;
+    if (cudaMalloc(&Ai8, (size_t)MMAX * K) != cudaSuccess) goto next_shape;
+    if (cudaMalloc(&Ci32, (size_t)MMAX * N * 4) != cudaSuccess) goto next_shape;
+    if (cudaMalloc(&Wsc, (size_t)N * 4) != cudaSuccess) goto next_shape;
     {
       /* deterministic fill, values in [-0.25, 0.25] */
       unsigned int rng = 12345u + (unsigned int)(N * 31 + K);
@@ -1718,6 +1756,39 @@ void sgl_cuda_gemm_bench(void) {
       cudaMemcpy(Af, ta, (size_t)MMAX * K * 4, cudaMemcpyHostToDevice);
       for (long i = 0; i < (long)MMAX * K; i++) Af_h[i] = __float2half(ta[i]);
       cudaMemcpy(Ah, Af_h, (size_t)MMAX * K * 2, cudaMemcpyHostToDevice);
+      /* t8: per-channel int8 W + per-tensor int8 A (bench-only quantization) */
+      {
+        int8_t *qw = (int8_t *)malloc((size_t)N * K);
+        int8_t *qa = (int8_t *)malloc((size_t)MMAX * K);
+        float *sc = (float *)malloc((size_t)N * 4);
+        for (int n = 0; n < N; n++) {
+          float am = 0;
+          for (int k2 = 0; k2 < K; k2++) {
+            float v = tw[(size_t)n * K + k2];
+            if (v > am) am = v; else if (-v > am) am = -v;
+          }
+          float inv = am > 1e-8f ? 127.0f / am : 0;
+          sc[n] = am / 127.0f;
+          for (int k2 = 0; k2 < K; k2++) {
+            float v = tw[(size_t)n * K + k2] * inv;
+            qw[(size_t)n * K + k2] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
+          }
+        }
+        float aam = 0;
+        for (long i = 0; i < (long)MMAX * K; i++) {
+          float v = ta[i];
+          if (v > aam) aam = v; else if (-v > aam) aam = -v;
+        }
+        float ainv = aam > 1e-8f ? 127.0f / aam : 0;
+        for (long i = 0; i < (long)MMAX * K; i++) {
+          float v = ta[i] * ainv;
+          qa[i] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
+        }
+        cudaMemcpy(Wi8, qw, (size_t)N * K, cudaMemcpyHostToDevice);
+        cudaMemcpy(Ai8, qa, (size_t)MMAX * K, cudaMemcpyHostToDevice);
+        cudaMemcpy(Wsc, sc, (size_t)N * 4, cudaMemcpyHostToDevice);
+        free(qw); free(qa); free(sc);
+      }
       free(ta); free(tw);
     }
     for (int mi = 0; mi < 3; mi++) {
@@ -1764,6 +1835,35 @@ void sgl_cuda_gemm_bench(void) {
           if (it >= 0 && ms < ms_k16) ms_k16 = ms;
         }
       }
+      /* t8: int8 tensor core (cublasGemmEx IMMA) vs hand dp4a kernel */
+      if (K % 4 == 0 && N % 4 == 0) {
+        int32_t ai = 1, bi = 0;
+        float ms_imma = 1e30f;
+        for (int it = -WARM; it < ITERS; it++) {
+          cudaEventRecord(ev0);
+          cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &ai,
+                       Wi8, CUDA_R_8I, K, Ai8, CUDA_R_8I, K, &bi,
+                       Ci32, CUDA_R_32I, N, CUBLAS_COMPUTE_32I,
+                       CUBLAS_GEMM_DEFAULT);
+          cudaEventRecord(ev1);
+          cudaEventSynchronize(ev1);
+          float ms;
+          cudaEventElapsedTime(&ms, ev0, ev1);
+          if (it >= 0 && ms < ms_imma) ms_imma = ms;
+        }
+        float ms_dp4a = 1e30f;
+        for (int it = -WARM; it < ITERS; it++) {
+          cudaEventRecord(ev0);
+          k_gemm_w8a8<<<dim3(N, M), 256>>>(Af, Wi8, Wsc, NULL, Cf, M, N, K);
+          cudaEventRecord(ev1);
+          cudaEventSynchronize(ev1);
+          float ms;
+          cudaEventElapsedTime(&ms, ev0, ev1);
+          if (it >= 0 && ms < ms_dp4a) ms_dp4a = ms;
+        }
+        printf("[gemm-bench] %-28s M=%3d  int8 imma %8.4f ms  dp4a %8.4f ms (%.2fx)\n",
+               shapes[si].name, M, ms_imma, ms_dp4a, ms_imma / ms_dp4a);
+      }
       printf("[gemm-bench] %-28s M=%3d  sgemm %8.4f ms  hgemm %8.4f ms (%.2fx)",
              shapes[si].name, M, ms_s, ms_h, ms_s / ms_h);
       if (M == 1)
@@ -1777,6 +1877,10 @@ void sgl_cuda_gemm_bench(void) {
     if (Ah) cudaFree(Ah);
     if (Cf) cudaFree(Cf);
     if (Af_h) cudaFreeHost(Af_h);
+    if (Wi8) cudaFree(Wi8);
+    if (Ai8) cudaFree(Ai8);
+    if (Ci32) cudaFree(Ci32);
+    if (Wsc) cudaFree(Wsc);
   }
   cudaEventDestroy(ev0);
   cudaEventDestroy(ev1);

@@ -1,4 +1,4 @@
-/* test_cuda.c — CUDA 后端验证（需 SGL_CUDA=ON 构建；无 CUDA 构建时不存在）
+﻿/* test_cuda.c — CUDA 后端验证（需 SGL_CUDA=ON 构建；无 CUDA 构建时不存在）
  * 1. 上传 Qwen2.5-0.5B 权重到 GPU（fp32 ≈2GB）
  * 2. 同 prompt 的 logits 与 CPU 版对照（< 2e-3，fp32 归约顺序差异）
  * 3. greedy 16 步与 CPU 逐 token 对照
@@ -12,10 +12,13 @@
 
 #include "sgl/alloc.h"
 #include "sgl/bpe.h"
+#include "sgl/clip.h"
 #include "sgl/cuda.h"
 #include "sgl/gpt2.h"
 #include "sgl/json.h"
 #include "sgl/llama.h"
+#include "sgl/ops.h"
+#include "sgl/safetensors.h"
 #include "sgl/sampling.h"
 
 static int FAILURES = 0;
@@ -54,6 +57,66 @@ static int top1_gap(const float *l, int V, float *gap) {
   return t1;
 }
 
+
+/* t10: multimodal fusion on GPU — CLIP+projector feats appended after a text
+ * prefix via sgl_cuda_forward_seg_emb; logits must match the CPU stack's
+ * forward + forward_emb chain (both share the layer-loop numerics). Runs
+ * only when models/mistral-rand + models/llava-rand exist. */
+static void mm_gpu_check(void) {
+  sgl_llama *lm = sgl_llama_load("models/mistral-rand");
+  sgl_clip *cp = lm ? sgl_clip_load("models/llava-rand") : NULL;
+  if (!lm || !cp) { printf("[mm] mistral-rand/llava-rand missing, skip\n"); if (lm) sgl_llama_free(lm); return; }
+  FILE *f = NULL;
+  fopen_s(&f, "models/llava-rand/image.raw", "rb");
+  if (!f) { printf("[mm] image.raw missing, skip\n"); sgl_clip_free(cp); sgl_llama_free(lm); return; }
+  size_t npx = (size_t)3 * cp->img * cp->img;
+  float *img = (float *)sgl_xmalloc(sizeof(float) * npx);
+  if (fread(img, sizeof(float), npx, f) != npx) { fclose(f); sgl_xfree(img); sgl_clip_free(cp); sgl_llama_free(lm); return; }
+  fclose(f);
+  sgl_st_ctx *pst = sgl_st_open("models/llava-rand/projector.safetensors");
+  sgl_tensor w1 = pst ? sgl_st_get(pst, "linear_1.weight", 2, (int64_t[]){lm->n_embd, cp->proj_dim})
+                      : sgl_tensor_null();
+  sgl_tensor b1 = pst ? sgl_st_get(pst, "linear_1.bias", 1, (int64_t[]){lm->n_embd})
+                      : sgl_tensor_null();
+  if (!w1.data || !b1.data) { printf("[mm] projector missing, skip\n"); sgl_xfree(img); sgl_clip_free(cp); sgl_llama_free(lm); if (pst) sgl_st_close(pst); return; }
+
+  float *feats = (float *)sgl_xmalloc(sizeof(float) * (size_t)cp->n_patch * cp->proj_dim);
+  float *fp2 = (float *)sgl_xmalloc(sizeof(float) * (size_t)cp->n_patch * lm->n_embd);
+  CHECK(sgl_clip_encode(cp, img, feats) == 0, "mm clip encode");
+  sgl_matmul_nt(feats, w1.data, b1.data, fp2, cp->n_patch, lm->n_embd, cp->proj_dim);
+
+  int ids3[4] = {9707, 1879, 4321, 100};
+  int npg[512];
+  CHECK(sgl_llama_pages_alloc(lm, npg, 4 + cp->n_patch) == 0, "mm pages");
+  float *lc3 = (float *)sgl_xmalloc(sizeof(float) * (size_t)lm->vocab);
+  {
+    /* cpu: text prefix forward (logits to scratch), then emb segment */
+    float *lg_c = (float *)sgl_xmalloc(sizeof(float) * (size_t)lm->vocab);
+    CHECK(sgl_llama_forward(lm, ids3, 4, 0, npg, lc3) == 0, "mm cpu prefix");
+    CHECK(sgl_llama_forward_emb(lm, fp2, cp->n_patch, 4, npg, lg_c) == 0, "mm cpu emb");
+
+    /* gpu: same chain */
+    sgl_cuda_model *gm = sgl_cuda_from_llama(lm);
+    CHECK(gm != NULL, "mm gpu upload");
+    float *lg_g = (float *)sgl_xmalloc(sizeof(float) * (size_t)lm->vocab);
+    CHECK(sgl_cuda_forward_seg(gm, ids3, 4, 0, 0, NULL) == 0, "mm gpu prefix");
+    CHECK(sgl_cuda_forward_seg_emb(gm, fp2, cp->n_patch, 4, 0, lg_g) == 0, "mm gpu emb");
+
+    double me = 0;
+    for (int v2 = 0; v2 < lm->vocab; v2++) {
+      double e2 = fabs((double)lg_c[v2] - lg_g[v2]);
+      if (e2 > me) me = e2;
+    }
+    int tc = sgl_sample_greedy(lg_c, lm->vocab), tg = sgl_sample_greedy(lg_g, lm->vocab);
+    printf("[mm] GPU fusion vs CPU fusion: maxerr = %.3g (greedy %d vs %d %s)\n",
+           me, tc, tg, tc == tg ? "SAME" : "DIFF");
+    CHECK(me < 1e-3, "mm gpu/cpu diverge: %g", me);
+    sgl_xfree(lg_c); sgl_xfree(lg_g);
+    sgl_cuda_free(gm);
+  }
+  sgl_xfree(lc3); sgl_xfree(feats); sgl_xfree(fp2); sgl_xfree(img);
+  sgl_st_close(pst); sgl_clip_free(cp); sgl_llama_free(lm);
+}
 
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
@@ -568,6 +631,8 @@ int main(int argc, char **argv) {
       }
     }
   }
+
+  mm_gpu_check();
 
   if (FAILURES) { printf("test_cuda: %d FAILURES\n", FAILURES); return 1; }
   printf("test_cuda: all OK\n");

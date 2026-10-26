@@ -2,20 +2,28 @@
 # bench_all.ps1 - sglang-c performance snapshot (Markdown table)
 #
 # Usage (from anywhere):
-#   powershell -ExecutionPolicy Bypass -File sglang-c\bench_all.ps1
+#   powershell -ExecutionPolicy Bypass -File sglang-c\bench_all.ps1 [-Soak]
 #
 # Env switches (passthrough to cuda_cli, no script edit needed):
 #   SGL_CUDA_FP16=1  -> also benchmark CUDA fp16 row
 #   SGL_CUDA_W8=1    -> also benchmark CUDA int8 row
 #
+# -Soak: run the t11 soak+fuzz suite (tests/soak_fuzz.ps1) instead of the perf
+#        snapshot — needs a cuda_http serving on :30002 (GPU) or -Port 30003
+#        -SkipEnvDependent (CPU sglc --serve).
+#
 # Output: Markdown table to stdout + sglang-c/docs/BENCH.md (rewritten each run,
 # idempotent). Each benchmark runs twice, the better tok/s is kept.
-# --soak mode is NOT implemented here (planned in t11).
 # ============================================================
 $ErrorActionPreference = 'Continue'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root      = Split-Path -Parent $ScriptDir          # sglang/ repo root
 Set-Location $Root
+
+if ($args -contains '-Soak') {
+  & powershell -ExecutionPolicy Bypass -File (Join-Path $ScriptDir 'tests\soak_fuzz.ps1') @args
+  exit $LASTEXITCODE
+}
 
 $env:Path = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin;" + $env:Path
 

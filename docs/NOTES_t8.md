@@ -30,3 +30,10 @@
 只改 src/cuda_backend.cu（struct/kernel/上传/分派/free）、docs/BENCH.md；
 W8 默认关闭（env 显式开启），fp32/fp16 行为 bit-identical（cuda_test 无 W8 全绿
 验证）；W8 数值验收独立于 cuda_test 的严格断言（该断言设计给 bit-exact 模式）。
+
+## 补记 (2026-10-27)：cublas IMMA vs dp4a 对比（t8 原文「先 bench 两者」）
+
+`sgl_cuda_gemm_bench` 新增 int8 段（RTX 2060 实测，best of 20）：
+
+- **M=1（decode GEMV）**：两者持平——qkv/ow [896,896] dp4a 0.178ms vs IMMA 0.251ms（dp4a 快 1.41x）；lm_head [151936,896] dp4a 10.96 vs IMMA 12.02（dp4a 快 1.10x）。**选 dp4a 正确**。
+- **M>1**：IMMA 全面胜出（M=8 快 6-16x，M=64 快 30-100x）——手写 dp4a kernel 的 dim3(N,M) 网格每块独立重复量化同一行激活，大 M 严重低效。W8 的 prefill（大 M）受此影响，但 W8 主收益是显存（decode 路径），验收已过；**后续优化**：PROJ 宏 M>1 分支切 cublasGemmEx IMMA（需预量化激活到 int8 缓冲）。

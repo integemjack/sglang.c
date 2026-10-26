@@ -18,9 +18,12 @@
 
 #include "sgl/alloc.h"
 #include "sgl/bpe.h"
+#include "sgl/clip.h"
 #include "sgl/cuda.h"
 #include "sgl/json.h"
 #include "sgl/llama.h"
+#include "sgl/ops.h"
+#include "sgl/safetensors.h"
 #include "sgl/sampling.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -36,6 +39,8 @@ typedef struct request {
   rstate state;
   int *prompt;
   int n_prompt;
+  float *img_feats; /* t10: projector output [n_img][E_lm], appended after prompt */
+  int n_img;
   int gen[MAX_NEW_CAP];
   int n_gen;
   int max_new;
@@ -60,6 +65,9 @@ typedef struct {
   int vocab;
   int eos;
   int seg_len; /* ctx / MAX_CONC */
+  sgl_clip *clip;      /* t10: vision tower, NULL when model dir has no clip_config.json */
+  float *pj_w, *pj_b;  /* mm_projector linear [E_lm][proj_in] + [E_lm] */
+  int pj_in;
   request *reqs[MAX_CONC];
   int n_active;
   request *waitq_head, *waitq_tail; /* t5: queue beyond ACTIVE_CONC */
@@ -92,22 +100,74 @@ static request *req_new(const char *text, int max_new, const sgl_sampling_params
 static void req_free(request *r) {
   if (!r) return;
   sgl_xfree(r->prompt);
+  sgl_xfree(r->img_feats); /* t10: projector output (sgl_xmalloc aligned) */
   free(r->logits);
   sgl_xfree(r->text_out); /* decode_gen 返回 sgl_xmalloc（对齐）——绝不能 free() */
   free(r);
 }
 
-static int submit(const char *text, int max_new, const sgl_sampling_params *sp) {
+/* t10: image (base64 raw float CHW) -> CLIP encode -> projector -> [n_img][E_lm]
+ * features (sgl_xmalloc'd). Returns NULL on any mismatch. The data URI
+ * payload format is raw float32 [3*img*img] little-endian — JPEG/PNG decode
+ * is out of scope (HF preprocess equivalent must happen client-side). */
+static float *vision_feats(const char *b64, int *n_out) {
+  *n_out = 0;
+  if (!E.clip || !b64) return NULL;
+  /* strip the data:...;base64, prefix if present */
+  const char *comma = strrchr(b64, ',');
+  const char *p = comma ? comma + 1 : b64;
+  size_t cap = strlen(p) * 3 / 4 + 4;
+  unsigned char *raw = (unsigned char *)sgl_xmalloc(cap);
+  size_t nraw = 0;
+  int acc = 0, bits = 0;
+  for (; *p; p++) {
+    if (*p == '=' || *p == '\n' || *p == '\r') continue;
+    int c = (unsigned char)*p, v;
+    if (c >= 'A' && c <= 'Z') v = c - 'A';
+    else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+    else if (c >= '0' && c <= '9') v = c - '0' + 52;
+    else if (c == '+') v = 62;
+    else if (c == '/') v = 63;
+    else { sgl_xfree(raw); return NULL; } /* invalid b64 char */
+    acc = (acc << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      raw[nraw++] = (unsigned char)((acc >> bits) & 0xFF);
+    }
+  }
+  size_t want = (size_t)3 * E.clip->img * E.clip->img * sizeof(float);
+  if (nraw != want) { sgl_xfree(raw); return NULL; }
+  float *feats_proj = (float *)sgl_xmalloc(
+      sizeof(float) * (size_t)E.clip->n_patch * E.cpu->n_embd);
+  float *feats = (float *)sgl_xmalloc(
+      sizeof(float) * (size_t)E.clip->n_patch * E.clip->proj_dim);
+  if (sgl_clip_encode(E.clip, (const float *)raw, feats) != 0) {
+    sgl_xfree(raw); sgl_xfree(feats); sgl_xfree(feats_proj);
+    return NULL;
+  }
+  sgl_xfree(raw);
+  sgl_matmul_nt(feats, E.pj_w, E.pj_b, feats_proj, E.clip->n_patch,
+                E.cpu->n_embd, E.clip->proj_dim);
+  sgl_xfree(feats);
+  *n_out = E.clip->n_patch;
+  return feats_proj;
+}
+
+static int submit2(const char *text, int max_new, const sgl_sampling_params *sp,
+                   float *img_feats, int n_img) {
   /* t11: cap prompt length before the O(n^2)-ish BPE merge — a pathological
    * 200KB single-char body used to park encode for minutes (server hang). */
-  if (!text || strlen(text) > 65536) return -1;
+  if (!text || strlen(text) > 65536) { sgl_xfree(img_feats); return -1; }
   /* t5: no more 503 when full — park in a wait queue; the worker drains it
    * into freed slots every pass. Hard cap only guards against unbounded
    * queue growth (128 waiting). */
   EnterCriticalSection(&E.lock);
-  if (E.n_active + E.n_waitq >= 128) { LeaveCriticalSection(&E.lock); return -1; }
+  if (E.n_active + E.n_waitq >= 128) { LeaveCriticalSection(&E.lock); sgl_xfree(img_feats); return -1; }
   request *r = req_new(text, max_new, sp);
-  if (!r) { LeaveCriticalSection(&E.lock); return -1; }
+  if (!r) { LeaveCriticalSection(&E.lock); sgl_xfree(img_feats); return -1; }
+  r->img_feats = img_feats;
+  r->n_img = n_img;
   r->id = ++E.next_id;
   r->state = R_WAIT;
   int placed = 0;
@@ -190,17 +250,24 @@ static DWORD WINAPI worker(LPVOID unused) {
       int base = i * E.seg_len;
       LeaveCriticalSection(&E.lock);
       int rc;
-      if (r->n_prompt > r->seg_len) {
-        rc = -2; /* prompt exceeds its KV segment capacity */
+      if (r->n_prompt + r->n_img > r->seg_len) {
+        rc = -2; /* prompt (+visual tokens) exceeds its KV segment capacity */
       } else {
         rc = 0;
         int off = 0;
         while (off < r->n_prompt && rc == 0) {
           int chunk = r->n_prompt - off;
           /* only the last chunk needs the lm_head pass + logits D2H */
-          float *dst = (off + chunk >= r->n_prompt) ? r->logits : NULL;
+          float *dst = (off + chunk >= r->n_prompt && r->n_img == 0) ? r->logits : NULL;
           rc = sgl_cuda_forward_seg(E.gpu, r->prompt + off, chunk, off, base, dst);
           off += chunk;
+        }
+        /* t10: visual tokens go AFTER the text prompt, writing KV at
+         * [n_prompt, n_prompt+n_img) via the embedding-level forward; their
+         * last position produces the logits for the first sampled token. */
+        if (rc == 0 && r->n_img > 0) {
+          rc = sgl_cuda_forward_seg_emb(E.gpu, r->img_feats, r->n_img,
+                                        r->n_prompt, base, r->logits);
         }
       }
       EnterCriticalSection(&E.lock);
@@ -245,7 +312,7 @@ static DWORD WINAPI worker(LPVOID unused) {
       for (int b = 0; b < B; b++) {
         request *r = run[b];
         if (r->state != R_RUN) continue;
-        if (r->n_prompt + r->n_gen >= r->seg_len) {
+        if (r->n_prompt + r->n_img + r->n_gen >= r->seg_len) {
           r->state = R_DONE;
           strcpy_s(r->finish, sizeof(r->finish), "length");
           r->text_out = decode_gen(r);
@@ -253,7 +320,7 @@ static DWORD WINAPI worker(LPVOID unused) {
         }
         bt[nb] = r->gen[r->n_gen - 1];
         bb[nb] = r->seg * E.seg_len;
-        bl[nb] = r->n_prompt + r->n_gen - 1;
+        bl[nb] = r->n_prompt + r->n_img + r->n_gen - 1;
         br[nb] = r;
         nb++;
       }
@@ -387,9 +454,18 @@ static void respond_error(SOCKET fd, int code, const char *msg) {
   respond(fd, code, "application/json", body);
 }
 
-/* build chatml prompt from messages array; returns malloc'd string */
-static char *build_chatml(const sgl_json *j) {
+/* shared tail: stream (SSE) or plain response for request id (t10 refactor). */
+static int finish_request(SOCKET fd, int id, int is_stream, int chat, int openai);
+
+/* build chatml prompt from messages array; returns malloc'd string.
+ * t10: content may be an ARRAY of parts —
+ *   [{"type":"text","text":"..."},{"type":"image_url","image_url":{"url":"data:..."}}]
+ * Text parts append in order; the first image part's url is stashed (malloc'd)
+ * into *img_url_out and "<image>" is appended as a marker (visual tokens are
+ * inserted by the worker right after the whole prompt, LLaVA-style). */
+static char *build_chatml(const sgl_json *j, char **img_url_out) {
   const sgl_json *msgs = sgl_json_get(j, "messages");
+  if (img_url_out) *img_url_out = NULL;
   if (!msgs || msgs->type != SGL_JSON_ARRAY || msgs->count == 0) return NULL;
   size_t cap = 1024, len = 0;
   char *s = (char *)malloc(cap);
@@ -411,11 +487,31 @@ static char *build_chatml(const sgl_json *j) {
   for (int i = 0; i < msgs->count; i++) {
     const sgl_json *m = msgs->items[i];
     const char *role = sgl_json_get_str(m, "role", "user");
-    const char *content = sgl_json_get_str(m, "content", "");
     APPEND("<|im_start|>");
     APPEND(role);
     APPEND("\n");
-    APPEND(content);
+    const sgl_json *content = sgl_json_get(m, "content");
+    if (content && content->type == SGL_JSON_ARRAY) {
+      /* t10 multimodal content parts */
+      for (int k = 0; k < content->count; k++) {
+        const sgl_json *part = content->items[k];
+        const char *ty = sgl_json_get_str(part, "type", "");
+        if (!strcmp(ty, "text")) {
+          APPEND(sgl_json_get_str(part, "text", ""));
+        } else if (!strcmp(ty, "image_url")) {
+          const sgl_json *iu = sgl_json_get(part, "image_url");
+          const char *url = iu ? sgl_json_get_str(iu, "url", NULL) : NULL;
+          if (url && img_url_out && !*img_url_out) {
+            size_t ul = strlen(url) + 1;
+            *img_url_out = (char *)malloc(ul);
+            memcpy(*img_url_out, url, ul);
+          }
+          APPEND("<image>");
+        }
+      }
+    } else {
+      APPEND(sgl_json_get_str(m, "content", ""));
+    }
     APPEND("<|im_end|>\n");
   }
   APPEND("<|im_start|>assistant\n");
@@ -530,9 +626,31 @@ static int route(SOCKET fd, const http_req *req) {
   sgl_sampling_params sp;
   memset(&sp, 0, sizeof(sp));
   int is_stream = 0;
+  char *img_url = NULL;
   if (chat) {
-    prompt = build_chatml(j);
+    prompt = build_chatml(j, &img_url);
     if (!prompt) { sgl_json_free(j); respond_error(fd, 400, "messages required"); return 0; }
+    if (img_url) {
+      /* t10 multimodal: resolve the image now (outside the engine lock) */
+      if (!E.clip) {
+        free(prompt); free(img_url); sgl_json_free(j);
+        respond_error(fd, 400, "model has no vision tower (clip_config.json missing)");
+        return 0;
+      }
+      int n_img = 0;
+      float *feats = vision_feats(img_url, &n_img);
+      free(img_url);
+      if (!feats) {
+        free(prompt); sgl_json_free(j);
+        respond_error(fd, 400, "bad image (need base64 raw float32 [3*img*img] CHW)");
+        return 0;
+      }
+      int id2 = submit2(prompt, max_new, &sp, feats, n_img);
+      free(prompt);
+      sgl_json_free(j);
+      if (id2 < 0) { respond_error(fd, 503, "server busy"); return 0; }
+      return finish_request(fd, id2, is_stream, 1, 0);
+    }
     max_new = sgl_json_get_int(j, "max_tokens", 256);
     sp.temperature = (float)sgl_json_get_num(j, "temperature", 0.0);
     sp.top_p = (float)sgl_json_get_num(j, "top_p", 0.0);
@@ -554,9 +672,14 @@ static int route(SOCKET fd, const http_req *req) {
   sgl_json_free(j);
   if (max_new <= 0 || max_new > MAX_NEW_CAP) max_new = 256;
 
-  int id = submit(prompt, max_new, &sp);
+  int id = submit2(prompt, max_new, &sp, NULL, 0);
   free(prompt);
   if (id < 0) { respond_error(fd, 503, "prompt too long (>64KB) or server busy"); return 0; }
+  return finish_request(fd, id, is_stream, chat, openai);
+}
+
+/* shared tail: stream (SSE) or plain response for request id (t10 refactor). */
+static int finish_request(SOCKET fd, int id, int is_stream, int chat, int openai) {
 
   if (is_stream) {
     /* mark streaming then wait_done emits SSE chunks */
@@ -668,6 +791,40 @@ int main(int argc, char **argv) {
   if (!E.tok) return 2;
   E.vocab = E.cpu->vocab;
   E.eos = sgl_tokenizer_eos_id(E.tok);
+  /* t10: optional vision tower — <model_dir>/clip_config.json enables the
+ * multimodal path (/v1/chat/completions with image_url parts). */
+ {
+   char cpath[1024];
+   snprintf(cpath, sizeof(cpath), "%s/clip_config.json", dir);
+   FILE *cf = NULL;
+   fopen_s(&cf, cpath, "rb");
+   if (cf) {
+     fclose(cf);
+     E.clip = sgl_clip_load(dir);
+     if (E.clip) {
+       snprintf(cpath, sizeof(cpath), "%s/projector.safetensors", dir);
+       sgl_st_ctx *pst = sgl_st_open(cpath);
+       sgl_tensor w1 = {0}, b1 = {0};
+       if (pst) {
+         int64_t lm_e = E.cpu->n_embd;
+         w1 = sgl_st_get(pst, "linear_1.weight", 2, (int64_t[]){lm_e, E.clip->proj_dim});
+         b1 = sgl_st_get(pst, "linear_1.bias", 1, (int64_t[]){lm_e});
+       }
+       if (!w1.data || !b1.data) {
+         fprintf(stderr, "[mm] projector.safetensors missing/mismatched — vision disabled\n");
+         sgl_clip_free(E.clip); E.clip = NULL;
+       } else {
+         E.pj_w = w1.data; /* mmap-backed, lives as long as we keep pst open
+                              (never closed — server lifetime) */
+         E.pj_b = b1.data;
+         E.pj_in = E.clip->proj_dim;
+         printf("[mm] vision tower ON: CLIP E=%d L=%d patch=%d NP=%d proj=%d -> lm E=%d\n",
+                E.clip->E, E.clip->L, E.clip->P, E.clip->n_patch, E.clip->proj_dim,
+                E.cpu->n_embd);
+       }
+     }
+   }
+ }
   {
     const char *ec = getenv("SGL_HTTP_CONC");
     if (ec) {

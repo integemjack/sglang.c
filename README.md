@@ -31,7 +31,7 @@
 | Speculative decoding v2 | `srt/speculative/` | ✅ n-token 批量 verify；160m draft 接受率 13%，spec==greedy 保证 |
 | 多 LoRA 热切换 | `srt/lora/` | ✅ 运行时 add/remove，N 卡 N 选 1 |
 | **CUDA FP16 / Graph / 长上下文** | `srt/` | ✅ 1.1B fp16 入 6GB 卡；graph 批处理 +89%；ctx 16384 |
-| **LLaVA 多模态（CLIP+融合）** | `srt/models/llava.py` | ✅ CLIP ViT + projector + embedding 级融合（numpy 全等 9.3e-9） |
+| **LLaVA 多模态（CLIP+融合+HTTP）** | `srt/models/llava.py` | ✅ CLIP ViT + projector + embedding 级融合 + `/v1/chat/completions` image_url（raw float base64；JPEG 解码不支持）；numpy 全等 9.3e-9，GPU 融合 vs CPU 融合 1.2e-7 |
 | **CPU OpenBLAS / AVX2 dot** | backend | ✅ 大 M GEMM 3.1x（195 GFLOPs），运行时分派零依赖可选 |
 | SSE 流式 | `--stream` | ✅ 流式拼接与非流式严格全等 |
 
@@ -55,6 +55,16 @@ curl localhost:30000/v1/chat/completions -d '{"messages":[{"role":"user","conten
 ```
 
 模型目录格式（HF 标准）：`config.json` / `tokenizer.json` / `model.safetensors`（F32/F16/BF16）。
+
+## 环境要求（本机验证过的工具链版本）
+
+| 组件 | 版本 | 说明 |
+|---|---|---|
+| Windows CPU 栈 | WinLibs GCC **16.2**（winget `BrechtSanders.WinLibs.POSIX.UCRT`）| CMake ≥ 3.20 + Ninja；产物静态链接不依赖运行库 DLL |
+| CUDA 栈 | VS2022 Build Tools（MSVC 14.44）+ CUDA Toolkit **13.3** | sm_75+（RTX 20 系起）；与 MinGW 栈共存于独立 build 目录 |
+| 可选 OpenBLAS | **0.3.29 x64.zip**（Release 页） | 注意不是 `x64_64`（那是 64 位 int ABI，动态调用会静默读出垃圾值）；解压到 `third_party/openblas` 后 `-DSGL_OPENBLAS=ON` |
+| 源码编码 | UTF-8 **带 BOM** | MSVC/nvcc 按 GBK 读无 BOM 的中文注释会吞结构体声明；CMake configure 阶段有自检警告 |
+| 测试模型 | `models/` 目录 | 真实权重：gpt2 / tinyllama / qwen05 / qwen3-06 / llama-160m；随机生成（tests/gen_random_*.py）：mistral-rand / gemma-rand / llava-rand |
 
 ## 性能（i7-10700F 8 核，TinyLlama-1.1B fp32）
 

@@ -1,4 +1,4 @@
-﻿/* sgl/cuda.h — CUDA 后端（M9 v1）：llama 系模型的 GPU 单流前向
+/* sgl/cuda.h — CUDA 后端（M9 v1）：llama 系模型的 GPU 单流前向
  * 权重在加载时上传设备；KV 连续存储（不分页，v1）；采样在主机。
  * 复用 llama.c 的加载器（sgl_llama*）作为权重源与配置来源。 */
 #ifndef SGL_CUDA_H
@@ -17,6 +17,11 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model /* sgl_llama* */);
  * 路径；绝对位置 wpe / 带 bias 的 LayerNorm / GELU 走 gpt2 专用 kernel 组合。
  * sgl_cuda_forward* 内部按 kind 分派。fp16 开关同样生效（转置时一并转 half）。 */
 sgl_cuda_model *sgl_cuda_from_gpt2(const void *gpt2_model /* sgl_gpt2* */);
+
+/* t10 llava: 预融合视觉 embedding [n][E]（CLIP+projector 输出）直接进层循环，
+ * 跳过 token 查表；与 token 前向同一路径。仅 llama 后端（gpt2 返回 -1）。 */
+int sgl_cuda_forward_seg_emb(sgl_cuda_model *g, const float *emb, int n, int pos0,
+                             int kv_base, float *logits_out);
 
 void sgl_cuda_free(sgl_cuda_model *m);
 

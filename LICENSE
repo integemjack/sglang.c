@@ -28,3 +28,14 @@ Third-party components (optional, not distributed in this repository):
   https://www.openblas.net/ — see its LICENSE in the downloaded archive.
   SGL_OPENBLAS=ON copies the prebuilt dll next to the binaries; the engine
   runs without it (built-in SIMD kernels).
+
+Derivation notice
+-----------------
+
+This project is an independent from-scratch reimplementation of the
+architecture of sglang (https://github.com/sgl-project/sglang), which is
+licensed under the Apache License, Version 2.0. No source code was copied;
+the module-by-module correspondence is documented in README.md. In
+accordance with Apache-2.0 §4(b), the original work's NOTICE information
+is: sglang, Copyright 2023 sgl-project contributors
+(https://github.com/sgl-project/sglang/blob/main/NOTICE).
