@@ -13,6 +13,7 @@
 #include "sgl/alloc.h"
 #include "sgl/bpe.h"
 #include "sgl/cuda.h"
+#include "sgl/gpt2.h"
 #include "sgl/json.h"
 #include "sgl/llama.h"
 #include "sgl/sampling.h"
@@ -499,6 +500,75 @@ int main(int argc, char **argv) {
 
   sgl_cuda_free(gpu);
   sgl_llama_free(cpu);
+
+  /* ---- t4: GPT-2 backend (same acceptance shape: logits parity + greedy
+   * step-by-step vs the MSVC-compiled CPU reference) ---- */
+  {
+    const char *gdir = getenv("SGL_TEST_GPT2");
+    if (!gdir || !*gdir) gdir = "models/gpt2";
+    snprintf(p, sizeof(p), "%s/model.safetensors", gdir);
+    if (fopen_s(&f, p, "rb") != 0 || !f) {
+      printf("[gpt2] SKIP: no %s\n", gdir);
+    } else {
+      fclose(f);
+      sgl_gpt2 *g2 = sgl_gpt2_load(gdir);
+      CHECK(g2, "gpt2 cpu load");
+      if (g2) {
+        sgl_cuda_model *g2gpu = sgl_cuda_from_gpt2(g2);
+        CHECK(g2gpu, "gpt2 cuda upload");
+        if (g2gpu) {
+          snprintf(p, sizeof(p), "%s/tokenizer.json", gdir);
+          sgl_tokenizer *tok2 = sgl_tokenizer_load(p);
+          const char *p2 = "The capital of France is";
+          int np2 = 0;
+          int *ids2 = sgl_tokenizer_encode(tok2, p2, strlen(p2), &np2);
+          int V2 = g2->vocab;
+          float *lc2 = (float *)sgl_xmalloc(sizeof(float) * (size_t)V2);
+          float *lg2 = (float *)sgl_xmalloc(sizeof(float) * (size_t)V2);
+          int need2 = np2 + 24;
+          int *pg2 = (int *)sgl_xmalloc(sizeof(int) * (size_t)need2);
+          CHECK(sgl_gpt2_pages_alloc(g2, pg2, need2) == 0, "gpt2 pages");
+          CHECK(sgl_gpt2_prefill(g2, ids2, np2, 0, pg2, lc2) == 0, "gpt2 cpu prefill");
+          CHECK(sgl_cuda_forward(g2gpu, ids2, np2, 0, lg2) == 0, "gpt2 cuda forward");
+          double me2 = 0;
+          for (int i = 0; i < V2; i++) {
+            double e = fabs((double)lc2[i] - lg2[i]);
+            if (e > me2) me2 = e;
+          }
+          printf("[gpt2] prefill logits maxerr = %g (CPU vs GPU)\n", me2);
+          CHECK(me2 < LOGITS_MAXERR_LIMIT, "gpt2 logits diff %g", me2);
+          int gc2 = sgl_sample_greedy(lc2, V2), gg2 = sgl_sample_greedy(lg2, V2);
+          CHECK(gc2 == gg2, "gpt2 greedy first step");
+          int len2 = np2, okg = 1;
+          for (int s = 0; s < 16; s++) {
+            CHECK(sgl_cuda_forward(g2gpu, &gc2, 1, len2, lg2) == 0, "gpt2 gpu step");
+            gg2 = sgl_sample_greedy(lg2, V2);
+            CHECK(sgl_gpt2_prefill(g2, &gc2, 1, len2, pg2, lc2) == 0, "gpt2 cpu step");
+            gc2 = sgl_sample_greedy(lc2, V2);
+            if (gg2 != gc2) {
+              float gp2;
+              int t1g = top1_gap(lg2, V2, &gp2);
+              if (FP16 && gp2 < GAP_EXPLAIN) {
+                printf("[gpt2][fp16] step %d flip gap=%.4g -> explainable\n", s, gp2);
+              } else {
+                printf("[gpt2] step %d: gpu=%d cpu=%d (gpu top1=%d gap=%g)\n",
+                       s, gg2, gc2, t1g, gp2);
+                okg = 0;
+              }
+            }
+            gc2 = gg2;
+            len2++;
+          }
+          printf("[gpt2] 16-step greedy %s\n", okg ? "== CPU ✓" : "MISMATCH");
+          CHECK(okg || FP16, "gpt2 greedy mismatch");
+          sgl_xfree(pg2); sgl_xfree(lc2); sgl_xfree(lg2); sgl_xfree(ids2);
+          sgl_cuda_free(g2gpu);
+        }
+        sgl_gpt2_free(g2);
+      }
+    }
+  }
+
   if (FAILURES) { printf("test_cuda: %d FAILURES\n", FAILURES); return 1; }
   printf("test_cuda: all OK\n");
   return 0;

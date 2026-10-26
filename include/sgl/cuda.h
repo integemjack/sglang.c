@@ -1,4 +1,4 @@
-﻿/* sgl/cuda.h — CUDA 后端（M9 v1）：llama 系模型的 GPU 单流前向
+/* sgl/cuda.h — CUDA 后端（M9 v1）：llama 系模型的 GPU 单流前向
  * 权重在加载时上传设备；KV 连续存储（不分页，v1）；采样在主机。
  * 复用 llama.c 的加载器（sgl_llama*）作为权重源与配置来源。 */
 #ifndef SGL_CUDA_H
@@ -12,6 +12,11 @@ typedef struct sgl_cuda_model sgl_cuda_model;
 
 /* 从已加载的 CPU 模型构建 GPU 实例（拷贝全部权重到设备）；失败 NULL */
 sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model /* sgl_llama* */);
+
+/* t4: GPT-2 后端。Conv1D [K,N] 权重在上传时转置为 [N,K] 复用现有 gemm/attention
+ * 路径；绝对位置 wpe / 带 bias 的 LayerNorm / GELU 走 gpt2 专用 kernel 组合。
+ * sgl_cuda_forward* 内部按 kind 分派。fp16 开关同样生效（转置时一并转 half）。 */
+sgl_cuda_model *sgl_cuda_from_gpt2(const void *gpt2_model /* sgl_gpt2* */);
 
 void sgl_cuda_free(sgl_cuda_model *m);
 

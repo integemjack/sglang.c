@@ -1,4 +1,4 @@
-﻿/* sgl cuda_backend.cu - llama-family GPU forward (M9 v1)
+/* sgl cuda_backend.cu - llama-family GPU forward (M9 v1)
  * kernels: embed / rmsnorm / gemm_nt (block-reduce dot) / rope (precomputed
  * freqs) / attention (block per (t,h), shared scores) / silu_mul / residual.
  * Numerics match llama.c (fp32; reduction order may differ ~1e-5). */
@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "sgl/cuda.h"
+#include "sgl/gpt2.h"
 #include "sgl/llama.h"
 
 #define CK(x)                                                            \
@@ -49,6 +50,16 @@ struct sgl_cuda_model {
   cudaStream_t stream;      /* all launches go here (0 = legacy default) */
   void *blas_ws;            /* cublas workspace (pre-allocated, graph-safe) */
   size_t blas_ws_size;
+
+  /* t4 GPT-2 backend (kind=1): llama slots are reused where the math matches
+   * (ln1/ln2 = gamma-only norm weight, qw = transposed qkv W [3E,E],
+   * ow = transposed attn c_proj, gw = transposed c_fc [4E,E], dw = transposed
+   * mlp c_proj [E,4E], wte/lm_head = tied). Extras live below. */
+  int kind;                 /* 0 = llama, 1 = gpt2 */
+  float *wpe;               /* [ctx,E] absolute position embeddings */
+  float *lnf_b;             /* final layernorm beta [E] */
+  float **lnb1, **lnb2;     /* per-layer layernorm betas [E] */
+  float **qkvb, **ob, **fcb, **mb; /* per-layer proj biases: [3E] [E] [4E] [E] */
 
   /* t1 fp16 path (SGL_CUDA_FP16=1): weights stored as __half, activations /
    * KV / attention / rope / softmax stay fp32. Only GEMMs consume half:
@@ -157,6 +168,66 @@ __global__ void k_embed_h(const __half *wte, const int *tok, float *x, int n, in
   x[idx] = __half2float(wte[(long)tok[idx / E] * E + idx % E]);
 }
 
+/* t4 gpt2: x[t] = wte[tok[t]] + wpe[pos0+t] (absolute positions, fp32) */
+__global__ void k_embed_pos(const float *wte, const float *wpe, const int *tok,
+                            float *x, int n, int E, int pos0) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n * E) return;
+  int t = idx / E;
+  x[idx] = wte[(long)tok[t] * E + idx % E] + wpe[(long)(pos0 + t) * E + idx % E];
+}
+
+/* t4 gpt2 fp16 weights: embed table is half, wpe stays fp32 (small) */
+__global__ void k_embed_pos_h(const __half *wte, const float *wpe, const int *tok,
+                              float *x, int n, int E, int pos0) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n * E) return;
+  int t = idx / E;
+  x[idx] = __half2float(wte[(long)tok[t] * E + idx % E]) + wpe[(long)(pos0 + t) * E + idx % E];
+}
+
+/* t4 gpt2: LayerNorm WITH beta (mean/var form, matches sgl_layernorm numerics) */
+__global__ void k_layernorm_b(const float *x, const float *g, const float *b,
+                              float *y, int M, int N, float eps) {
+  extern __shared__ float red[];
+  int m = blockIdx.x;
+  const float *xr = x + (long)m * N;
+  float *yr = y + (long)m * N;
+  float sm = 0;
+  for (int i = threadIdx.x; i < N; i += blockDim.x) sm += xr[i];
+  red[threadIdx.x] = sm;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  float mean = red[0] / N;
+  float sv = 0;
+  for (int i = threadIdx.x; i < N; i += blockDim.x) {
+    float d = xr[i] - mean;
+    sv += d * d;
+  }
+  red[threadIdx.x] = sv;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  float inv = rsqrtf(red[0] / N + eps);
+  for (int i = threadIdx.x; i < N; i += blockDim.x)
+    yr[i] = (xr[i] - mean) * inv * g[i] + b[i];
+}
+
+/* t4 gpt2: tanh-approx GELU in place (same formula as sgl_gelu_inplace) */
+__global__ void k_gelu(float *row, long n) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float k = 0.7978845608028654f;
+  float x = row[i];
+  float inner = k * (x + 0.044715f * x * x * x);
+  row[i] = 0.5f * x * (1.0f + tanhf(inner));
+}
+
 /* fp32 -> fp16 elementwise conversion (GEMM input mirror for cublasGemmEx) */
 __global__ void k_f2h(const float *src, __half *dst, long n) {
   long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
@@ -200,12 +271,14 @@ __global__ void k_rope_rows(float *qk, int n, int head_dim, const int *pos_row,
 
 __global__ void k_attn(const float *q, const float *kc, const float *vc,
                        float *out, int pos0, int kv_base, int n, int H, int HK, int D,
-                       float scale) {
+                       float scale, int q_stride) {
   extern __shared__ float sc[];
   int th = blockIdx.x;
   int t = th / H, h = th % H;
   int upto = pos0 + t + 1;
-  const float *qh = q + ((long)t * H + h) * D;
+  /* q_stride: row width of the q buffer — E for llama, 3E when the fused
+   * gpt2 qkv buffer is passed directly (t4) */
+  const float *qh = q + (long)t * q_stride + h * D;
   int hkv = h / (H / HK);
   float maxv = -1e30f;
   for (int p = threadIdx.x; p < upto; p += blockDim.x) {
@@ -540,7 +613,9 @@ static int sgl_cuda_reserve(sgl_cuda_model *g, int n) {
   if (n <= g->ws_cap) return 0;
   float *x = dev_copy(NULL, (size_t)n * g->E);
   float *h = dev_copy(NULL, (size_t)n * g->E);
-  float *q = dev_copy(NULL, (size_t)n * g->E);
+  /* t4 gpt2: the q slot doubles as the fused-qkv buffer [n,3E] */
+  int q_cols = g->kind == 1 ? 3 * g->E : g->E;
+  float *q = dev_copy(NULL, (size_t)n * q_cols);
   float *a = dev_copy(NULL, (size_t)n * g->E);
   float *k = dev_copy(NULL, (size_t)n * g->KD);
   float *v = dev_copy(NULL, (size_t)n * g->KD);
@@ -808,6 +883,123 @@ fail:
   return NULL;
 }
 
+/* t4: transpose-copy helper — HF Conv1D weight is [K,N] row-major; llama's
+ * gemm path wants [N,K] (W row n = weight column n). Host-side one-shot. */
+static float *dev_copy_transposed(const float *src, int K, int N, int to_half) {
+  float *buf = (float *)malloc((size_t)N * K * sizeof(float));
+  if (!buf) return NULL;
+  for (int k = 0; k < K; k++)
+    for (int n = 0; n < N; n++)
+      buf[(size_t)n * K + k] = src[(size_t)k * N + n];
+  float *d = to_half ? (float *)dev_copy_h(buf, (size_t)N * K) : dev_copy(buf, (size_t)N * K);
+  free(buf);
+  return d;
+}
+
+sgl_cuda_model *sgl_cuda_from_gpt2(const void *gpt2_model) {
+  const sgl_gpt2 *m = (const sgl_gpt2 *)gpt2_model;
+  if (!m) return NULL;
+  sgl_cuda_model *g = (sgl_cuda_model *)calloc(1, sizeof(*g));
+  size_t ctx = 0;
+  g->kind = 1;
+  g->L = m->n_layer; g->H = m->n_head; g->HK = m->n_head; /* no GQA */
+  g->E = m->n_embd; g->I = 4 * m->n_embd; g->V = m->vocab;
+  g->D = m->n_embd / m->n_head; g->KD = m->n_embd; g->ctx = m->n_ctx;
+  g->eps = m->ln_eps; g->theta = 10000.0; /* unused */
+  {
+    const char *fe = getenv("SGL_CUDA_FP16");
+    g->use_fp16 = (fe && atoi(fe)) ? 1 : 0;
+  }
+  {
+    const char *e = getenv("SGL_CUDA_CTX");
+    int cap = (e && atoi(e) > 0) ? atoi(e) : m->n_ctx; /* gpt2 ctx=1024 fits */
+    if (g->ctx > cap) g->ctx = cap;
+  }
+
+  if (g->use_fp16) {
+    g->wte_h = dev_copy_h(m->wte.data, (size_t)m->vocab * m->n_embd);
+    g->lm_head_h = g->wte_h; /* tied */
+    if (!g->wte_h) goto fail;
+  } else {
+    g->wte = dev_copy(m->wte.data, (size_t)m->vocab * m->n_embd);
+    g->lm_head = g->wte; /* tied */
+    if (!g->wte) goto fail;
+  }
+  g->wpe = dev_copy(m->wpe.data, (size_t)g->ctx * m->n_embd);
+  g->final_norm = dev_copy(m->lnf_g.data, (size_t)m->n_embd);
+  g->lnf_b = dev_copy(m->lnf_b.data, (size_t)m->n_embd);
+  if (!g->wpe || !g->final_norm || !g->lnf_b) goto fail;
+
+  g->ln1 = (float **)calloc(g->L, sizeof(float *));
+  g->ln2 = (float **)calloc(g->L, sizeof(float *));
+  g->lnb1 = (float **)calloc(g->L, sizeof(float *));
+  g->lnb2 = (float **)calloc(g->L, sizeof(float *));
+  g->qkvb = (float **)calloc(g->L, sizeof(float *));
+  g->ob = (float **)calloc(g->L, sizeof(float *));
+  g->fcb = (float **)calloc(g->L, sizeof(float *));
+  g->mb = (float **)calloc(g->L, sizeof(float *));
+  /* qkv W lives in qw slot (transposed [3E,E]); attn c_proj in ow; c_fc in
+   * gw ([4E,E]); mlp c_proj in dw ([E,4E]). fp16 mirrors use the _h slots. */
+  g->qw = (float **)calloc(g->L, sizeof(float *));
+  g->ow = (float **)calloc(g->L, sizeof(float *));
+  g->gw = (float **)calloc(g->L, sizeof(float *));
+  g->dw = (float **)calloc(g->L, sizeof(float *));
+  if (g->use_fp16) {
+    g->qw_h = (__half **)calloc(g->L, sizeof(__half *));
+    g->ow_h = (__half **)calloc(g->L, sizeof(__half *));
+    g->gw_h = (__half **)calloc(g->L, sizeof(__half *));
+    g->dw_h = (__half **)calloc(g->L, sizeof(__half *));
+  }
+  if (!g->lnb1 || !g->qkvb || !g->ob || !g->fcb || !g->mb || !g->lnb2) goto fail;
+
+  for (int l = 0; l < g->L; l++) {
+    const sgl_gpt2_layer *L = &m->layers[l];
+    int E = g->E, E3 = 3 * E, E4 = 4 * E;
+    if (g->use_fp16) {
+      g->qw_h[l] = (__half *)dev_copy_transposed(L->qkv_w.data, E, E3, 1);
+      g->ow_h[l] = (__half *)dev_copy_transposed(L->proj_w.data, E, E, 1);
+      g->gw_h[l] = (__half *)dev_copy_transposed(L->fc_w.data, E, E4, 1);
+      g->dw_h[l] = (__half *)dev_copy_transposed(L->mlp_proj_w.data, E4, E, 1);
+      if (!g->qw_h[l] || !g->gw_h[l] || !g->dw_h[l]) goto fail;
+    } else {
+      g->qw[l] = dev_copy_transposed(L->qkv_w.data, E, E3, 0);
+      g->ow[l] = dev_copy_transposed(L->proj_w.data, E, E, 0);
+      g->gw[l] = dev_copy_transposed(L->fc_w.data, E, E4, 0);
+      g->dw[l] = dev_copy_transposed(L->mlp_proj_w.data, E4, E, 0);
+      if (!g->qw[l] || !g->gw[l] || !g->dw[l]) goto fail;
+    }
+    g->ln1[l] = dev_copy(L->ln1_g.data, (size_t)E);
+    g->lnb1[l] = dev_copy(L->ln1_b.data, (size_t)E);
+    g->ln2[l] = dev_copy(L->ln2_g.data, (size_t)E);
+    g->lnb2[l] = dev_copy(L->ln2_b.data, (size_t)E);
+    g->qkvb[l] = dev_copy(L->qkv_b.data, (size_t)E3);
+    g->ob[l] = dev_copy(L->proj_b.data, (size_t)E);
+    g->fcb[l] = dev_copy(L->fc_b.data, (size_t)E4);
+    g->mb[l] = dev_copy(L->mlp_proj_b.data, (size_t)E);
+    if (!g->ln1[l] || !g->lnb1[l] || !g->ln2[l] || !g->lnb2[l] ||
+        !g->qkvb[l] || !g->ob[l] || !g->fcb[l] || !g->mb[l]) goto fail;
+  }
+
+  if (cublasCreate(&g->blas) != CUBLAS_STATUS_SUCCESS) goto fail;
+  if (cudaStreamCreate(&g->stream) != cudaSuccess) goto fail;
+  cublasSetStream(g->blas, g->stream);
+  g->blas_ws_size = (size_t)32 << 20;
+  if (cudaMalloc(&g->blas_ws, g->blas_ws_size) != cudaSuccess) g->blas_ws_size = 0;
+  else cublasSetWorkspace(g->blas, g->blas_ws, g->blas_ws_size);
+
+  ctx = (size_t)g->ctx;
+  g->kc = dev_copy(NULL, (size_t)g->L * ctx * g->KD);
+  g->vc = dev_copy(NULL, (size_t)g->L * ctx * g->KD);
+  if (!g->kc || !g->vc) goto fail;
+  if (g->use_fp16) printf("[cuda] gpt2 fp16 weights ON (SGL_CUDA_FP16=1)\n");
+  return g;
+
+fail:
+  fprintf(stderr, "sgl_cuda_from_gpt2: out of VRAM or copy failed\n");
+  sgl_cuda_free(g);
+  return NULL;
+}
+
 void sgl_cuda_free(sgl_cuda_model *g) {
   if (!g) return;
   if (g->blas) cublasDestroy(g->blas);
@@ -836,6 +1028,17 @@ void sgl_cuda_free(sgl_cuda_model *g) {
   cudaFree(g->freqs); cudaFree(g->kc); cudaFree(g->vc);
   cudaFree(g->x); cudaFree(g->h); cudaFree(g->q); cudaFree(g->k); cudaFree(g->v);
   cudaFree(g->attn); cudaFree(g->gate); cudaFree(g->up);
+  /* t4 gpt2 extras */
+  cudaFree(g->wpe); cudaFree(g->lnf_b);
+  for (int l = 0; l < g->L; l++) {
+    if (g->lnb1 && g->lnb1[l]) cudaFree(g->lnb1[l]);
+    if (g->lnb2 && g->lnb2[l]) cudaFree(g->lnb2[l]);
+    if (g->qkvb && g->qkvb[l]) cudaFree(g->qkvb[l]);
+    if (g->ob && g->ob[l]) cudaFree(g->ob[l]);
+    if (g->fcb && g->fcb[l]) cudaFree(g->fcb[l]);
+    if (g->mb && g->mb[l]) cudaFree(g->mb[l]);
+  }
+  free(g->lnb1); free(g->lnb2); free(g->qkvb); free(g->ob); free(g->fcb); free(g->mb);
   for (int l = 0; l < g->L; l++) {
     if (g->ln1 && g->ln1[l]) cudaFree(g->ln1[l]);
     if (g->qw && g->qw[l]) cudaFree(g->qw[l]);
@@ -878,8 +1081,88 @@ int sgl_cuda_forward(sgl_cuda_model *g, const int *tokens, int n, int pos0,
   return sgl_cuda_forward_seg(g, tokens, n, pos0, 0, logits_out);
 }
 
+/* t4: GPT-2 block forward (embed+pos / LN+bias / fused qkv / shared-scores
+ * attention / GELU MLP / tied lm_head). KV rows scatter from the fused qkv
+ * buffer via 2D memcpy (row layout [q|k|v], src pitch 3E). */
+static int gpt2_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
+                            int kv_base, float *logits_out) {
+  int E = g->E, H = g->H, D = g->D, KD = g->KD, E3 = 3 * E;
+  if (n <= 0 || pos0 + n > g->ctx) return -1;
+  if (kv_base + pos0 + n > g->ctx) return -1;
+  if (sgl_cuda_reserve(g, n) != 0) return -1;
+  if (sgl_cuda_ensure_io(g, n) != 0) return -1;
+
+  memcpy(g->h_tok, tokens, sizeof(int) * (size_t)n);
+  CK(cudaMemcpyAsync(g->d_tok, g->h_tok, sizeof(int) * (size_t)n,
+                     cudaMemcpyHostToDevice, g->stream));
+  if (g->use_fp16)
+    k_embed_pos_h<<<(int)((n * (long)E + 255) / 256), 256, 0, g->stream>>>(
+        g->wte_h, g->wpe, g->d_tok, g->x, n, E, pos0);
+  else
+    k_embed_pos<<<(int)((n * (long)E + 255) / 256), 256, 0, g->stream>>>(
+        g->wte, g->wpe, g->d_tok, g->x, n, E, pos0);
+  CK(cudaGetLastError());
+
+  for (int l = 0; l < g->L; l++) {
+    k_layernorm_b<<<n, 256, 256 * sizeof(float), g->stream>>>(
+        g->x, g->ln1[l], g->lnb1[l], g->h, n, E, g->eps);
+    CK(cudaGetLastError());
+    /* fused qkv: [n,3E] lands in the q slot */
+    gemm_nt_any(g, g->h, g->qw[l], g->qw_h ? g->qw_h[l] : NULL, g->qkvb[l],
+                g->q, n, E3, E);
+    CK(cudaGetLastError());
+    /* KV scatter: k/v rows are at +E/+2E inside each 3E-stride qkv row */
+    {
+      float *kcl = g->kc + (long)l * g->ctx * KD;
+      float *vcl = g->vc + (long)l * g->ctx * KD;
+      size_t row = (size_t)KD * sizeof(float);
+      size_t src_pitch = (size_t)E3 * sizeof(float);
+      size_t dst_off = (size_t)(kv_base + pos0) * row;
+      CK(cudaMemcpy2DAsync((char *)kcl + dst_off, row, (char *)g->q + E * sizeof(float),
+                           src_pitch, row, n, cudaMemcpyDeviceToDevice, g->stream));
+      CK(cudaMemcpy2DAsync((char *)vcl + dst_off, row, (char *)g->q + 2 * E * sizeof(float),
+                           src_pitch, row, n, cudaMemcpyDeviceToDevice, g->stream));
+    }
+    k_attn<<<n * H, 256, (size_t)(pos0 + n) * sizeof(float), g->stream>>>(
+        g->q, g->kc + (long)l * g->ctx * KD, g->vc + (long)l * g->ctx * KD,
+        g->attn, pos0, kv_base, n, H, H, D, 1.0f / sqrtf((float)D), E3);
+    CK(cudaGetLastError());
+    gemm_nt_any(g, g->attn, g->ow[l], g->ow_h ? g->ow_h[l] : NULL, g->ob[l],
+                g->h, n, E, E);
+    CK(cudaGetLastError());
+    k_residual<<<(int)(((long)n * E + 255) / 256), 256, 0, g->stream>>>(g->x, g->h, (long)n * E);
+    k_layernorm_b<<<n, 256, 256 * sizeof(float), g->stream>>>(
+        g->x, g->ln2[l], g->lnb2[l], g->h, n, E, g->eps);
+    CK(cudaGetLastError());
+    gemm_nt_any(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, g->fcb[l],
+                g->gate, n, g->I, E);
+    CK(cudaGetLastError());
+    k_gelu<<<(int)(((long)n * g->I + 255) / 256), 256, 0, g->stream>>>(g->gate, (long)n * g->I);
+    gemm_nt_any(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, g->mb[l],
+                g->h, n, E, g->I);
+    CK(cudaGetLastError());
+    k_residual<<<(int)(((long)n * E + 255) / 256), 256, 0, g->stream>>>(g->x, g->h, (long)n * E);
+    CK(cudaGetLastError());
+  }
+  k_layernorm_b<<<n, 256, 256 * sizeof(float), g->stream>>>(
+      g->x, g->final_norm, g->lnf_b, g->h, n, E, g->eps);
+  CK(cudaGetLastError());
+  if (logits_out) {
+    if (sgl_cuda_ensure_lgb(g, 1) != 0) return -1;
+    gemm_nt_any(g, g->h + (long)(n - 1) * E, g->lm_head, g->lm_head_h, NULL,
+                g->d_lgb, 1, g->V, E);
+    CK(cudaGetLastError());
+    CK(cudaMemcpyAsync(g->h_lgb, g->d_lgb, sizeof(float) * (size_t)g->V,
+                       cudaMemcpyDeviceToHost, g->stream));
+    CK(cudaStreamSynchronize(g->stream));
+    memcpy(logits_out, g->h_lgb, sizeof(float) * (size_t)g->V);
+  }
+  return 0;
+}
+
 int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
                          int kv_base, float *logits_out) {
+  if (g->kind == 1) return gpt2_forward_seg(g, tokens, n, pos0, kv_base, logits_out);
   int E = g->E, H = g->H, HK = g->HK, D = g->D, KD = g->KD;
   if (n <= 0 || pos0 + n > g->ctx) return -1;
   if (kv_base + pos0 + n > g->ctx) return -1;
@@ -939,7 +1222,7 @@ int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
       } else {
         k_attn<<<n * H, 256, (size_t)(pos0 + n) * sizeof(float), g->stream>>>(
             g->q, g->kc + (long)l * g->ctx * KD, g->vc + (long)l * g->ctx * KD,
-            g->attn, pos0, kv_base, n, H, HK, D, 1.0f / sqrtf((float)D));
+            g->attn, pos0, kv_base, n, H, HK, D, 1.0f / sqrtf((float)D), E);
       }
     }
     CK(cudaGetLastError());

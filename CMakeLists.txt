@@ -158,7 +158,7 @@ if(SGL_CUDA)
     VERBATIM)
   set(SGL_CORE_SRC
       src/alloc.c src/log.c src/json.c src/tensor.c src/safetensors.c
-      src/bpe.c src/ops.c src/quant.c src/llama.c src/sampling.c)
+      src/bpe.c src/ops.c src/quant.c src/llama.c src/gpt2.c src/sampling.c)
   add_library(sgl_cuda STATIC ${SGL_CORE_SRC} ${SGL_CUDA_OBJ})
   target_include_directories(sgl_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   if(MSVC)
