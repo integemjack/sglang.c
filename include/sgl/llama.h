@@ -1,4 +1,4 @@
-/* sgl/llama.h — Llama 系模型（Llama/TinyLlama/Qwen 同构：RoPE/RMSNorm/SwiGLU/GQA）
+﻿/* sgl/llama.h — Llama 系模型（Llama/TinyLlama/Qwen 同构：RoPE/RMSNorm/SwiGLU/GQA）
  * 对应 sglang srt/models/llama.py 的 CPU 单流路径（prefill + 增量 decode）。
  * KV 池：分页 + 引用计数（与 gpt2 相同语义，页大小 = kv_dim）。 */
 #ifndef SGL_LLAMA_H

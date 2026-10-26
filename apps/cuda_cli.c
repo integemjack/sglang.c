@@ -1,4 +1,4 @@
-/* sgl cuda_cli.c - standalone CUDA inference CLI (MSVC build, links sgl_cuda)
+﻿/* sgl cuda_cli.c - standalone CUDA inference CLI (MSVC build, links sgl_cuda)
  * usage: cuda_cli.exe <model_dir> "<prompt>" [max_new] [temperature] */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>

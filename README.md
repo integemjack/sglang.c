@@ -4,7 +4,7 @@
 
 **用纯 C 重写的 SGLang 推理引擎** —— 从 [sgl-project/sglang](https://github.com/sgl-project/sglang)（核心 Python 约 138 万行）重构而来的 CPU 推理栈，零第三方依赖（仅 MinGW-w64 运行库静态链接）。
 
-> 进度：M0–M19 + M21 + M26 完成（见 [ROADMAP.md](ROADMAP.md)）。CPU 15/15 + CUDA 全绿，GPT-2 / TinyLlama-1.1B / Qwen2.5-0.5B 三套真实权重验证。
+> 进度：M0–M26 + t1–t12 完成（见 [ROADMAP.md](ROADMAP.md) / [CHANGELOG.md](CHANGELOG.md)）。CPU 20/20 + CUDA 全绿；GPT-2 / TinyLlama-1.1B / Qwen2.5-0.5B / **Qwen3-0.6B** 真实权重验证。
 
 ## 下载（预编译）
 
@@ -20,17 +20,22 @@
 
 | 功能 | 对应 sglang 模块 | 状态 |
 |---|---|---|
-| GPT-2 / Llama / Qwen2 后端 | `srt/models/` | ✅ 与 numpy/HF 数值对照（maxerr ≤ 2e-4，SIMD 后 1e-8） |
+| GPT-2 / Llama / Qwen2 / **Qwen3** 后端 | `srt/models/` | ✅ 与 numpy/HF 数值对照（maxerr ≤ 2e-4，SIMD 后 1e-8） |
+| **Mistral 滑窗 / Gemma 归一化** | `srt/models/` | ✅ 随机结构 numpy 全等（tests/gen_random_*.py） |
 | 连续批处理调度器 | `srt/managers/scheduler.py` | ✅ 批处理输出与串行逐 token 全等，3 并发 +68% |
-| HTTP 服务（OpenAI 兼容） | `entrypoints/http_server.py` | ✅ /generate /v1/completions /v1/chat/completions（chat 模板/stop/n/stream SSE） |
+| HTTP 服务（OpenAI 兼容，CPU+GPU 双栈） | `entrypoints/http_server.py` | ✅ /generate /v1/completions /v1/chat/completions + 超限排队 + finish_reason 如实 |
 | RadixAttention 前缀缓存 | `srt/mem_cache/radix_cache.py` | ✅ 分页 KV + 引用计数 + LRU 驱逐，长 prompt 命中提速 ~40% |
-| W8A16 量化 | `srt/layers/quantization` | ✅ int8 权重，decode 1.76x，greedy 一致 |
+| W8A16 量化（CPU）/ **W8A8 dp4a（CUDA）** | `srt/layers/quantization` | ✅ CPU decode 1.76x；CUDA 显存最优档（free VRAM 3947MB） |
 | int8 KV cache | fp8/int8 KV 路线 | ✅ 内存减半，吞吐 +20% |
 | Beam search | `srt/beam_search/` | ✅ W≤8，W=1 == greedy 硬断言 |
-| Speculative decoding | `srt/speculative/` | ✅ 框架 + 数学正确性验证（draft 模型待接入） |
+| Speculative decoding v2 | `srt/speculative/` | ✅ n-token 批量 verify；160m draft 接受率 13%，spec==greedy 保证 |
+| 多 LoRA 热切换 | `srt/lora/` | ✅ 运行时 add/remove，N 卡 N 选 1 |
+| **CUDA FP16 / Graph / 长上下文** | `srt/` | ✅ 1.1B fp16 入 6GB 卡；graph 批处理 +89%；ctx 16384 |
+| **LLaVA 多模态（CLIP+融合）** | `srt/models/llava.py` | ✅ CLIP ViT + projector + embedding 级融合（numpy 全等 9.3e-9） |
+| **CPU OpenBLAS / AVX2 dot** | backend | ✅ 大 M GEMM 3.1x（195 GFLOPs），运行时分派零依赖可选 |
 | SSE 流式 | `--stream` | ✅ 流式拼接与非流式严格全等 |
 
-**未覆盖**：CUDA 后端（M9，需 MSVC 工具链）、张量并行、多模态、LoRA。
+**未覆盖**：张量并行、真实 LLaVA 权重端到端（结构已验证）、GPU 侧 sliding window。
 
 ## 快速开始
 
@@ -38,7 +43,7 @@
 # 构建（MinGW-w64 + CMake + Ninja）
 cmake -S sglang-c -B sglang-c/build -G Ninja
 cmake --build sglang-c/build
-ctest --test-dir sglang-c/build          # 14 套测试（部分需 models/ 下真实权重）
+ctest --test-dir sglang-c/build          # 20 套测试（部分需 models/ 下真实权重）
 
 # 交互生成（GPT-2 124M / TinyLlama-1.1B / Qwen2.5-0.5B）
 sglang-c/build/bin/sglc --model models/gpt2 --prompt "The meaning of life is" --max-new 32

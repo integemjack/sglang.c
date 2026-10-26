@@ -1,4 +1,4 @@
-/* sgl/clip.h — CLIP ViT encoder (LLaVA 视觉塔, t10) */
+﻿/* sgl/clip.h — CLIP ViT encoder (LLaVA 视觉塔, t10) */
 #ifndef SGL_CLIP_H
 #define SGL_CLIP_H
 

@@ -1,4 +1,4 @@
-/* sgl/tensor.h — 张量（PyTorch torch.Tensor 的最小 C 子集：1D/2D/3D f32） */
+﻿/* sgl/tensor.h — 张量（PyTorch torch.Tensor 的最小 C 子集：1D/2D/3D f32） */
 #ifndef SGL_TENSOR_H
 #define SGL_TENSOR_H
 

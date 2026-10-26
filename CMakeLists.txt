@@ -65,6 +65,16 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   endif()
 endif()
 
+# ---- 源码 UTF-8 BOM 自检（MSVC/nvcc 按 GBK 读无 BOM 的中文注释会吞结构体声明，t11 踩坑两次）----
+file(GLOB _bomcheck_src ${CMAKE_CURRENT_SOURCE_DIR}/src/*.[ch] ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu
+     ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl/*.h ${CMAKE_CURRENT_SOURCE_DIR}/apps/*.c)
+foreach(_f ${_bomcheck_src})
+  file(READ ${_f} _magic LIMIT 3 HEX)
+  if(NOT _magic STREQUAL "efbbbf")
+    message(WARNING "missing UTF-8 BOM (MSVC build will misparse CJK comments): ${_f}")
+  endif()
+endforeach()
+
 # ---- t12.1 OpenBLAS 运行时分派（可选）----
 # ops.c 在运行时 LoadLibrary libopenblas.dll（SGL_BLAS=0 可强制内置路径）；
 # SGL_OPENBLAS=ON 只把 third_party 预编译 dll 拷到可执行文件目录，方便被找到。

@@ -1,4 +1,4 @@
-/* sgl cuda_backend.cu - llama-family GPU forward (M9 v1)
+﻿/* sgl cuda_backend.cu - llama-family GPU forward (M9 v1)
  * kernels: embed / rmsnorm / gemm_nt (block-reduce dot) / rope (precomputed
  * freqs) / attention (block per (t,h), shared scores) / silu_mul / residual.
  * Numerics match llama.c (fp32; reduction order may differ ~1e-5). */

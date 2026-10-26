@@ -1,4 +1,4 @@
-/* sgl http 实现：winsock2 + 每连接一线程 + worker 驱动调度器 */
+﻿/* sgl http 实现：winsock2 + 每连接一线程 + worker 驱动调度器 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/http.h"
 #include "sgl/log.h"
