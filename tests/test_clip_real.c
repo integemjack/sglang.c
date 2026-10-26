@@ -62,6 +62,26 @@ int main(int argc, char **argv) {
   if (!dir || !*dir) { printf("test_clip_real: SKIP（没给 clip 目录）\n"); return 0; }
 
   char path[1024];
+  /* 真实 CLIP 权重 + torch 参考都不入库（~350MB + ~7MB npy）：缺就 SKIP。
+   * CMake 已经只在两者都存在时才注册本测试（防 fresh-clone 红），这里再加一道
+   * 保险——手跑 exe 或将来改变注册条件时不至于把「没下载」当「失败」。 */
+  {
+    FILE *pf = NULL;
+    snprintf(path, sizeof(path), "%s/model.safetensors", dir);
+    fopen_s(&pf, path, "rb");
+    if (!pf) {
+      printf("test_clip_real: SKIP（无 %s；见 docs/NOTES_g8.md §1 准备权重）\n", dir);
+      return 0;
+    }
+    fclose(pf);
+    snprintf(path, sizeof(path), "%s/ref/pv.npy", dir);
+    fopen_s(&pf, path, "rb");
+    if (!pf) {
+      printf("test_clip_real: SKIP（无 %s；先跑 python tests/clip_real_ref.py <clip目录>）\n", path);
+      return 0;
+    }
+    fclose(pf);
+  }
   long nel = 0;
   snprintf(path, sizeof(path), "%s/ref/pv.npy", dir);
   float *pv = npy_load(path, &nel);

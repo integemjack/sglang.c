@@ -25,6 +25,7 @@ static void sgl_sleep_ms(int ms) { Sleep(ms); }
 #include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h> /* TCP_NODELAY（t11 加的 ND 开关；Linux/macOS 不在这里声明） */
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <pthread.h>

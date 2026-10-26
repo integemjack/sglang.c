@@ -73,6 +73,29 @@ int main(int argc, char **argv) {
   if (!dir || !*dir) dir = "models/llava-rand";
   const char *ref = argc > 2 ? argv[2] : "ref_llava.json";
 
+  /* CI / fresh clone 里没有随机多模态模型（gen_random_llava.py 生成，不入库）：
+   * 缺模型就 SKIP，别把「模型没生成」变成「测试失败」——t9/t10 时代 CI 就
+   * 一直红在这一条（v0.2.0 那次 5 个 job 因此失败，release 被 skipped）。
+   * 其他 test_*（test_llama / test_qwen / test_beam / test_bpe）早就是这种写法。 */
+  {
+    char probe[1024];
+    snprintf(probe, sizeof(probe), "%s/clip_model.safetensors", dir);
+    FILE *pf = NULL;
+    fopen_s(&pf, probe, "rb");
+    if (!pf) {
+      printf("test_llava: SKIP（无 %s；跑 tests/gen_random_llava.py 生成）\n", dir);
+      return 0;
+    }
+    fclose(pf);
+    snprintf(probe, sizeof(probe), "%s/image.raw", dir);
+    fopen_s(&pf, probe, "rb");
+    if (!pf) {
+      printf("test_llava: SKIP（无 %s；跑 tests/gen_random_llava.py 生成）\n", probe);
+      return 0;
+    }
+    fclose(pf);
+  }
+
   sgl_clip *c = sgl_clip_load(dir);
   CHECK(c != NULL, "clip load");
   if (!c) return 1;

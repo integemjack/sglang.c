@@ -23,6 +23,7 @@ G1–G10 已全部完成并发版，结果见文末「已完成索引」。下�
 | G16 W8 IMMA 后端到端重测 + flash 泛化 | 性能/广度 | NOTES_gaps G2、G1 | BENCH int8 行还是 dp4a 时代的数；flash 只特化 D=64/128 |
 | G17 G4 修复的 GPU 版复验 + soak 误报 | 健壮性 | NOTES_t5 G4、soak_curve.ps1 | g4_probe 只在 CPU 版跑过；soak_curve 把 INFO 当错误报 |
 | G18 8K GPU-vs-CPU 绝对对照 | 验收补齐 | NOTES_gaps “未完成”1 | long_vcpu 本批没跑完，用了传递论证代替 |
+| G19 CI 覆盖随机模型族 | 基础设施 | .github/build.yml 与 CMake 条件注册 | CI 只下载 gpt2，模型族/多模态测试全部走 SKIP |
 
 小事不单独立项（做上面任一任务时顺手）：`test_clip_real` 只在 `models/clip-vit-base-patch32/ref/`
 存在时注册；G3 的 prewarm 会向段 0 写一次 64-token 垃圾 KV（首个真实 prefill 会覆盖，
@@ -347,13 +348,36 @@ logits vs CPU 同 ids，要求 maxerr < 1e-3）本批没跑完——CPU 侧 8192
 验收：verdict: PASS (<1e-3)，原始输出存 docs/ 或 NOTES_gaps 引用的日志路径。
 ```
 
+## 任务 G19 · CI 真跑模型族与多模态测试（基础设施，中）
+
+```
+现状（2026-10-27 查 v0.2.0 的 CI 日志时发现）：CI 只 curl 了 models/gpt2/model.safetensors，
+其余模型全缺。CMake 的 G9 段（CMakeLists.txt:141-155）与 G8 段（:133-137）都是
+「模型存在才注册 test」，所以 CI 上 test_family_{mistral,gemma,gemma2,qwen3,qwen3next}
+与 test_clip_real 根本不跑；而 test_llama/test_qwen/test_tinyllama/test_w8/test_spec 走了
+SKIP。结果是 CI 实际只验了「能编译 + 不依赖模型的几个测试」，项目最核心的数值正确性
+（numpy 对照、模型族、多模态）完全没被 CI 覆盖。
+为什么没做：当时为了不恒红而选了条件注册（v0.2.0 前 5 个 job 就是被 test_llava 拖红的）。
+1) gen_random_*.py 共 5 个脚本硬编码从 models/qwen3-06/ 拷 tokenizer——加一个
+   --tokenizer <dir> 参数（CI 传 models/gpt2；gpt2 的 vocab.json/merges.txt 已在仓库），
+   并把输出目录也参数化（默认保持 ../models/<fam>-rand，CI 传 models/）；
+2) workflow 在 Configure 前加一步（仅 CPU job）：pip install numpy &&
+   对 mistral/gemma/gemma2/qwen3next/llava 逐个 python tests/gen_random_<fam>.py；
+3) 注意 _ref_*.json 已在仓库且与被生成权重必须一致（脚本固定 seed；若改过 seed，
+   要同时重生 ref 并提交）；
+4) 验收：CI 日志里 test_family_mistral/gemma/gemma2/qwen3next 与 test_llava 的输出是
+   Passed 且不是 SKIP 字样；总测试数从 18 涨到 ~23。
+若生成步太慢/太不稳，退而求其次：只生成 gemma2 + qwen3next（G9 新加的两个）
+先把新特性的回归盯住。
+```
+
 ---
 
 ## 附注
 
 - **张量并行**仍未列入：单卡 6GB 无从验证；双卡时 Mistral 路径（MoE expert 并行）切入。
-- 顺序建议：G11（最小、承接 G8 的真实缺口）→ G17（小，先把 G4 结论坐实）→ G16
-  （重测已有实现，不改设计）→ G14（有明确验收门槛）→ G12 → G15 → G13 → G18。
+- 顺序建议：G11（最小、承接 G8 的真实缺口）→ G17（小，先把 G4 结论坐实）→ G19
+  （CI 覆盖，影响后续每次改动的信心）→ G16（重测已有实现，不改设计）→ G14 → G12 → G15 → G13 → G18。
   G12 与 G15 都动多模态前缀语义，先 G12 后 G15；G14 与 G3 都掺 cuda graph，先 G3（已完成）。
 
 ---
