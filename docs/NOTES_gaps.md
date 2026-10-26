@@ -38,7 +38,12 @@ shared、K/V 分块流式过 global、online softmax 复用已有的 run_max/run
   传递地 flash == CPU（本批未重跑 `long_vcpu` 的 8K GPU-vs-CPU 绝对对照：CPU 侧
   40+ 分钟未完、已主动终止）；
 - 4300-token batched == single-stream：OK（14 tok / 0.49s）；
-- `long_vcpu` 8K GPU vs CPU 的 t2 绝对对照：本轮因并发内存压力未跑完，见「未完成」。
+- ~~`long_vcpu` 8K GPU vs CPU 的 t2 绝对对照：本轮因并发内存压力未跑完~~ →
+  **G18 已补跑通过**（2026-10-27 06:41，干净时段）：
+  `SGL_POOL_SLOTS=8208 long_vcpu ..\models\qwen05 8192` →
+  GPU prefill 2.8s、two-pass 66.1s、CPU prefill 3733.0s（62.2 分钟），
+  **maxerr = 1.47581e-04 < 1e-3，greedy cpu=5562 gpu=5562 同**，verdict PASS。
+  原始输出：`docs/g18_8192.log`。当时空闲内存 23.3GB / 32GB。
 
 **定位数据**（`SGL_CUDA_PROF=1`，n=4096 prefill，旧两遍核）：`[prof] attention 451367.7 ms /
 24 layers` —— 注意力占绝对主导，确认瓶颈在 kernel 而不是别处（该次测量同样落在溢出状态）。
@@ -163,8 +168,11 @@ LRU 驱逐，段被复用时先释放它持有的租让）；请求结束时把�
 
 ## 未完成 / 遗留
 
-1. `long_vcpu` 的 8K **GPU vs CPU** 绝对对照本批未重跑（CPU 侧 40+ 分钟未完、已终止）；
-   flash 路径的长上下文正确性改用传递论证（见 G1）+ 新增的 4300 行直接断言。
+1. ~~`long_vcpu` 的 8K **GPU vs CPU** 绝对对照本批未重跑~~ → **G18 已完成**：
+   maxerr 1.47581e-04（<1e-3）、greedy 同、PASS；日志 `docs/g18_8192.log`。
+   CPU 侧 8192-token prefill 耗时 **3733.0s（62.2 分钟）**，且是**单线程**（MSVC 构建
+   不开 OpenMP：CMakeLists 里的 `-fopenmp` 只给 GNU 编译器；进程 CPU 时间 ≈ 墙钟时间
+   已证实）。GPU 侧 flash 只要 **2.8s**（two-pass 66.1s，flash 比两遍快 23.6x）。
 2. G5 soak 已重跑无干扰版（8 分钟，PASS，斜率见上）。
 3. 前缀缓存是**段级**（一条序列一个租让槽，最长公共前缀按 token 精确比对），不是 CPU 侧
    那种 radix 树；跨段的部分共享、显存压力下的主动回收、以及带 visual token 的请求都未覆盖。

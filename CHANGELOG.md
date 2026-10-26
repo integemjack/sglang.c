@@ -2,7 +2,15 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G12/G13/G14/G15/G16/G17/G19
+## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G12/G13/G14/G15/G16/G17/G18/G19
+
+### 验收（G18）
+- **8K GPU-vs-CPU 绝对对照补跑通过**：`SGL_POOL_SLOTS=8208 long_vcpu ..\models\qwen05 8192`
+  → GPU prefill **2.8 s**、CPU prefill **3733.0 s（62.2 分钟，单线程）**、
+  **maxerr 1.47581e-04 < 1e-3**、greedy 5562 vs 5562 SAME。日志 `docs/g18_8192.log`。
+  （之前只能靠传递论证：flash vs 两遍核 2.72e-05、两遍核 vs CPU 1.48e-04 —— 现在是直接实测。）
+  另外记一笔原因：CPU 侧这么慢不是算法问题，而是 **MSVC 构建没开 OpenMP**
+  （CMakeLists 的 `-fopenmp` 只给 GNU），进程 CPU 时间 ≈ 墙钟时间，1.0 core。
 
 ### 多模态（G12 真实 llava-1.5 链路）
 - **projector 支持两层 MLP**：新增 `sgl_projector`（`include/sgl/image.h` + `src/image.c`），

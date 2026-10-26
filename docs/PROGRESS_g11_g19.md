@@ -32,7 +32,7 @@
 | G12 真实 llava-1.5 | ✅ 完成（两层 MLP + 占位插入 + 真实 CLIP/projector 分段对照） | 见下 |
 | G15 前缀缓存 radix | ✅ 完成（租让覆盖生成 token + 带图 text；四组全 PASS） | 见下 |
 | G13 Qwen3-Next full 层 | ✅ 完成（q 门控 / partial rope / (1+w) / MoE；递归状态按序列） | 见下 |
-| G18 8K GPU-vs-CPU 绝对对照 | 未开始 | qwen05 在，需 40–60 分钟干净时段 |
+| G18 8K GPU-vs-CPU 绝对对照 | ✅ 完成（maxerr 1.47581e-04 < 1e-3，greedy SAME，PASS） | `docs/g18_8192.log` |
 
 ## G11 ✅ GPU 版收标准 JPEG/PNG
 
@@ -162,7 +162,26 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 未做：真实 7B LM 的端到端（fp16 13.5GB，本机只剩 3.5GB 磁盘）；多图仍拼在同一占位位置
   （llava 是一图一占位）。
 
-## 下一轮从这里继续
+### 新增（G18）
+- **8K GPU-vs-CPU 绝对对照通过**：`SGL_POOL_SLOTS=8208 long_vcpu ..\models\qwen05 8192`
+  → GPU prefill **2.8s**、two-pass 66.1s、CPU prefill **3733.0s（62.2 分钟）**、
+  **maxerr 1.47581e-04 < 1e-3**、greedy 5562 vs 5562 SAME、verdict PASS。
+  原始输出 `docs/g18_8192.log`；空闲内存 23.3GB/32GB。
+  - 顺带证实：CPU 侧是**单线程**（MSVC 构建没开 OpenMP，CPU 时间 ≈ 墙钟），
+    这就是以前“40+ 分钟没跑完”的原因；开 OpenMP 预计能降到 ~10 分钟量级（未实测，
+    不当结论）。
+  - 干净环境下 flash 在 8K 行上比 two-pass 快 **23.6x**（G1 当时记录的 8.3x 是显存溢出/
+    并发争用状态下的数，两个数字不要互相引用）。
+- 至此 **TODO_PROMPTS v0.4 的 G11–G19 全部完成**（只剩可选项未做：G12 的 7B LM 端到端
+  因磁盘不够、G13 的 CUDA 路径、G15 的跳段共享——都有实测依据说明无意义/不可能）。
 
-1. **G18**（8K GPU-vs-CPU 绝对对照）：要 40–60 分钟 CPU 侧算力，建议最后一轮。
-   命令：`long_vcpu ..\models\qwen05 8192`（GPU 侧现在 ~2s，CPU 侧是瓶颈）。
+## 现状（v0.4 已清零）
+
+- TODO_PROMPTS v0.4 的 **G11–G19 全部完成**（每节都有实测数字和日志路径）。
+- 未做的三项都是文档里允许的可选项，且有实测依据：
+  - **G12 的 7B LM 端到端**：llava-1.5-7B 的 LM 是 fp16 13.5GB，本机磁盘只剩 3.4GB；
+    已用任务允许的「分段对照」覆盖（真实 CLIP-L/14-336 + 真实 mm_projector）。
+  - **G13 的 CUDA 路径**：任务写明「CUDA 可选」（cuda_backend.cu 只有 llama 族 attention）。
+  - **G15 的跳段共享两轮扫描**：扁平表上可复用行数的上界就是最长的一条登记，拼接永远
+    不可能更长（已论证 + 实测无收益），改用「登记生成 token 行」拿到真实收益。
+- 以后的缺口写进 TODO_PROMPTS v0.5。

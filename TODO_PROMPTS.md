@@ -333,7 +333,7 @@ vs float64 numpy ≤8e-08；但 full_attention 层还是普通 qwen3 写法，�
 验收：g4_probe 两版（CPU/GPU）都是 0 超时；soak_curve 对干净服务不再报错。
 ```
 
-## 任务 G18 · 8K GPU-vs-CPU 绝对对照补跑（验收，小但慢）
+## 任务 G18 · 8K GPU-vs-CPU 绝对对照补跑（验收，小但慢） ✅ 已完成（maxerr 1.47581e-04 < 1e-3，greedy 同；日志 docs/g18_8192.log）
 
 ```
 现状（NOTES_gaps.md “未完成”1）：t2 那条 `long_vcpu models/qwen05 8192`（GPU prefill

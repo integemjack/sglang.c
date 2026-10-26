@@ -36,6 +36,28 @@ G7 净减速的根因：未蒸馏同源 draft 接受率上限 ~13–15%（每轮
 K=1 0.44x→0.73x、K=2 0.35x→0.64x、K=4 0.27x→0.40x；按实测回本需 K=1 a>88% /
 K=2 a>69.5%，而实测只有 39.1% / 28.6% —— **仍未转正**，根因就是 draft 太弱（见下）。
 
+## G18：8K GPU-vs-CPU 绝对对照（2026-10-27，干净时段补跑）
+
+`SGL_POOL_SLOTS=8208 long_vcpu ..\models\qwen05 8192`（build-cuda / MSVC Release），
+原始输出 `docs/g18_8192.log`。环境：空闲内存 23.3GB / 32GB，无其他任务。
+
+| 项 | 结果 |
+|---|---|
+| GPU prefill（flash，8192 tok） | **2.8 s** |
+| GPU two-pass（同进程再走一遍） | 66.1 s |
+| flash vs two-pass maxerr | 2.72e-05 |
+| CPU prefill（sgl_llama_forward，8192 tok） | **3733.0 s（62.2 分钟）** |
+| **GPU vs CPU maxerr** | **1.47581e-04（< 1e-3 → PASS）** |
+| greedy 首 token | cpu=5562 gpu=5562（SAME） |
+
+值得记下的两件事：
+1. CPU 侧是**单线程**：CMakeLists 的 `-fopenmp` 只给 GNU 编译器（Apple Clang / MSVC 都没开），
+   实测进程 CPU 时间 ≈ 墙钟时间（1.0 core）——这就是之前“40+ 分钟没跑完”的原因，
+   而不是算法退化。若开 OpenMP（8 核）预计可降到 ~10 分钟量级（未实测，不当作结论）。
+2. GPU 侧同一份 8K prompt 只要 2.8 s，而 two-pass 要 66.1 s —— 在 8K 行上 flash 比
+   两遍快 **23.6x**（G1 当时的 8.3x 是在显存溢出/并发争用的机器状态上测的；这次是干净状态）。
+   这个倍数与 G1 的结论方向一致，但数值不应互相引用。
+
 ## G15：前缀缓存（租让表）扩到「生成 token + 带图 + 可关」 （2026-10-27）
 
 工具：`tests/prefix_e2e.ps1`（四组全 PASS）、`/health` 的 `prefix` 字段。
