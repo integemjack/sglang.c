@@ -2,7 +2,27 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G14/G16/G17/G19
+## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G14/G15/G16/G17/G19
+
+### 性能
+- **G15 前缀缓存扩容**（`apps/cuda_http.c`）：租让登记的 **行数从「只有 prompt」改成
+  「这个段里真有有效 KV 的行」**——非视觉请求登记 `n_prompt + (n_gen-1)`，于是多轮对话
+  / 续写场景（下一个 prompt = 上轮 prompt + 生成结果 + 新后缀）能整段复用。实测
+  552 → **573 行**（多出的就是生成 token 的 KV）。同 prompt 重发的端到端：
+  0.262s → **0.103s（2.5x）**，命中 552/558 行（单轮 prefill 的 99%）。
+- **G15 带图请求也登记**（只到 text 末）：视觉行依赖图片、位置在 text 之后，不归
+  这段登记管，所以同文本不同图片的请求能复用 text 部分 —— 实测命中 **135 行**
+  （以前带图请求直接跳过登记 ⇒ 0）。
+- **G15 `/health` 统计**：`prefix.{slots,hits,misses,hit_rate,hit_rows,leased_rows,flushes}`
+  （leased_rows 是 gauge：当前可复用的行数）。
+- **G15 运维杆**：`SGL_PFX_MAX=0` 彻底关缓存（1..16 限表大小）；请求超过一段容量时
+  主动 `pfx_flush_all()`，避免后续命中半截现场。
+- **G15 验收**：`tests/prefix_e2e.ps1` 重写成四组（同前缀 / 续写 / 带图 / 显存紧张）
+  **全部 PASS**，且每组都断言输出与「关缓存」逐字一致。
+  至于任务里的「跳段共享两轮扫描」：扁平表里每条登记都从第 0 行开始，可复用行数的
+  上界就是最长的一条 —— 拼接永远不会更长，所以没实现（实测收益为零），改去真正能多
+  拿行数的「生成 token 行」；b) 在本服务的静态分段设计里退化为「超容量时清现场」，
+  已在组 4 验（也被实测证明：租让不额外占显存）。
 
 ### 性能
 - **G14 投机解码流水线化**（`src/cuda_spec.c`）：预填 `np-1` 行，把 prompt 末 token

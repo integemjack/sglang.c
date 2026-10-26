@@ -1,4 +1,4 @@
-﻿/* sgl cuda_http.c - GPU HTTP inference server (MSVC build, links sgl_cuda)
+/* sgl cuda_http.c - GPU HTTP inference server (MSVC build, links sgl_cuda)
  * endpoints: GET /health, POST /generate, POST /v1/completions,
  *            POST /v1/chat/completions (chatml template; stream via SSE)
  * engine: KV-segment scheduler on GPU - each request gets a segment of
@@ -95,21 +95,42 @@ static engine E;
  * 同样的计算顺序），所以命中与否输出一致（cuda_test [prefix] 逐 token 对拍）。 */
 #define PFX_MAX 16
 #define PFX_MIN 32 /* 短于这个的前缀不值得占一个段 */
+/* G15: 租让 = 请求结束后不回收的 KV 行。slot.len 是「这个段的 [0,len) 行全部
+ * 有效且与 toks[] 逐 token 对应」的长度，所以它不止 prompt：段里后面的生成 token
+ * 的行也是好的（decode_batch 用同一套 kernel 写的），多轮对话 / 续写场景下
+ * 下一个请求的 prompt 恰好以「上一轮的 prompt+生成结果」开头，就能整段复用。
+ * 带图的请求只登记 text 部分（视觉行依赖图片，位置在 text 之后，后续谁都能接）。*/
 typedef struct {
   int used;
   int seg;    /* 租让的 KV 段号（base = seg * seg_len） */
-  int len;    /* 前缀 token 数 */
-  int *toks;  /* 前缀 token 副本（精确比对，不靠 hash 碰运气） */
+  int len;    /* 有效行数：prompt（+ 生成 token，非视觉时） */
+  int *toks;  /* 与 [0,len) 行一一对应的 token 副本（精确比对，不靠 hash） */
   unsigned long long use; /* LRU 时钟 */
 } pfx_slot;
 static pfx_slot g_pfx[PFX_MAX];
 static int g_pfx_of[MAX_CONC];             /* 段 -> 表项下标+1；0 = 未租让 */
 static unsigned long long g_pfx_clock;
-static long g_pfx_hits, g_pfx_hit_rows, g_pfx_leased_rows;
+static long g_pfx_hits, g_pfx_misses, g_pfx_hit_rows, g_pfx_leased_rows;
+static long g_pfx_flushes;
+/* G15(b): 运维杆 —— SGL_PFX_MAX=0 彻底关掉前缀缓存（显存/排错极端情况用），
+ * 也可以给小值限住租让表。*/ 
+static int PFX_MAX_EFF = PFX_MAX;
+static void pfx_drop(int idx); /* 定义在下面（flush 要用）*/
+
+/* 把全部租让丢掉（段里的 KV 会在后续请求里被覆盖）。
+ * 注意：本服务的段是按并发数**静态划分**的，租让不额外占显存（/health 的
+ * leased_rows 只是“这些行还能复用”的计数，不是额外分配）；所以这个函数
+ * 是给「请求超容量（rc=-2）/ 关缓存」这类需要干净现场的场景用的，
+ * 而不是真的释放显存。*/ 
+static void pfx_flush_all(void) {
+  for (int i = 0; i < PFX_MAX; i++) pfx_drop(i);
+  g_pfx_flushes++;
+}
 
 static void pfx_drop(int idx) {
   if (idx < 0 || idx >= PFX_MAX || !g_pfx[idx].used) return;
   g_pfx_of[g_pfx[idx].seg] = 0;
+  g_pfx_leased_rows -= g_pfx[idx].len; /* 这是 gauge（当前可复用行数），不是累计 */
   free(g_pfx[idx].toks);
   memset(&g_pfx[idx], 0, sizeof(g_pfx[idx]));
 }
@@ -117,7 +138,7 @@ static void pfx_drop(int idx) {
 /* 最长公共前缀：返回长度（< PFX_MIN 视为没命中），*out_seg 给出来源段 */
 static int pfx_match(const int *toks, int n, int *out_seg) {
   int best = 0, bseg = -1;
-  for (int i = 0; i < PFX_MAX; i++) {
+  for (int i = 0; i < PFX_MAX_EFF; i++) {
     if (!g_pfx[i].used) continue;
     int m = g_pfx[i].len < n ? g_pfx[i].len : n;
     int l = 0;
@@ -126,17 +147,21 @@ static int pfx_match(const int *toks, int n, int *out_seg) {
   }
   if (best < PFX_MIN) { *out_seg = -1; return 0; }
   *out_seg = bseg;
-  for (int i = 0; i < PFX_MAX; i++)
+  for (int i = 0; i < PFX_MAX_EFF; i++)
     if (g_pfx[i].used && g_pfx[i].seg == bseg) g_pfx[i].use = ++g_pfx_clock;
   return best;
 }
 
-/* 请求结束后把它的段登记为前缀租让 */
-static void pfx_register(int seg, const int *toks, int len) {
+/* 请求结束后把它的段登记为前缀租让。
+ * toks/n_tok：这个段 [0,n_tok) 行对应的 token（非视觉时为 prompt+生成，
+ * 视觉时为 prompt 文本部分）；slot.len 就是 n_tok。 */
+static void pfx_register(int seg, const int *toks, int n_tok) {
+  int len = n_tok;
+  if (PFX_MAX_EFF <= 0) return;
   if (len < PFX_MIN || seg < 0 || seg >= MAX_CONC) return;
   int slot = -1, lru = 0;
   unsigned long long oldest = ~0ull;
-  for (int i = 0; i < PFX_MAX; i++) {
+  for (int i = 0; i < PFX_MAX_EFF; i++) {
     if (!g_pfx[i].used) { slot = i; break; }
     if (g_pfx[i].seg == seg) { slot = i; break; } /* 同段直接覆盖旧登记 */
     if (g_pfx[i].use < oldest) { oldest = g_pfx[i].use; lru = i; }
@@ -153,6 +178,30 @@ static void pfx_register(int seg, const int *toks, int len) {
   g_pfx[slot].use = ++g_pfx_clock;
   g_pfx_of[seg] = slot + 1;
   g_pfx_leased_rows += len;
+}
+
+/* G15：把一次已完成请求能租让的行拼出来。
+ * 非视觉：prompt + 生成（末尾那个生成 token 的 KV 行不一定被写过 ——
+ *   decode 循环在 n_gen==max_new 或 eos 时就直接收了 —— 所以保守地只算到
+ *   n_gen-1 行）。
+ * 视觉：只到 prompt 末（后面的视觉行依赖图片，不归这段文本管）。
+ * 返回实际登记的行数（0 = 不登记）。 */
+static int pfx_register_req(int seg, const request *r) {
+  if (!r || r->n_gen < 0) return -1;
+  if (r->n_img > 0) {
+    pfx_register(seg, r->prompt, r->n_prompt);
+    return r->n_prompt;
+  }
+  int n_gen_ok = r->n_gen > 0 ? r->n_gen - 1 : 0;
+  int total = r->n_prompt + n_gen_ok;
+  if (n_gen_ok == 0) { pfx_register(seg, r->prompt, r->n_prompt); return r->n_prompt; }
+  int *buf = (int *)malloc(sizeof(int) * (size_t)total);
+  if (!buf) { pfx_register(seg, r->prompt, r->n_prompt); return r->n_prompt; }
+  memcpy(buf, r->prompt, sizeof(int) * (size_t)r->n_prompt);
+  memcpy(buf + r->n_prompt, r->gen, sizeof(int) * (size_t)n_gen_ok);
+  pfx_register(seg, buf, total);
+  free(buf);
+  return total;
 }
 
 /* ---------------- request lifecycle ---------------- */
@@ -301,11 +350,12 @@ static DWORD WINAPI worker(LPVOID unused) {
     for (int i = 0; i < MAX_CONC; i++) {
       request *r = E.reqs[i];
       if (r && r->state == R_REAPED) {
-        /* G6: 跑过 prefill 的请求，把它的段登记为前缀租让（后面的请求就能复用）。
-         * 带图的请求不登记：视觉 token 接在 prompt 后，前缀语义不一样。 */
-        if (E.gpu && r->reached_run && r->n_img == 0 && r->seg == i &&
-            r->n_prompt >= PFX_MIN)
-          pfx_register(i, r->prompt, r->n_prompt);
+        /* G6/G15: 跑过 prefill 的请求，把它的段登记为前缀租让（后面的请求就能复用）。
+         * G15: ① 行数不再只算 prompt，而是「这个段里确实有有效 KV 的行」（含生成 token，
+         * 多轮对话/续写直接受益）；② 带图的请求也登记了（只登到 text 末：视觉行依赖
+         * 图片，位置在 text 之后，不归这段登记管）。*/
+        if (E.gpu && r->reached_run && r->seg == i && r->n_prompt >= PFX_MIN)
+          pfx_register_req(i, r);
         req_free(r);
         E.reqs[i] = NULL;
         E.n_active--;
@@ -349,11 +399,11 @@ static DWORD WINAPI worker(LPVOID unused) {
       int base = i * E.seg_len;
       LeaveCriticalSection(&E.lock);
       int rc;
-      /* G6: 前缀命中 -> 把租让段里的 KV 行搬进本段，prefill 从命中处起。
+      /* G6/G15: 前缀命中 -> 把租让段里的 KV 行搬进本段，prefill 从命中处起。
        * 全命中时留最后一个 token 重算一遍（那一行 KV 值不变），否则本轮得
-       * 不到 logits。 */
+       * 不到 logits。带图的请求也参与（能命中 text 部分，视觉行照旧算）。*/
       int off = 0;
-      if (E.gpu && r->n_img == 0 && r->n_prompt >= PFX_MIN) {
+      if (E.gpu && r->n_prompt >= PFX_MIN) {
         int src_seg = -1;
         int hit = pfx_match(r->prompt, r->n_prompt, &src_seg);
         if (hit >= r->n_prompt) hit = r->n_prompt - 1;
@@ -370,10 +420,15 @@ static DWORD WINAPI worker(LPVOID unused) {
             if (sgl_cuda_copy_kv(E.gpu, src_seg * E.seg_len, base, hit) != 0) hit = 0;
           }
           if (hit > 0) { g_pfx_hits++; g_pfx_hit_rows += hit; off = hit; }
+          else g_pfx_misses++;
         }
+      } else if (E.gpu) {
+        g_pfx_misses++;
       }
       if (r->n_prompt + r->n_img > r->seg_len) {
         rc = -2; /* prompt (+visual tokens) exceeds its KV segment capacity */
+        pfx_flush_all(); /* G15(b): 现场已经不干净（本请求要的比一段还长），
+                          * 把租让全丢掉，别让后续请求命中半截。*/ 
       } else {
         rc = 0;
         while (off < r->n_prompt && rc == 0) {
@@ -755,12 +810,19 @@ static int route(SOCKET fd, const http_req *req) {
     if (E.degraded)
       snprintf(body, sizeof(body),
                "{\"ok\":false,\"gpu\":false,\"degraded\":true,\"reason\":\"%s\"}", E.gpu_err);
-    else
+    else {
+      /* G15: 命中率 / 省下的 prefill 行数一起暴露（命中率的分母是参与前缀比对的请求数，
+       * 即命中+未命中；短于 PFX_MIN 的请求不计入，否则短的聊天请求会把命中率拉低）。*/
+      long tot = g_pfx_hits + g_pfx_misses;
       snprintf(body, sizeof(body),
                "{\"ok\":true,\"gpu\":true,\"ctx\":%d,\"seg\":%d,\"conc\":%d,"
-               "\"prefix\":{\"hits\":%ld,\"hit_rows\":%ld,\"leased_rows\":%ld}}",
+               "\"prefix\":{\"slots\":%d,\"hits\":%ld,\"misses\":%ld,\"hit_rate\":%.3f,"
+               "\"hit_rows\":%ld,\"leased_rows\":%ld,\"flushes\":%ld}}",
                sgl_cuda_ctx(E.gpu), E.seg_len, ACTIVE_CONC,
-               g_pfx_hits, g_pfx_hit_rows, g_pfx_leased_rows);
+               PFX_MAX_EFF, g_pfx_hits, g_pfx_misses,
+               tot ? (double)g_pfx_hits / (double)tot : 0.0,
+               g_pfx_hit_rows, g_pfx_leased_rows, g_pfx_flushes);
+    }
     respond(fd, 200, "application/json", body);
     return 0;
   }
@@ -1037,6 +1099,16 @@ int main(int argc, char **argv) {
     }
   }
   E.seg_len = E.gpu ? sgl_cuda_ctx(E.gpu) / ACTIVE_CONC : 0;
+  /* G15(b): 运维杆 SGL_PFX_MAX —— 0 = 关掉前缀缓存，1..16 = 限租让表大小。 */
+  {
+    const char *pm = getenv("SGL_PFX_MAX");
+    if (pm) {
+      int v = atoi(pm);
+      PFX_MAX_EFF = v < 0 ? 0 : (v > PFX_MAX ? PFX_MAX : v);
+      printf("[engine] prefix cache: %s (SGL_PFX_MAX=%d)\n",
+             PFX_MAX_EFF ? "on" : "OFF", PFX_MAX_EFF);
+    }
+  }
   /* G3: decode graphs 现在默认开。t5 当时强制关掉是因为：
    *   (1) 捕获失败会把一个进程级 static 置为“graphs off”，一个 B 的偶然失败
    *       就让所有 batch 永远走 plain（比 graph 慢 3-4x）—— 改成按 B 记录失败；

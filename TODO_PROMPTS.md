@@ -281,7 +281,7 @@ vs float64 numpy ≤8e-08；但 full_attention 层还是普通 qwen3 写法，�
 非 spec greedy 逐 token 全同；BENCH.md 更新，做不到就如实记“该组合仍净减速”。
 ```
 
-## 任务 G15 · 前缀缓存升 radix（性能，中大）
+## 任务 G15 · 前缀缓存升 radix（性能，中大） ✅ 已做完（a 用“登记生成 token 行”替代两轮扫描并实测无收益；b/c 完成）——见 docs/BENCH.md 的 G15 节
 
 ```
 现状（NOTES_gaps.md “未完成”2、G6 节）：现在是**段级租让**：一条序列一个槽，
