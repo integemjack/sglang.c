@@ -189,6 +189,33 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 至此 **TODO_PROMPTS v0.4 的 G11–G19 全部完成**（只剩可选项未做：G12 的 7B LM 端到端
   因磁盘不够、G13 的 CUDA 路径、G15 的跳段共享——都有实测依据说明无意义/不可能）。
 
+## README 对账（第 11 轮，2026-10-27）
+
+发布质量（t13 要求 README/CHANGELOG 准确）直接吊在 README 上，所以把 README 逐句对了一遍
+代码，改掉四处过期/误导说法（提交 `3180306`）：
+
+| 原来的说法 | 实际 |
+|---|---|
+| LLaVA 行：“raw float base64；JPEG 解码不支持” | G11 已能直收 PNG/JPEG（同 CPU 版路径） |
+| 能力表没有 Qwen3-Next | G13 已支持（q 门控/partial rope/(1+w)/MoE） |
+| 未覆盖：真实 LLaVA 权重“仅结构已验证” | CLIP-L 与 mm_projector 已用真实权重对照，缺的只是 7B LM |
+| M26：“≤4096 走 short 核、>4096 切两段式” | G1→长行走 flash，G16 又降到 64 tok；两段核默认只在 `SGL_ATTN_TWOPASS=1` 或无特化 D 时用 |
+
+另外两处顺手修正：
+
+1. **G1 的 8.3x 不能当头条**：那是显存吃紧时测的，BENCH 已写「两个数字不要互相引用」。
+   README 现在两个都给并注明条件（8.3x 当时 / 23.6x 干净同进程 A/B）。
+2. **核实过程中发现 GPT-2 不走 `attn_dispatch`**（它有自己的前向循环，仍然直接启
+   shared-scores 核），所以“kernel 选择集中在一处”这句话只能限 llama 族；已在 README
+   里限定，并在「已知问题」里记下 GPT-2 没拿到 G1/G16 的长上下文优化。
+
+补了一节「缺口关闭 G11–G19」（与已有的 G1–G6 节同格），并给「已知问题」加了四条真限制：
+MSVC 无 OpenMP（只值 2.05x）、前缀缓存是段级非 radix 树且多图仍共用一个 `<image>` 位、
+CI 不跑 CUDA 与真实 llava 权重、GPT-2 缺新 attention 路径。
+
+新写进 README 的每条事实都 grep 回代码核过（`SGL_*` 开关、`D % 32` 守卫、`img_at`、
+`sgl_projector_init`、`moe_row`、`sgl_dot_f32_avx2`），表格改完也重数了每行的 `|` 个数。
+
 ## G19 补记：从**干净检出**按 CI 步骤实跑（2026-10-27，第 10 轮）
 
 之前只验证了「生成器产出与夹具逐字节相同」和「YAML 能解析」，**没验证过那串步骤在 fresh
