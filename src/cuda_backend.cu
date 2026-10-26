@@ -30,6 +30,9 @@
 #define SGL_ATTN_SHORT_MAX 4096
 #define SGL_ATTN_CHUNK 1024
 
+/* t8 W8A8 per-channel int8 weights: w[N,K] int8 + scale[N]. */
+typedef struct { int8_t *w; float *scale; } sgl_w8w;
+
 struct sgl_cuda_model {
   int L, H, HK, E, I, V, D, KD, ctx;
   float eps;
@@ -41,6 +44,7 @@ struct sgl_cuda_model {
   float **ln1, **qw, **kw, **vw, **ow;
   float **qb, **kb, **vb;
   float **ln2, **gw, **uw, **dw;
+  sgl_w8w *qw8, *kw8, *vw8, *ow8, *gw8, *uw8, *dw8; /* t8: per-layer [L], NULL when off */
   float *freqs; /* [D/2] */
   cublasHandle_t blas; /* M22: all projections via cublas */
   float *kc, *vc; /* [ctx][KD] */
@@ -66,6 +70,7 @@ struct sgl_cuda_model {
    * M==1 decode GEMV is a hand-written kernel (half2 loads, fp32 accum),
    * M>1 goes through tensor-core cublasGemmEx (16F in, 32F accum+out). */
   int use_fp16;
+  int use_w8;   /* t8: SGL_CUDA_W8=1 -> int8 hidden projections (dp4a decode) */
   __half *wte_h;            /* [V,E] embed table; lm_head aliases when tied */
   __half *lm_head_h;        /* [V,E] (aliases wte_h when tied embeddings) */
   __half **qw_h, **kw_h, **vw_h, **ow_h;
@@ -506,6 +511,67 @@ __global__ void k_fill_bias(float *C, const float *bias, int M, int N) {
   C[i] = bias[i % N];
 }
 
+/* t8: W8A8 GEMV via __dp4a (Turing native int8 MAC).
+ * A row (K floats) is quantized per-tensor-absmax to int8 on the fly in the
+ * kernel (read twice: pass 1 absmax, pass 2 pack); W is per-output-channel
+ * int8 with scale[n]. Accurate enough for hidden projections; lm_head stays
+ * full precision. C[n] = dp4a(A8,W8) * ascale * wscale[n] + bias. */
+__global__ void k_gemm_w8a8(const float *A, const int8_t *W, const float *ws,
+                            const float *bias, float *C, int M, int N, int K) {
+  int n = blockIdx.x;
+  int m = blockIdx.y;
+  if (m >= M || n >= N) return;
+  const float *a = A + (long)m * K;
+  /* per-row activation absmax */
+  float amax = 0.f;
+  for (int i = threadIdx.x; i < K; i += blockDim.x) {
+    float v = fabsf(a[i]);
+    if (v > amax) amax = v;
+  }
+  __shared__ float red[256];
+  red[threadIdx.x] = amax;
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (threadIdx.x < s && red[threadIdx.x + s] > red[threadIdx.x]) red[threadIdx.x] = red[threadIdx.x + s];
+    __syncthreads();
+  }
+  float as_inv = red[0] > 1e-8f ? 127.0f / red[0] : 0.f;
+  float as = red[0] > 1e-8f ? red[0] / 127.0f : 0.f;
+  const int8_t *w = W + (long)n * K;
+  int acc = 0;
+  /* 16-wide stripes: 4x dp4a per iteration, activation bytes re-derived from
+   * float each time (no extra smem pass; bandwidth-bound anyway) */
+  for (int i = threadIdx.x * 16; i + 15 < K; i += blockDim.x * 16) {
+    signed char abuf[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+      float q = __float2int_rn(a[i + j] * as_inv);
+      q = q > 127.f ? 127.f : (q < -127.f ? -127.f : q);
+      abuf[j] = (signed char)q;
+    }
+    int acc0 = __dp4a(*(const int *)(abuf + 0), *(const int *)(w + i + 0), 0);
+    acc0 = __dp4a(*(const int *)(abuf + 4), *(const int *)(w + i + 4), acc0);
+    acc0 = __dp4a(*(const int *)(abuf + 8), *(const int *)(w + i + 8), acc0);
+    acc0 = __dp4a(*(const int *)(abuf + 12), *(const int *)(w + i + 12), acc0);
+    acc += acc0;
+  }
+  /* tail (K % 16): scalar fallback, rare (K=896/4864/2048 all %16==0) */
+  for (int i = K - (K % 16) + threadIdx.x; i < K; i += blockDim.x) {
+    float q = __float2int_rn(a[i] * as_inv);
+    q = q > 127.f ? 127.f : (q < -127.f ? -127.f : q);
+    acc += (int)((signed char)q) * (int)w[i];
+  }
+  __shared__ int iacc[256];
+  iacc[threadIdx.x] = acc;
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (threadIdx.x < s) iacc[threadIdx.x] += iacc[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    C[(long)m * N + n] = (float)iacc[0] * as * ws[n] + (bias ? bias[n] : 0.f);
+}
+
 static void gemm_nt_cublas(cublasHandle_t h, cudaStream_t stream,
                            const float *A, const float *W,
                            const float *bias, float *C, int M, int N, int K) {
@@ -753,6 +819,65 @@ __global__ void k_attn_batch(const float *q, const float *kc, const float *vc,
   }
 }
 
+/* t8: quantize [N,K] fp32 host weights -> int8 device + scale[N] device */
+static int dev_copy_w8(const float *src, int N, int K, sgl_w8w *out) {
+  int8_t *q = (int8_t *)malloc((size_t)N * K);
+  float *s = (float *)malloc(sizeof(float) * (size_t)N);
+  if (!q || !s) { free(q); free(s); return -1; }
+  for (int n = 0; n < N; n++) {
+    float amax = 0;
+    const float *r = src + (size_t)n * K;
+    for (int k = 0; k < K; k++) { float v = fabsf(r[k]); if (v > amax) amax = v; }
+    float inv = amax > 1e-8f ? 127.0f / amax : 0.f;
+    s[n] = amax / 127.0f;
+    for (int k = 0; k < K; k++) {
+      float v = r[k] * inv;
+      v = v > 127.f ? 127.f : (v < -127.f ? -127.f : v);
+      q[(size_t)n * K + k] = (int8_t)lrintf(v);
+    }
+  }
+  cudaError_t e1 = cudaMalloc((void **)&out->w, (size_t)N * K);
+  cudaError_t e2 = cudaMalloc((void **)&out->scale, sizeof(float) * (size_t)N);
+  if (e1 != cudaSuccess || e2 != cudaSuccess) {
+    if (e1 == cudaSuccess) cudaFree(out->w);
+    if (e2 == cudaSuccess) cudaFree(out->scale);
+    free(q); free(s);
+    return -1;
+  }
+  cudaMemcpy(out->w, q, (size_t)N * K, cudaMemcpyHostToDevice);
+  cudaMemcpy(out->scale, s, sizeof(float) * (size_t)N, cudaMemcpyHostToDevice);
+  free(q); free(s);
+  return 0;
+}
+
+static int w8_alloc_layers(sgl_w8w **arr, int L) {
+  *arr = (sgl_w8w *)calloc((size_t)L, sizeof(sgl_w8w));
+  return *arr ? 0 : -1;
+}
+
+static void w8_free_layers(sgl_w8w *arr, int L) {
+  if (!arr) return;
+  for (int l = 0; l < L; l++) {
+    if (arr[l].w) cudaFree(arr[l].w);
+    if (arr[l].scale) cudaFree(arr[l].scale);
+  }
+  free(arr);
+}
+
+/* t8 projection dispatch: W8A8 dp4a for every M when int8 weights exist
+ * (prefill included — accuracy verified against fp32 greedy; fp32 originals
+ * are NOT uploaded in W8 mode, that's where the VRAM saving comes from). */
+#define PROJ(g, A, Wf, Wh, W8, bias, C, M, N, K)                                   \
+  do {                                                                             \
+    if ((g)->use_w8 && (W8)) {                                                     \
+      k_gemm_w8a8<<<dim3(N, M), 256, 0, (g)->stream>>>(                            \
+          A, (W8)->w, (W8)->scale, bias, C, M, N, K);                              \
+      CK(cudaGetLastError());                                                      \
+      break;                                                                       \
+    }                                                                              \
+    gemm_nt_any(g, A, Wf, Wh, bias, C, M, N, K);                                   \
+  } while (0)
+
 sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
   const sgl_llama *m = (const sgl_llama *)llama_model;
   if (!m) return NULL;
@@ -767,6 +892,9 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
   {
     const char *fe = getenv("SGL_CUDA_FP16");
     g->use_fp16 = (fe && atoi(fe)) ? 1 : 0;
+    const char *we = getenv("SGL_CUDA_W8");
+    g->use_w8 = (we && atoi(we)) ? 1 : 0; /* t8: int8 projections (dp4a) */
+    if (g->use_w8) g->use_fp16 = 1;       /* embed table fp16, projections int8 */
   }
 
   /* M26a: no hard 4096 clamp anymore. Two-pass attention lifts the shared
@@ -824,9 +952,33 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
     g->uw_h = (__half **)calloc(g->L, sizeof(__half *));
     g->dw_h = (__half **)calloc(g->L, sizeof(__half *));
   }
+  if (g->use_w8) { /* t8: int8 copies of the 7 hidden projections (llama path) */
+    if (w8_alloc_layers(&g->qw8, g->L) || w8_alloc_layers(&g->kw8, g->L) ||
+        w8_alloc_layers(&g->vw8, g->L) || w8_alloc_layers(&g->ow8, g->L) ||
+        w8_alloc_layers(&g->gw8, g->L) || w8_alloc_layers(&g->uw8, g->L) ||
+        w8_alloc_layers(&g->dw8, g->L))
+      goto fail;
+  }
 
   for (int l = 0; l < g->L; l++) {
     const sgl_llama_layer *L = &m->layers[l];
+    if (g->use_w8) {
+      if (dev_copy_w8(L->q_w.data, g->E, g->E, &g->qw8[l]) != 0 ||
+          dev_copy_w8(L->k_w.data, g->KD, g->E, &g->kw8[l]) != 0 ||
+          dev_copy_w8(L->v_w.data, g->KD, g->E, &g->vw8[l]) != 0 ||
+          dev_copy_w8(L->o_w.data, g->E, g->E, &g->ow8[l]) != 0 ||
+          dev_copy_w8(L->gate_w.data, g->I, g->E, &g->gw8[l]) != 0 ||
+          dev_copy_w8(L->up_w.data, g->I, g->E, &g->uw8[l]) != 0 ||
+          dev_copy_w8(L->down_w.data, g->E, g->I, &g->dw8[l]) != 0)
+        goto fail;
+      /* norms and biases still fp32 */
+      g->ln1[l] = dev_copy(L->inp_norm.data, (size_t)g->E);
+      g->ln2[l] = dev_copy(L->post_norm.data, (size_t)g->E);
+      g->qb[l] = L->q_b.data ? dev_copy(L->q_b.data, (size_t)g->E) : NULL;
+      g->kb[l] = L->k_b.data ? dev_copy(L->k_b.data, (size_t)g->KD) : NULL;
+      g->vb[l] = L->v_b.data ? dev_copy(L->v_b.data, (size_t)g->KD) : NULL;
+      continue; /* skip fp32/fp16 projection upload — VRAM saving */
+    }
     if (g->use_fp16) {
       g->qw_h[l] = dev_copy_h(L->q_w.data, (size_t)g->E * g->E);
       g->kw_h[l] = dev_copy_h(L->k_w.data, (size_t)g->KD * g->E);
@@ -927,7 +1079,7 @@ sgl_cuda_model *sgl_cuda_from_gpt2(const void *gpt2_model) {
   g->eps = m->ln_eps; g->theta = 10000.0; /* unused */
   {
     const char *fe = getenv("SGL_CUDA_FP16");
-    g->use_fp16 = (fe && atoi(fe)) ? 1 : 0;
+    g->use_fp16 = (fe && atoi(fe)) ? 1 : 0; /* gpt2: no W8 path (t8 is llama-only) */
   }
   {
     const char *e = getenv("SGL_CUDA_CTX");
@@ -1058,6 +1210,9 @@ void sgl_cuda_free(sgl_cuda_model *g) {
     if (g->mb && g->mb[l]) cudaFree(g->mb[l]);
   }
   free(g->lnb1); free(g->lnb2); free(g->qkvb); free(g->ob); free(g->fcb); free(g->mb);
+  w8_free_layers(g->qw8, g->L); w8_free_layers(g->kw8, g->L); w8_free_layers(g->vw8, g->L);
+  w8_free_layers(g->ow8, g->L); w8_free_layers(g->gw8, g->L); w8_free_layers(g->uw8, g->L);
+  w8_free_layers(g->dw8, g->L);
   for (int l = 0; l < g->L; l++) {
     if (g->ln1 && g->ln1[l]) cudaFree(g->ln1[l]);
     if (g->qw && g->qw[l]) cudaFree(g->qw[l]);
@@ -1127,8 +1282,8 @@ static int gpt2_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos
         g->x, g->ln1[l], g->lnb1[l], g->h, n, E, g->eps);
     CK(cudaGetLastError());
     /* fused qkv: [n,3E] lands in the q slot */
-    gemm_nt_any(g, g->h, g->qw[l], g->qw_h ? g->qw_h[l] : NULL, g->qkvb[l],
-                g->q, n, E3, E);
+    PROJ(g, g->h, g->qw[l], g->qw_h ? g->qw_h[l] : NULL, g->qw8 ? &g->qw8[l] : NULL, g->qkvb[l],
+         g->q, n, E3, E);
     CK(cudaGetLastError());
     /* KV scatter: k/v rows are at +E/+2E inside each 3E-stride qkv row */
     {
@@ -1146,19 +1301,19 @@ static int gpt2_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos
         g->q, g->kc + (long)l * g->ctx * KD, g->vc + (long)l * g->ctx * KD,
         g->attn, pos0, kv_base, n, H, H, D, 1.0f / sqrtf((float)D), E3);
     CK(cudaGetLastError());
-    gemm_nt_any(g, g->attn, g->ow[l], g->ow_h ? g->ow_h[l] : NULL, g->ob[l],
-                g->h, n, E, E);
+    PROJ(g, g->attn, g->ow[l], g->ow_h ? g->ow_h[l] : NULL, g->ow8 ? &g->ow8[l] : NULL, g->ob[l],
+         g->h, n, E, E);
     CK(cudaGetLastError());
     k_residual<<<(int)(((long)n * E + 255) / 256), 256, 0, g->stream>>>(g->x, g->h, (long)n * E);
     k_layernorm_b<<<n, 256, 256 * sizeof(float), g->stream>>>(
         g->x, g->ln2[l], g->lnb2[l], g->h, n, E, g->eps);
     CK(cudaGetLastError());
-    gemm_nt_any(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, g->fcb[l],
-                g->gate, n, g->I, E);
+    PROJ(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, g->gw8 ? &g->gw8[l] : NULL, g->fcb[l],
+         g->gate, n, g->I, E);
     CK(cudaGetLastError());
     k_gelu<<<(int)(((long)n * g->I + 255) / 256), 256, 0, g->stream>>>(g->gate, (long)n * g->I);
-    gemm_nt_any(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, g->mb[l],
-                g->h, n, E, g->I);
+    PROJ(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, g->dw8 ? &g->dw8[l] : NULL, g->mb[l],
+         g->h, n, E, g->I);
     CK(cudaGetLastError());
     k_residual<<<(int)(((long)n * E + 255) / 256), 256, 0, g->stream>>>(g->x, g->h, (long)n * E);
     CK(cudaGetLastError());
@@ -1203,9 +1358,12 @@ int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
   for (int l = 0; l < g->L; l++) {
     k_rmsnorm<<<n, 256, 256 * sizeof(float), g->stream>>>(g->x, g->ln1[l], g->h, n, E, g->eps);
     CK(cudaGetLastError());
-    gemm_nt_any(g, g->h, g->qw[l], g->qw_h ? g->qw_h[l] : NULL, g->qb[l], g->q, n, E, E);
-    gemm_nt_any(g, g->h, g->kw[l], g->kw_h ? g->kw_h[l] : NULL, g->kb[l], g->k, n, KD, E);
-    gemm_nt_any(g, g->h, g->vw[l], g->vw_h ? g->vw_h[l] : NULL, g->vb[l], g->v, n, KD, E);
+    PROJ(g, g->h, g->qw[l], g->qw_h ? g->qw_h[l] : NULL, g->qw8 ? &g->qw8[l] : NULL, g->qb[l],
+         g->q, n, E, E);
+    PROJ(g, g->h, g->kw[l], g->kw_h ? g->kw_h[l] : NULL, g->kw8 ? &g->kw8[l] : NULL, g->kb[l],
+         g->k, n, KD, E);
+    PROJ(g, g->h, g->vw[l], g->vw_h ? g->vw_h[l] : NULL, g->vw8 ? &g->vw8[l] : NULL, g->vb[l],
+         g->v, n, KD, E);
     CK(cudaGetLastError());
     k_rope<<<(int)(((long)n * H * D / 2 + 255) / 256), 256, 0, g->stream>>>(g->q, n * H, D, H, pos0, g->freqs);
     k_rope<<<(int)(((long)n * HK * D / 2 + 255) / 256), 256, 0, g->stream>>>(g->k, n * HK, D, HK, pos0, g->freqs);
@@ -1245,15 +1403,19 @@ int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
       }
     }
     CK(cudaGetLastError());
-    gemm_nt_any(g, g->attn, g->ow[l], g->ow_h ? g->ow_h[l] : NULL, NULL, g->h, n, E, E);
+    PROJ(g, g->attn, g->ow[l], g->ow_h ? g->ow_h[l] : NULL, g->ow8 ? &g->ow8[l] : NULL, NULL,
+         g->h, n, E, E);
     CK(cudaGetLastError());
     k_residual<<<(int)(((long)n * E + 255) / 256), 256, 0, g->stream>>>(g->x, g->h, (long)n * E);
     k_rmsnorm<<<n, 256, 256 * sizeof(float), g->stream>>>(g->x, g->ln2[l], g->h, n, E, g->eps);
-    gemm_nt_any(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, NULL, g->gate, n, g->I, E);
-    gemm_nt_any(g, g->h, g->uw[l], g->uw_h ? g->uw_h[l] : NULL, NULL, g->up, n, g->I, E);
+    PROJ(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, g->gw8 ? &g->gw8[l] : NULL, NULL,
+         g->gate, n, g->I, E);
+    PROJ(g, g->h, g->uw[l], g->uw_h ? g->uw_h[l] : NULL, g->uw8 ? &g->uw8[l] : NULL, NULL,
+         g->up, n, g->I, E);
     CK(cudaGetLastError());
     k_silu_mul<<<(int)(((long)n * g->I + 255) / 256), 256, 0, g->stream>>>(g->gate, g->up, (long)n * g->I);
-    gemm_nt_any(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, NULL, g->h, n, E, g->I);
+    PROJ(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, g->dw8 ? &g->dw8[l] : NULL, NULL,
+         g->h, n, E, g->I);
     CK(cudaGetLastError());
     k_residual<<<(int)(((long)n * E + 255) / 256), 256, 0, g->stream>>>(g->x, g->h, (long)n * E);
     CK(cudaGetLastError());
@@ -1339,9 +1501,12 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
   for (int l = 0; l < g->L; l++) {
     k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln1[l], g->h, B, E, g->eps);
     CK(cudaGetLastError());
-    gemm_nt_any(g, g->h, g->qw[l], g->qw_h ? g->qw_h[l] : NULL, g->qb[l], g->q, B, E, E);
-    gemm_nt_any(g, g->h, g->kw[l], g->kw_h ? g->kw_h[l] : NULL, g->kb[l], g->k, B, KD, E);
-    gemm_nt_any(g, g->h, g->vw[l], g->vw_h ? g->vw_h[l] : NULL, g->vb[l], g->v, B, KD, E);
+    PROJ(g, g->h, g->qw[l], g->qw_h ? g->qw_h[l] : NULL, g->qw8 ? &g->qw8[l] : NULL, g->qb[l],
+         g->q, B, E, E);
+    PROJ(g, g->h, g->kw[l], g->kw_h ? g->kw_h[l] : NULL, g->kw8 ? &g->kw8[l] : NULL, g->kb[l],
+         g->k, B, KD, E);
+    PROJ(g, g->h, g->vw[l], g->vw_h ? g->vw_h[l] : NULL, g->vw8 ? &g->vw8[l] : NULL, g->vb[l],
+         g->v, B, KD, E);
     CK(cudaGetLastError());
     k_rope_rows<<<(int)(((long)B * H * D / 2 + 255) / 256), 256, 0, s>>>(g->q, B * H, D, g->d_pq, g->freqs);
     k_rope_rows<<<(int)(((long)B * HK * D / 2 + 255) / 256), 256, 0, s>>>(g->k, B * HK, D, g->d_pk, g->freqs);
@@ -1360,15 +1525,19 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
           g->attn, g->d_base, g->d_lens, B, H, HK, D, 1.0f / sqrtf((float)D));
     }
     CK(cudaGetLastError());
-    gemm_nt_any(g, g->attn, g->ow[l], g->ow_h ? g->ow_h[l] : NULL, NULL, g->h, B, E, E);
+    PROJ(g, g->attn, g->ow[l], g->ow_h ? g->ow_h[l] : NULL, g->ow8 ? &g->ow8[l] : NULL, NULL,
+         g->h, B, E, E);
     CK(cudaGetLastError());
     k_residual<<<(int)(((long)B * E + 255) / 256), 256, 0, s>>>(g->x, g->h, (long)B * E);
     k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln2[l], g->h, B, E, g->eps);
-    gemm_nt_any(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, NULL, g->gate, B, g->I, E);
-    gemm_nt_any(g, g->h, g->uw[l], g->uw_h ? g->uw_h[l] : NULL, NULL, g->up, B, g->I, E);
+    PROJ(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, g->gw8 ? &g->gw8[l] : NULL, NULL,
+         g->gate, B, g->I, E);
+    PROJ(g, g->h, g->uw[l], g->uw_h ? g->uw_h[l] : NULL, g->uw8 ? &g->uw8[l] : NULL, NULL,
+         g->up, B, g->I, E);
     CK(cudaGetLastError());
     k_silu_mul<<<(int)(((long)B * g->I + 255) / 256), 256, 0, s>>>(g->gate, g->up, (long)B * g->I);
-    gemm_nt_any(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, NULL, g->h, B, E, g->I);
+    PROJ(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, g->dw8 ? &g->dw8[l] : NULL, NULL,
+         g->h, B, E, g->I);
     CK(cudaGetLastError());
     k_residual<<<(int)(((long)B * E + 255) / 256), 256, 0, s>>>(g->x, g->h, (long)B * E);
     CK(cudaGetLastError());
