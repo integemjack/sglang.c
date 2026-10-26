@@ -189,6 +189,24 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 至此 **TODO_PROMPTS v0.4 的 G11–G19 全部完成**（只剩可选项未做：G12 的 7B LM 端到端
   因磁盘不够、G13 的 CUDA 路径、G15 的跳段共享——都有实测依据说明无意义/不可能）。
 
+## msvc-cuda 矩阵项的断言本机复核（第 12 轮，2026-10-27）
+
+前两轮只跑了 workflow 的 `msvc` job，`msvc-cuda` 那条从未验证。它在无 GPU 的 runner
+上不跑 ctest，只做两件事，都能在本机用现成产物复核：
+
+1. **打包步的 DLL 断言**：`Get-ChildItem $env:CUDA_PATH -Recurse -File -Include "cublas64_*.dll",
+   "cublasLt64_*.dll"` 必须找到 ≥2 个，否则 throw。本机
+   `CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3` → 找到 **2** 个：
+   `bin\x64\cublas64_13.dll`（50.3MB）与 `bin\x64\cublasLt64_13.dll`（442.2MB）。
+   递归查找确实是必要的——CUDA 13 把 DLL 放在 `bin\x64\` 子目录而不是 `bin\`。
+2. **smoke 步**：要求 `build/bin/{cuda_cli,cuda_http,sglc}.exe` 都在，且 `sglc.exe` 无参
+   退出码为 1。本机（VS 生成器，产物在 `bin\Release\`）三个 exe 均存在，
+   `sglc.exe` 无参退出码 **= 1**，usage 文本确实打到 stderr（首行是 `usage: ... --model <dir>`）。
+
+未验证的只剩：`ninja` / `ninja-x64` 两条 **Linux** job（本机无 Linux 环境；但它们的
+验收 gate 已在第 10 轮用 msvc 产物跑过同一套 bash 命令），以及真正打 tag 时的 `release`
+job（需 push tag，属对外发布，未做）。
+
 ## README 对账（第 11 轮，2026-10-27）
 
 发布质量（t13 要求 README/CHANGELOG 准确）直接吊在 README 上，所以把 README 逐句对了一遍
