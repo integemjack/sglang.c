@@ -89,12 +89,16 @@ jobs:
         run: ctest --test-dir build --output-on-failure --timeout 900
 
       # CI runner 无 GPU：CUDA job 只验证编译/链接，smoke 走 usage 分支（exit 1）
+      # 注意：不能写 2>&1 | Out-Null —— Actions 的 pwsh 默认 ErrorActionPreference=stop，
+      # stderr 会变 ErrorRecord 直接杀脚本；让 stderr 透传，只看 LASTEXITCODE
       - name: Smoke (CUDA build)
         if: matrix.gen == 'msvc-cuda'
         shell: pwsh
         run: |
-          & "build/bin/cuda_cli.exe" 2>&1 | Out-Null
-          if ($LASTEXITCODE -ne 1) { throw "cuda_cli usage smoke failed ($LASTEXITCODE)" }
+          & "build/bin/cuda_cli.exe" | Out-Null
+          $code = $LASTEXITCODE
+          Write-Host "cuda_cli usage exit code: $code"
+          if ($code -ne 1) { throw "cuda_cli usage smoke failed ($code)" }
           Write-Host "cuda_cli smoke OK (usage exit 1)"
 
       - name: Package (Linux/macOS)
