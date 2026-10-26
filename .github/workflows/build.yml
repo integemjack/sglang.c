@@ -21,7 +21,10 @@ jobs:
           - { name: linux-x64,        os: ubuntu-latest,    gen: ninja }
           - { name: linux-arm64,      os: ubuntu-24.04-arm, gen: ninja }
           - { name: macos-arm64,      os: macos-latest,     gen: ninja }
-          - { name: macos-x64,        os: macos-13,         gen: ninja }
+          - { name: macos-x64,        os: macos-14,         gen: ninja-x64 }
+        # macos-x64 不再用 macos-13（最后的 Intel 镜像，2026-10 容量枯竭：连续三轮
+        # 排队 30-60 分钟+从未起跑）：改 macos-14（arm64）交叉编译 x86_64 产物，
+        # runner 的 Rosetta 2 透明转译跑测试
           - { name: windows-x64,      os: windows-latest,   gen: msvc }
           - { name: windows-x64-cuda, os: windows-latest,   gen: msvc-cuda }
         # windows-latest 自 2026-06 起预装 VS2026（18\），不用 VS 生成器：
@@ -31,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install toolchain (Linux/macOS)
-        if: matrix.gen == 'ninja'
+        if: matrix.gen == 'ninja' || matrix.gen == 'ninja-x64'
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install ninja
@@ -50,11 +53,17 @@ jobs:
             https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors
 
       - name: Configure (Ninja)
-        if: matrix.gen == 'ninja'
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        if: matrix.gen == 'ninja' || matrix.gen == 'ninja-x64'
+        run: |
+          if [ "${{ matrix.gen }}" = "ninja-x64" ]; then
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_C_FLAGS=-march=x86-64-v2
+          else
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          fi
 
       - name: Build (Ninja)
-        if: matrix.gen == 'ninja'
+        if: matrix.gen == 'ninja' || matrix.gen == 'ninja-x64'
         run: cmake --build build -j
 
       - name: Setup MSVC
@@ -105,7 +114,7 @@ jobs:
           exit 0
 
       - name: Package (Linux/macOS)
-        if: matrix.gen == 'ninja'
+        if: matrix.gen == 'ninja' || matrix.gen == 'ninja-x64'
         shell: bash
         run: |
           mkdir -p dist
