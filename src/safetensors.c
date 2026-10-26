@@ -1,4 +1,4 @@
-﻿/* sgl safetensors 实现
+/* sgl safetensors 实现
  * 文件格式：<u64 header_len><header JSON><数据区>
  * header: { "tensor": {"dtype":"F32","shape":[..],"data_offsets":[s,e]}, ... } */
 #define _CRT_SECURE_NO_WARNINGS
@@ -105,8 +105,8 @@ sgl_tensor sgl_st_get(sgl_st_ctx *c, const char *name, int expect_ndim,
     return bad;
 
   int ndim = shape->count;
-  if (ndim < 1 || ndim > 3) { SGL_ERROR("tensor '%s' ndim=%d unsupported", name, ndim); return bad; }
-  int64_t dims[3] = {1, 1, 1};
+  if (ndim < 1 || ndim > 4) { SGL_ERROR("tensor '%s' ndim=%d unsupported", name, ndim); return bad; }
+  int64_t dims[4] = {1, 1, 1, 1};
   int64_t numel = 1;
   for (int i = 0; i < ndim; i++) {
     dims[i] = (int64_t)shape->items[i]->num;

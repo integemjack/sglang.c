@@ -1,4 +1,4 @@
-﻿/* sgl llama implementation: RoPE/RMSNorm/SwiGLU/GQA + paged KV pool
+/* sgl llama implementation: RoPE/RMSNorm/SwiGLU/GQA + paged KV pool
  * (llama / tinyllama / qwen2 family; qwen2 adds qkv bias + qk-norm).
  * KV pool: LIFO free list + per-page refcount; optional int8 KV (SGL_KV8=1);
  * optional int8 weights W8A16 (SGL_W8=1); draft mode (SGL_DRAFT_LAYERS=N). */
@@ -427,9 +427,20 @@ static void proj_nt(sgl_llama *m, const float *A, const sgl_tensor *W,
 
 /* 共享实现：logits_rows==0 时只在 logits_out 返回末位分布（旧语义）；
  * logits_rows==n 时在 logits_all 返回全部 n 位分布（sgl_llama_forward_n）。 */
+static int llama_forward_emb_impl(sgl_llama *m, const int *tokens, const float *emb,
+                                  int n, int pos0, const int *slot_idx,
+                                  float *logits_out, int logits_rows);
 static int llama_forward_impl(sgl_llama *m, const int *tokens, int n, int pos0,
                               const int *slot_idx, float *logits_out,
                               int logits_rows) {
+  return llama_forward_emb_impl(m, tokens, NULL, n, pos0, slot_idx, logits_out, logits_rows);
+}
+
+/* t10 llava: emb != NULL 时直接用给定的 embedding 序列 [n][E]（视觉 token 融合），
+ * 跳过 token 查表；其余与 token 前向完全一致（同一层循环）。 */
+static int llama_forward_emb_impl(sgl_llama *m, const int *tokens, const float *emb,
+                                  int n, int pos0, const int *slot_idx,
+                                  float *logits_out, int logits_rows) {
   int E = m->n_embd, H = m->n_head, HK = m->n_kv_head, D = m->head_dim;
   int total = pos0 + n;
   if (n <= 0 || total > m->n_ctx) {
@@ -443,7 +454,10 @@ static int llama_forward_impl(sgl_llama *m, const int *tokens, int n, int pos0,
     }
   }
 
-  sgl_embedding_get(m->wte.data, tokens, n, E, m->x);
+  if (emb)
+    memcpy(m->x, emb, sizeof(float) * (size_t)n * E);
+  else
+    sgl_embedding_get(m->wte.data, tokens, n, E, m->x);
   if (m->gemma_scale > 0) /* t9 gemma: x *= sqrt(E) after embedding */
     for (size_t i = 0; i < (size_t)n * E; i++) m->x[i] *= m->gemma_scale;
 
@@ -591,6 +605,11 @@ int sgl_llama_forward(sgl_llama *m, const int *tokens, int n, int pos0,
 int sgl_llama_forward_n(sgl_llama *m, const int *tokens, int n, int pos0,
                         const int *slot_idx, float *logits_all) {
   return llama_forward_impl(m, tokens, n, pos0, slot_idx, logits_all, n);
+}
+
+int sgl_llama_forward_emb(sgl_llama *m, const float *emb, int n, int pos0,
+                          const int *slot_idx, float *logits_out) {
+  return llama_forward_emb_impl(m, NULL, emb, n, pos0, slot_idx, logits_out, 0);
 }
 
 /* batch decode: B sequences x 1 token, shared weights, one forward */

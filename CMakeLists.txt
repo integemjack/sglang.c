@@ -108,8 +108,14 @@ foreach(t ${SGL_TESTS})
   add_executable(${name} ${t})
   target_link_libraries(${name} PRIVATE sgl)
   add_test(NAME ${name} COMMAND ${name})
-  set_tests_properties(${name} PROPERTIES ENVIRONMENT "SGL_TEST_MODEL=${SGL_MODELS_DIR}/gpt2;SGL_TEST_LLAMA=${SGL_MODELS_DIR}/tiny-llama;SGL_TEST_LLAMA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_tinyllama.json;SGL_TEST_TINYLLAMA=${SGL_MODELS_DIR}/tinyllama;SGL_TEST_QWEN=${SGL_MODELS_DIR}/qwen05;SGL_TEST_LORA=${SGL_MODELS_DIR}/test-lora;SGL_TEST_LORA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora.json;SGL_TEST_LORA_S1=${SGL_MODELS_DIR}/test-lora-s1;SGL_TEST_LORA_S2=${SGL_MODELS_DIR}/test-lora-s2;SGL_TEST_LORA_REF_S1=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s1.json;SGL_TEST_LORA_REF_S2=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s2.json")
+  set_tests_properties(${name} PROPERTIES ENVIRONMENT "SGL_TEST_MODEL=${SGL_MODELS_DIR}/gpt2;SGL_TEST_LLAMA=${SGL_MODELS_DIR}/tiny-llama;SGL_TEST_LLAMA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_tinyllama.json;SGL_TEST_TINYLLAMA=${SGL_MODELS_DIR}/tinyllama;SGL_TEST_QWEN=${SGL_MODELS_DIR}/qwen05;SGL_TEST_LORA=${SGL_MODELS_DIR}/test-lora;SGL_TEST_LORA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora.json;SGL_TEST_LORA_S1=${SGL_MODELS_DIR}/test-lora-s1;SGL_TEST_LORA_S2=${SGL_MODELS_DIR}/test-lora-s2;SGL_TEST_LORA_REF_S1=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s1.json;SGL_TEST_LORA_REF_S2=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s2.json;SGL_TEST_LLAVA=${SGL_MODELS_DIR}/llava-rand")
 endforeach()
+
+# ---- t10 llava 多模态：给 glob 生成的 test_llava 指定模型目录（存在才设）----
+if(EXISTS ${SGL_MODELS_DIR}/llava-rand/clip_model.safetensors AND EXISTS ${SGL_MODELS_DIR}/llava-rand/_ref_proj.npy)
+  set_tests_properties(test_llava PROPERTIES DEPENDS test_llama
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
 
 # ---- t9 模型族对照（models/ 下存在对应（生成或下载的）目录时才注册，防 fresh-clone 红）----
 foreach(fam mistral gemma qwen3)
@@ -175,7 +181,7 @@ if(SGL_CUDA)
     VERBATIM)
   set(SGL_CORE_SRC
       src/alloc.c src/log.c src/json.c src/tensor.c src/safetensors.c
-      src/bpe.c src/ops.c src/quant.c src/llama.c src/gpt2.c src/sampling.c)
+      src/bpe.c src/ops.c src/quant.c src/llama.c src/gpt2.c src/sampling.c src/clip.c)
   add_library(sgl_cuda STATIC ${SGL_CORE_SRC} ${SGL_CUDA_OBJ})
   target_include_directories(sgl_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   if(MSVC)

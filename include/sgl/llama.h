@@ -1,4 +1,4 @@
-﻿/* sgl/llama.h — Llama 系模型（Llama/TinyLlama/Qwen 同构：RoPE/RMSNorm/SwiGLU/GQA）
+/* sgl/llama.h — Llama 系模型（Llama/TinyLlama/Qwen 同构：RoPE/RMSNorm/SwiGLU/GQA）
  * 对应 sglang srt/models/llama.py 的 CPU 单流路径（prefill + 增量 decode）。
  * KV 池：分页 + 引用计数（与 gpt2 相同语义，页大小 = kv_dim）。 */
 #ifndef SGL_LLAMA_H
@@ -71,6 +71,11 @@ int sgl_llama_forward(sgl_llama *m, const int *tokens, int n, int pos0,
  * 逐位一致（sgl_matmul_nt 分块不改每元素累加方式），test_spec 有断言。 */
 int sgl_llama_forward_n(sgl_llama *m, const int *tokens, int n, int pos0,
                         const int *slot_idx, float *logits_all);
+
+/* t10 llava：emb 版前向——直接吃 [n][E] embedding 序列（视觉 token 融合入口）。
+ * 与 token 前向同一路径（同一层循环），数值一致。 */
+int sgl_llama_forward_emb(sgl_llama *m, const float *emb, int n, int pos0,
+                          const int *slot_idx, float *logits_out);
 
 /* 批量 decode（调度器用）：B 序列各 1 token；logits_out 需 B*vocab */
 int sgl_llama_decode_batch(sgl_llama *m, const int *tokens, int *const *slot_idx,

@@ -1,4 +1,4 @@
-﻿/* sgl/tensor.h — 张量（PyTorch torch.Tensor 的最小 C 子集：1D/2D/3D f32） */
+/* sgl/tensor.h — 张量（PyTorch torch.Tensor 的最小 C 子集：1D/2D/3D f32） */
 #ifndef SGL_TENSOR_H
 #define SGL_TENSOR_H
 
@@ -11,9 +11,9 @@ typedef enum {
 } sgl_device;
 
 typedef struct {
-  int ndim;             /* 0..3 */
-  int64_t shape[3];     /* 各维大小 */
-  int64_t strides[3];   /* 元素步长（当前只支持紧凑行主序） */
+  int ndim;             /* 0..4 */
+  int64_t shape[4];     /* 各维大小 */
+  int64_t strides[4];   /* 元素步长（当前只支持紧凑行主序） */
   sgl_device device;
   float *data;          /* 指向 buffer 或 mmap 只读区 */
   void *_owner;         /* 非 NULL 表示 data 需要释放 */
