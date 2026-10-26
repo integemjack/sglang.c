@@ -172,6 +172,20 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
     不当结论）。
   - 干净环境下 flash 在 8K 行上比 two-pass 快 **23.6x**（G1 当时记录的 8.3x 是显存溢出/
     并发争用状态下的数，两个数字不要互相引用）。
+### 修复
+- **MSVC 构建的 CPU 路径一直只跑 SSE2（慢 10x）—— 已修**（`src/dot_avx2_msvc.c` +
+  `src/ops.c` + CMake）：AVX2 内积原来只对 GCC 可用（`__attribute__((target("avx2,fma")))`），
+  MSVC 没有函数级 target 属性，于是整条 CPU 路径（llama 的 GEMM 是「每行一个内积」）
+  落在 SSE2 基线。实测 qwen05 930-token prefill：MSVC 326.2s vs GCC 单线程 31.9s（差 10.2x）。
+  现在把 AVX2 版本放进单独编译单元（只给它 `/arch:AVX2`，其余代码仍 x86-64-v2 基线，
+  避开 t12.2 的全程序 AVX2 自动向量化 bug），用 CPUID（AVX2+FMA+OSXSAVE）运行时分派，
+  不支持就退回 SSE2。修后：930-token 326.2s → **33.6s（9.7x）**；8192-token CPU prefill
+  3733.0s → **611.8s（6.1x）**（g18b_8192.log，maxerr 1.43409e-04 仍 PASS）。
+  `cuda_test ..\models\qwen05` 仍 all OK（CPU-vs-GPU prefill maxerr 1.79e-07 → 2.15e-05，
+  归约顺序变化属 fp32 噪声）；CPU 构建 ctest 26/26。
+- 同时更正了自己上一轮的错判：把 CPU 慢归因于「没开 OpenMP」。实测 OpenMP 只值 **2.05x**
+  （930-token：单线程 31.9s → 8 线程 15.6s），归因已改。
+
 - 至此 **TODO_PROMPTS v0.4 的 G11–G19 全部完成**（只剩可选项未做：G12 的 7B LM 端到端
   因磁盘不够、G13 的 CUDA 路径、G15 的跳段共享——都有实测依据说明无意义/不可能）。
 

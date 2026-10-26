@@ -170,9 +170,12 @@ LRU 驱逐，段被复用时先释放它持有的租让）；请求结束时把�
 
 1. ~~`long_vcpu` 的 8K **GPU vs CPU** 绝对对照本批未重跑~~ → **G18 已完成**：
    maxerr 1.47581e-04（<1e-3）、greedy 同、PASS；日志 `docs/g18_8192.log`。
-   CPU 侧 8192-token prefill 耗时 **3733.0s（62.2 分钟）**，且是**单线程**（MSVC 构建
-   不开 OpenMP：CMakeLists 里的 `-fopenmp` 只给 GNU 编译器；进程 CPU 时间 ≈ 墙钟时间
-   已证实）。GPU 侧 flash 只要 **2.8s**（two-pass 66.1s，flash 比两遍快 23.6x）。
+   CPU 侧 8192-token prefill 耗时 **3733.0s（62.2 分钟）**。GPU 侧 flash 只要 **2.8s**
+   （two-pass 66.1s，flash 比两遍快 23.6x）。
+   事后查明这 62 分钟是**构建问题**：MSVC 没跑到 AVX2 内积（只跑 SSE2），同一线程下比
+   GCC 慢 10.2x；已新增 `src/dot_avx2_msvc.c`（单文件 `/arch:AVX2` + CPUID 分派）修好，
+   修后同样 930-token prefill 326.2s → 33.6s（9.7x），`cuda_test` 仍 all OK。
+   详情与实测表见 `docs/BENCH.md` 的「G18 补记」。
 2. G5 soak 已重跑无干扰版（8 分钟，PASS，斜率见上）。
 3. 前缀缓存是**段级**（一条序列一个租让槽，最长公共前缀按 token 精确比对），不是 CPU 侧
    那种 radix 树；跨段的部分共享、显存压力下的主动回收、以及带 visual token 的请求都未覆盖。

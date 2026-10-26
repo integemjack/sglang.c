@@ -46,17 +46,52 @@ K=2 a>69.5%，而实测只有 39.1% / 28.6% —— **仍未转正**，根因就�
 | GPU prefill（flash，8192 tok） | **2.8 s** |
 | GPU two-pass（同进程再走一遍） | 66.1 s |
 | flash vs two-pass maxerr | 2.72e-05 |
-| CPU prefill（sgl_llama_forward，8192 tok） | **3733.0 s（62.2 分钟）** |
+| CPU prefill（sgl_llama_forward，8192 tok，**修 AVX2 前**） | 3733.0 s（62.2 分钟） |
 | **GPU vs CPU maxerr** | **1.47581e-04（< 1e-3 → PASS）** |
 | greedy 首 token | cpu=5562 gpu=5562（SAME） |
 
+上面的 CPU 耗时是**修 AVX2 之前**的（MSVC 只跑 SSE2）；同一个二进制把 AVX2 路径接上后
+重跑（`docs/g18b_8192.log`）：
+
+| 项 | 修前 | 修后 | 倍率 |
+|---|---|---|---|
+| CPU prefill 8192 tok | 3733.0 s | **611.8 s（10.2 分钟）** | **6.1x** |
+| GPU vs CPU maxerr | 1.47581e-04 | 1.43409e-04 | 同量级，两次都 PASS |
+| greedy | 5562 / 5562 SAME | 5562 / 5562 SAME | — |
+
+（930-token 小测上的倍率是 9.7x，8192 上是 6.1x：因为 8K 时 attention 的占比更大，
+而那部分的内积宽度小（头的 64 维），AVX2 收益不如 MLP 的大 K。）
+
 值得记下的两件事：
-1. CPU 侧是**单线程**：CMakeLists 的 `-fopenmp` 只给 GNU 编译器（Apple Clang / MSVC 都没开），
-   实测进程 CPU 时间 ≈ 墙钟时间（1.0 core）——这就是之前“40+ 分钟没跑完”的原因，
-   而不是算法退化。若开 OpenMP（8 核）预计可降到 ~10 分钟量级（未实测，不当作结论）。
+1. ~~CPU 侧是单线程（MSVC 没开 OpenMP），这就是之前 40+ 分钟没跑完的原因~~ →
+   **这个判断错了，已修正（下面 G18 补记）**：OpenMP 只值 2.05x，真正的原因是 MSVC
+   构建根本没跑到 AVX2 内积（只跑 SSE2 基线），**同一线程数下差 10.2x**。
 2. GPU 侧同一份 8K prompt 只要 2.8 s，而 two-pass 要 66.1 s —— 在 8K 行上 flash 比
    两遍快 **23.6x**（G1 当时的 8.3x 是在显存溢出/并发争用的机器状态上测的；这次是干净状态）。
    这个倍数与 G1 的结论方向一致，但数值不应互相引用。
+
+### G18 补记：CPU 侧慢的真正原因 = MSVC 缺 AVX2 内积（已修，实测 9.7x）
+
+G18 跑完后我对着两个构建的同一段 CPU 代码量了一下（qwen05，930-token prompt，
+`--max-new 1`，只含 prefill+1 步）：
+
+| 构建 / 线程 | 930-token prefill |
+|---|---|
+| MinGW（GCC，OpenMP=1） | 31.94 s |
+| MinGW（GCC，OpenMP=8） | 15.62 s（**OpenMP 只值 2.05x**，不是 8x） |
+| MSVC（无 OpenMP） | **326.17 s** |
+| MSVC + 本次修好 AVX2 后 | **33.64 s**（相对修前 **9.7x**，与 GCC 单线程持平） |
+
+原因：`src/ops.c` 的 AVX2 内积用的是 GCC 的 `__attribute__((target("avx2,fma")))`，
+**MSVC 没有等价的函数级属性**，于是 MSVC 构建一直落在 SSE2 基线（8-wide → 4-wide，
+且无 FMA）。而 llama 的 GEMM 是「每行一个内积」，所以整条 CPU 路径都慢 10x ——
+这也解释了 G18 为何要 62 分钟（正确性没问题，只是跑得慢）。
+
+修法：新增 `src/dot_avx2_msvc.c`（只这个文件在 CMake 里单独加 `/arch:AVX2`，其余代码
+仍保持 x86-64-v2 基线，避开 t12.2 记录的全程序 AVX2 自动向量化 bug），运行时用
+CPUID（AVX2+FMA+OSXSAVE）分派，不支持就退回 SSE2。正确性：`cuda_test ..\models\qwen05`
+仍 `test_cuda: all OK`（CPU-vs-GPU prefill maxerr 1.79e-07 → **2.15e-05**，仍在 1e-4 量级、
+远低于各阈值；归约顺序变化属 fp32 噪声，与 ops.c 里 GCC AVX2 路径的注释一致）。
 
 ## G15：前缀缓存（租让表）扩到「生成 token + 带图 + 可关」 （2026-10-27）
 

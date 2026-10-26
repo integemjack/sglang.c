@@ -1,0 +1,60 @@
+07:01:13.408 INFO bpe.c:242] tokenizer loaded: style=gpt2/ByteLevel vocab=151643 merges=151387 added=22 bos=128245 eos=128247
+prompt: 8192 tokens (repeat unit 11)
+07:01:13.408 INFO llama.c:321] Llama config: L=24 H=14 KVH=2 E=896 I=4864 D=64 ctx=32768 vocab=151936 eps=1e-06 theta=1e+06 tie=0
+07:01:13.408 INFO safetensors.c:71] safetensors opened: ..\models\qwen05/model.safetensors, 291 tensors, data 942.3 MB
+07:01:13.629 ERROR safetensors.c:92] tensor 'lm_head.weight' not found
+07:01:13.629 INFO llama.c:338] lm_head missing, fallback to tied embeddings
+07:01:13.653 ERROR safetensors.c:92] tensor 'model.layers.0.self_attn.q_norm.weight' not found
+07:01:13.653 ERROR safetensors.c:92] tensor 'model.layers.0.self_attn.k_norm.weight' not found
+07:01:13.679 ERROR safetensors.c:92] tensor 'model.layers.1.self_attn.q_norm.weight' not found
+07:01:13.679 ERROR safetensors.c:92] tensor 'model.layers.1.self_attn.k_norm.weight' not found
+07:01:13.704 ERROR safetensors.c:92] tensor 'model.layers.2.self_attn.q_norm.weight' not found
+07:01:13.704 ERROR safetensors.c:92] tensor 'model.layers.2.self_attn.k_norm.weight' not found
+07:01:13.727 ERROR safetensors.c:92] tensor 'model.layers.3.self_attn.q_norm.weight' not found
+07:01:13.727 ERROR safetensors.c:92] tensor 'model.layers.3.self_attn.k_norm.weight' not found
+07:01:13.752 ERROR safetensors.c:92] tensor 'model.layers.4.self_attn.q_norm.weight' not found
+07:01:13.752 ERROR safetensors.c:92] tensor 'model.layers.4.self_attn.k_norm.weight' not found
+07:01:13.779 ERROR safetensors.c:92] tensor 'model.layers.5.self_attn.q_norm.weight' not found
+07:01:13.779 ERROR safetensors.c:92] tensor 'model.layers.5.self_attn.k_norm.weight' not found
+07:01:13.803 ERROR safetensors.c:92] tensor 'model.layers.6.self_attn.q_norm.weight' not found
+07:01:13.805 ERROR safetensors.c:92] tensor 'model.layers.6.self_attn.k_norm.weight' not found
+07:01:13.828 ERROR safetensors.c:92] tensor 'model.layers.7.self_attn.q_norm.weight' not found
+07:01:13.828 ERROR safetensors.c:92] tensor 'model.layers.7.self_attn.k_norm.weight' not found
+07:01:13.853 ERROR safetensors.c:92] tensor 'model.layers.8.self_attn.q_norm.weight' not found
+07:01:13.853 ERROR safetensors.c:92] tensor 'model.layers.8.self_attn.k_norm.weight' not found
+07:01:13.876 ERROR safetensors.c:92] tensor 'model.layers.9.self_attn.q_norm.weight' not found
+07:01:13.876 ERROR safetensors.c:92] tensor 'model.layers.9.self_attn.k_norm.weight' not found
+07:01:13.901 ERROR safetensors.c:92] tensor 'model.layers.10.self_attn.q_norm.weight' not found
+07:01:13.901 ERROR safetensors.c:92] tensor 'model.layers.10.self_attn.k_norm.weight' not found
+07:01:13.925 ERROR safetensors.c:92] tensor 'model.layers.11.self_attn.q_norm.weight' not found
+07:01:13.925 ERROR safetensors.c:92] tensor 'model.layers.11.self_attn.k_norm.weight' not found
+07:01:13.950 ERROR safetensors.c:92] tensor 'model.layers.12.self_attn.q_norm.weight' not found
+07:01:13.950 ERROR safetensors.c:92] tensor 'model.layers.12.self_attn.k_norm.weight' not found
+07:01:13.973 ERROR safetensors.c:92] tensor 'model.layers.13.self_attn.q_norm.weight' not found
+07:01:13.973 ERROR safetensors.c:92] tensor 'model.layers.13.self_attn.k_norm.weight' not found
+07:01:13.998 ERROR safetensors.c:92] tensor 'model.layers.14.self_attn.q_norm.weight' not found
+07:01:13.998 ERROR safetensors.c:92] tensor 'model.layers.14.self_attn.k_norm.weight' not found
+07:01:14.022 ERROR safetensors.c:92] tensor 'model.layers.15.self_attn.q_norm.weight' not found
+07:01:14.022 ERROR safetensors.c:92] tensor 'model.layers.15.self_attn.k_norm.weight' not found
+07:01:14.048 ERROR safetensors.c:92] tensor 'model.layers.16.self_attn.q_norm.weight' not found
+07:01:14.048 ERROR safetensors.c:92] tensor 'model.layers.16.self_attn.k_norm.weight' not found
+07:01:14.072 ERROR safetensors.c:92] tensor 'model.layers.17.self_attn.q_norm.weight' not found
+07:01:14.072 ERROR safetensors.c:92] tensor 'model.layers.17.self_attn.k_norm.weight' not found
+07:01:14.098 ERROR safetensors.c:92] tensor 'model.layers.18.self_attn.q_norm.weight' not found
+07:01:14.098 ERROR safetensors.c:92] tensor 'model.layers.18.self_attn.k_norm.weight' not found
+07:01:14.122 ERROR safetensors.c:92] tensor 'model.layers.19.self_attn.q_norm.weight' not found
+07:01:14.122 ERROR safetensors.c:92] tensor 'model.layers.19.self_attn.k_norm.weight' not found
+07:01:14.146 ERROR safetensors.c:92] tensor 'model.layers.20.self_attn.q_norm.weight' not found
+07:01:14.146 ERROR safetensors.c:92] tensor 'model.layers.20.self_attn.k_norm.weight' not found
+07:01:14.172 ERROR safetensors.c:92] tensor 'model.layers.21.self_attn.q_norm.weight' not found
+07:01:14.172 ERROR safetensors.c:92] tensor 'model.layers.21.self_attn.k_norm.weight' not found
+07:01:14.195 ERROR safetensors.c:92] tensor 'model.layers.22.self_attn.q_norm.weight' not found
+07:01:14.195 ERROR safetensors.c:92] tensor 'model.layers.22.self_attn.k_norm.weight' not found
+07:01:14.221 ERROR safetensors.c:92] tensor 'model.layers.23.self_attn.q_norm.weight' not found
+07:01:14.221 ERROR safetensors.c:92] tensor 'model.layers.23.self_attn.k_norm.weight' not found
+07:01:14.221 INFO llama.c:617] Llama loaded: KV pool 8208 pages (192.4 MB f32)
+GPU prefill 8192 tok: 2.7s
+GPU two-pass 8192 tok: 66.1s | flash-vs-twopass maxerr = 2.71797e-05
+CPU prefill 8192 tok: 611.8s
+maxerr = 0.000143409  (greedy cpu=5562 gpu=5562 SAME)
+verdict: PASS (<1e-3)

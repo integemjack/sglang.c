@@ -9,8 +9,17 @@
   → GPU prefill **2.8 s**、CPU prefill **3733.0 s（62.2 分钟，单线程）**、
   **maxerr 1.47581e-04 < 1e-3**、greedy 5562 vs 5562 SAME。日志 `docs/g18_8192.log`。
   （之前只能靠传递论证：flash vs 两遍核 2.72e-05、两遍核 vs CPU 1.48e-04 —— 现在是直接实测。）
-  另外记一笔原因：CPU 侧这么慢不是算法问题，而是 **MSVC 构建没开 OpenMP**
-  （CMakeLists 的 `-fopenmp` 只给 GNU），进程 CPU 时间 ≈ 墙钟时间，1.0 core。
+  修 AVX2 后重跑（同二进制、`docs/g18b_8192.log`）：CPU 侧 **611.8s（10.2 分钟）**、
+  相对修前 **6.1x**、maxerr 1.43409e-04 仍 PASS、greedy 仍 SAME。
+
+### 修复
+- **MSVC 构建的 CPU 路径只跑 SSE2，比 GCC 慢 10.2x —— 已修**：`src/ops.c` 的 AVX2 内积
+  原本只对 GCC 可用（函数级 `target("avx2,fma")`），MSVC 没这个属性 → 一直落在 SSE2 基线。
+  新增 `src/dot_avx2_msvc.c`（只该文件 `/arch:AVX2`，其余保持 x86-64-v2 基线；CPUID
+  AVX2+FMA+OSXSAVE 运行时分派，不支持退 SSE2）。实测 qwen05 930-token prefill
+  **326.2s → 33.6s（9.7x）**、8192-token CPU prefill **3733.0s → 611.8s（6.1x）**；
+  `cuda_test` 仍 all OK（CPU-vs-GPU maxerr 1.79e-07 → 2.15e-05，归约顺序变化属 fp32 噪声）。
+- 同时更正上轮自己的错判：把 CPU 慢归因于“没开 OpenMP”——实测 OpenMP 只值 **2.05x**。
 
 ### 多模态（G12 真实 llava-1.5 链路）
 - **projector 支持两层 MLP**：新增 `sgl_projector`（`include/sgl/image.h` + `src/image.c`），

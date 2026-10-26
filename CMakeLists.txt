@@ -232,8 +232,13 @@ if(SGL_CUDA)
       src/alloc.c src/log.c src/json.c src/tensor.c src/safetensors.c
       src/bpe.c src/ops.c src/quant.c src/llama.c src/gpt2.c src/sampling.c src/clip.c
       src/image.c # G11: PNG/JPEG 解码 + CLIP 预处理（cuda_http 现在收真实图片）
+      src/dot_avx2_msvc.c # G18: MSVC 的 AVX2 内积（单独 /arch:AVX2 编译 + CPUID 分派）
       src/cuda_spec.c) # G7: GPU 侧投机解码（纯 host C，调 sgl_cuda_* API）
   add_library(sgl_cuda STATIC ${SGL_CORE_SRC} ${SGL_CUDA_OBJ})
+  # dot_avx2_msvc.c 单独开 /arch:AVX2（MSVC 没有函数级 target 属性）
+  if(MSVC)
+    set_source_files_properties(src/dot_avx2_msvc.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  endif()
   target_include_directories(sgl_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb) # G8: image.c 在 SGL_CORE_SRC 里，stb 头要能找到
   if(MSVC)

@@ -83,12 +83,24 @@ static double dot_k_f32_sse2(const float *a, const float *b, int K) {
 }
 
 /* 运行时一次性选路（race 无害：各线程写入相同值）*/
+#if defined(_MSC_VER)
+/* MSVC 没有函数级 target 属性：AVX2 版在 src/dot_avx2_msvc.c（单独 /arch:AVX2 编译），
+ * 这里只做 CPUID 分派。不加这条的话 MSVC 构建永远只跑 SSE2 基线 —— 实测 qwen05
+ * 930-token prefill 单线程 326s vs GCC 同线程 31.9s（差 10.2x），见 BENCH 的 G18 补记。 */
+extern int sgl_dot_avx2_available(void);
+extern double sgl_dot_f32_avx2(const float *a, const float *b, int K);
+#endif
+
 static double dot_k_f32(const float *a, const float *b, int K) {
 #if SGL_HAVE_AVX2_TARGET
   static int has_avx2 = -1;
   if (has_avx2 < 0)
     has_avx2 = (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) ? 1 : 0;
   if (has_avx2) return dot_k_f32_avx2(a, b, K);
+#elif defined(_MSC_VER)
+  static int has_avx2 = -1;
+  if (has_avx2 < 0) has_avx2 = sgl_dot_avx2_available();
+  if (has_avx2) return sgl_dot_f32_avx2(a, b, K);
 #endif
   return dot_k_f32_sse2(a, b, K);
 }
