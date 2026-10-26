@@ -1,4 +1,4 @@
-/* sgl tensor 实现 */
+﻿/* sgl tensor 实现 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/tensor.h"
 

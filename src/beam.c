@@ -1,4 +1,4 @@
-/* sgl beam search（llama 后端；对应 sglang srt/beam_search 的最小正确版）
+﻿/* sgl beam search（llama 后端；对应 sglang srt/beam_search 的最小正确版）
  * W 条 beam，逐步保留累计 logprob 最高的 W 个候选；eos 候选直接终束并记录；
  * 分叉时复制源 beam 的 KV 页（每步全量复制，W≤8、CPU 可接受）。 */
 #define _CRT_SECURE_NO_WARNINGS

@@ -1,4 +1,4 @@
-/* sgl gpt2 实现 */
+﻿/* sgl gpt2 实现 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/gpt2.h"
 

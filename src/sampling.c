@@ -1,4 +1,4 @@
-/* sgl sampling 实现 */
+﻿/* sgl sampling 实现 */
 #include "sgl/sampling.h"
 
 #include <math.h>

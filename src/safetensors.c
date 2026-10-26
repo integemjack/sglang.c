@@ -1,4 +1,4 @@
-/* sgl safetensors 实现
+﻿/* sgl safetensors 实现
  * 文件格式：<u64 header_len><header JSON><数据区>
  * header: { "tensor": {"dtype":"F32","shape":[..],"data_offsets":[s,e]}, ... } */
 #define _CRT_SECURE_NO_WARNINGS

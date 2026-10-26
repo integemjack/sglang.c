@@ -98,6 +98,9 @@ static void req_free(request *r) {
 }
 
 static int submit(const char *text, int max_new, const sgl_sampling_params *sp) {
+  /* t11: cap prompt length before the O(n^2)-ish BPE merge — a pathological
+   * 200KB single-char body used to park encode for minutes (server hang). */
+  if (!text || strlen(text) > 65536) return -1;
   /* t5: no more 503 when full — park in a wait queue; the worker drains it
    * into freed slots every pass. Hard cap only guards against unbounded
    * queue growth (128 waiting). */
@@ -553,7 +556,7 @@ static int route(SOCKET fd, const http_req *req) {
 
   int id = submit(prompt, max_new, &sp);
   free(prompt);
-  if (id < 0) { respond_error(fd, 503, "server busy (max concurrent reached)"); return 0; }
+  if (id < 0) { respond_error(fd, 503, "prompt too long (>64KB) or server busy"); return 0; }
 
   if (is_stream) {
     /* mark streaming then wait_done emits SSE chunks */

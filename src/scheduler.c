@@ -1,4 +1,4 @@
-/* sgl scheduler 实现：连续批处理调度器 + RadixCache 前缀复用 */
+﻿/* sgl scheduler 实现：连续批处理调度器 + RadixCache 前缀复用 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/scheduler.h"
 

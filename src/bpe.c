@@ -1,4 +1,4 @@
-/* sgl bpe 实现：GPT-2 字节级 BPE（HF tokenizer.json 格式）*/
+﻿/* sgl bpe 实现：GPT-2 字节级 BPE（HF tokenizer.json 格式）*/
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/bpe.h"
 

@@ -1,4 +1,4 @@
-/* sgl speculative decoding v2（draft-verify；对应 sglang srt/speculative 的 greedy 版）
+﻿/* sgl speculative decoding v2（draft-verify；对应 sglang srt/speculative 的 greedy 版）
  * 每轮：draft 连出 K 候选 → target 【一次 n-token 批量前向】拿到全部候选位
  * logits（n-outer 分块 GEMM，权重驻留复用；verify 成本 ≈ 单步×1.2 而非×K），
  * 再逐步用【上一位置分布】验证（forward 返回的是吃掉 token 后的分布，比较

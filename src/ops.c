@@ -1,4 +1,4 @@
-/* sgl ops 实现：OpenMP 并行的 CPU 算子 */
+﻿/* sgl ops 实现：OpenMP 并行的 CPU 算子 */
 #include "sgl/ops.h"
 
 #include <math.h>

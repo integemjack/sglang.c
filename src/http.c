@@ -432,6 +432,14 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
   }
   text = prompt_copy;
 
+  /* t11: same pathological-prompt guard as cuda_http — a huge single-char
+   * body parks BPE encode for minutes on the CPU stack too. */
+  if (strlen(text) > 65536) {
+    sgl_xfree(prompt_copy);
+    respond_error(fd, 503, "prompt too long (>64KB)");
+    return;
+  }
+
   /* n 个请求（n>1 时各自加 seed 偏移，temperature>0 才有差异）*/
   int ids[4] = {-1, -1, -1, -1};
   pthread_mutex_lock(&srv->lock);
@@ -594,6 +602,19 @@ typedef struct {
 static void *conn_fn(void *arg) {
   conn_ctx *ctx = (conn_ctx *)arg;
   http_req req;
+  /* t11: disable Nagle — head+body split sends interact with delayed-ACK
+   * into a fixed ~21-24s stall per response (2x RTO) on loopback. */
+  {
+    int nd = 1;
+    setsockopt(ctx->fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&nd, sizeof(nd));
+#ifdef _WIN32
+    DWORD rto = 30000;
+#else
+    struct timeval rto = {30, 0};
+#endif
+    setsockopt(ctx->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rto, sizeof(rto));
+    setsockopt(ctx->fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&rto, sizeof(rto));
+  }
   if (read_request(ctx->fd, &req) == 0) {
     route(ctx->srv, ctx->fd, &req);
     sgl_xfree(req.body);
@@ -612,7 +633,16 @@ static void *acceptor_fn(void *arg) {
     struct sockaddr_in peer;
     int plen = sizeof(peer);
     SOCKET c = accept(srv->listen_fd, (struct sockaddr *)&peer, &plen);
-    if (c == INVALID_SOCKET) break; /* listen socket 关闭（stop）*/
+    if (c == INVALID_SOCKET) {
+      /* t11: transient accept errors (burst) used to kill the acceptor */
+#ifdef _WIN32
+      int e = WSAGetLastError();
+      if (e == WSAECONNABORTED || e == WSAEINTR || e == WSAEMFILE) continue;
+#else
+      if (errno == ECONNABORTED || errno == EINTR) continue;
+#endif
+      break; /* listen socket 关闭（stop）*/
+    }
     if (srv->stop) { closesocket(c); break; }
     pthread_mutex_lock(&srv->lock);
     srv->active_conns++;

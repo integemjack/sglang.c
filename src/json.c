@@ -1,4 +1,4 @@
-/* sgl json 实现：递归下降解析器 */
+﻿/* sgl json 实现：递归下降解析器 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/json.h"
 

@@ -1,4 +1,4 @@
-/* sgl radix 实现：RadixAttention 前缀树（对照 sglang radix_cache.py 的 insert/match/evict）*/
+﻿/* sgl radix 实现：RadixAttention 前缀树（对照 sglang radix_cache.py 的 insert/match/evict）*/
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/radix.h"
 

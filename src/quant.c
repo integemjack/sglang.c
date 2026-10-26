@@ -1,4 +1,4 @@
-/* sgl quant 实现：int8 权重/激活/KV 量化 */
+﻿/* sgl quant 实现：int8 权重/激活/KV 量化 */
 #include "sgl/quant.h"
 
 #include <stdlib.h>

@@ -1,4 +1,4 @@
-/* sgl log 实现（Windows / POSIX 双分支）*/
+﻿/* sgl log 实现（Windows / POSIX 双分支）*/
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/log.h"
 

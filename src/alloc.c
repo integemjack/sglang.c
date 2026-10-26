@@ -1,4 +1,4 @@
-/* sgl alloc 实现：对齐分配 + 只读文件映射（Windows / POSIX 双分支）*/
+﻿/* sgl alloc 实现：对齐分配 + 只读文件映射（Windows / POSIX 双分支）*/
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/alloc.h"
 #include "sgl/log.h"

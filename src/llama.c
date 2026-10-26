@@ -1,4 +1,4 @@
-/* sgl llama implementation: RoPE/RMSNorm/SwiGLU/GQA + paged KV pool
+﻿/* sgl llama implementation: RoPE/RMSNorm/SwiGLU/GQA + paged KV pool
  * (llama / tinyllama / qwen2 family; qwen2 adds qkv bias + qk-norm).
  * KV pool: LIFO free list + per-page refcount; optional int8 KV (SGL_KV8=1);
  * optional int8 weights W8A16 (SGL_W8=1); draft mode (SGL_DRAFT_LAYERS=N). */

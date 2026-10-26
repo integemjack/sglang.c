@@ -1,4 +1,4 @@
-/* sgl model 实现：gpt2 / llama 后端分发 */
+﻿/* sgl model 实现：gpt2 / llama 后端分发 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/model.h"
 

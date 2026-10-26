@@ -1,4 +1,4 @@
-/* sgl generate 实现（单请求，直接走分页 KV 池；无 radix）*/
+﻿/* sgl generate 实现（单请求，直接走分页 KV 池；无 radix）*/
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/generate.h"
 
