@@ -88,18 +88,19 @@ jobs:
         shell: bash
         run: ctest --test-dir build --output-on-failure --timeout 900
 
-      # CI runner 无 GPU：CUDA job 只验证编译/链接，smoke 走 usage 分支（exit 1）
-      # 注意：不能写 2>&1 | Out-Null —— Actions 的 pwsh 默认 ErrorActionPreference=stop，
-      # stderr 会变 ErrorRecord 直接杀脚本；让 stderr 透传，只看 LASTEXITCODE
+      # CI runner 无 NVIDIA 驱动：cuda_cli/cuda_http 动态链 cublas（→nvcuda.dll）启动即
+      # 0xC0000135，无法在无 GPU runner 上运行 —— 只验证产物存在；可加载 smoke 用同
+      # job 构建的纯 CPU sglc（usage 分支 exit 1，不链任何 CUDA 库）
       - name: Smoke (CUDA build)
         if: matrix.gen == 'msvc-cuda'
         shell: pwsh
         run: |
-          & "build/bin/cuda_cli.exe" | Out-Null
+          Get-Item build/bin/cuda_cli.exe, build/bin/cuda_http.exe, build/bin/sglc.exe | Out-Null
+          & "build/bin/sglc.exe" | Out-Null
           $code = $LASTEXITCODE
-          Write-Host "cuda_cli usage exit code: $code"
-          if ($code -ne 1) { throw "cuda_cli usage smoke failed ($code)" }
-          Write-Host "cuda_cli smoke OK (usage exit 1)"
+          Write-Host "sglc usage exit code: $code"
+          if ($code -ne 1) { throw "sglc usage smoke failed ($code)" }
+          Write-Host "smoke OK (3 exes present, sglc usage exit 1)"
 
       - name: Package (Linux/macOS)
         if: matrix.gen == 'ninja'
