@@ -605,12 +605,23 @@ static __half *dev_copy_h(const float *src, size_t n) {
   return d;
 }
 
+/* t5 fix: captured graphs bind device pointers (x/h/q/... activation buffers)
+ * and pinned host addresses; any realloc below frees those, so cached graphs
+ * must be dropped. They re-capture lazily on the next decode. */
+static void invalidate_graphs(sgl_cuda_model *g) {
+  for (int b = 0; b <= 32; b++) {
+    if (g->graphs[b]) { cudaGraphDestroy((cudaGraph_t)g->graphs[b]); g->graphs[b] = NULL; }
+    if (g->gexec[b]) { cudaGraphExecDestroy((cudaGraphExec_t)g->gexec[b]); g->gexec[b] = NULL; }
+  }
+}
+
 /* growable activation workspace: make sure x/h/q/attn [E rows], k/v [KD
  * rows], gate/up [I rows] each cover n rows. Grows geometrically so decode
  * (n=B) allocates once and prefill grows to the longest segment seen.
  * t1: also the fp16 GEMM-input mirror ha [ws_cap x max(E,I)] (cublas path). */
 static int sgl_cuda_reserve(sgl_cuda_model *g, int n) {
   if (n <= g->ws_cap) return 0;
+  invalidate_graphs(g); /* realloc below frees buffers old graphs point to */
   float *x = dev_copy(NULL, (size_t)n * g->E);
   float *h = dev_copy(NULL, (size_t)n * g->E);
   /* t4 gpt2: the q slot doubles as the fused-qkv buffer [n,3E] */
@@ -651,6 +662,14 @@ static int sgl_cuda_reserve(sgl_cuda_model *g, int n) {
  * (memcpy nodes capture the host address, not the contents). */
 static int sgl_cuda_ensure_io(sgl_cuda_model *g, int B) {
   if (B <= g->io_cap_B) return 0;
+  /* t5 fix: captured graphs bind the CURRENT pinned host addresses in their
+   * memcpy nodes; growing the buffers frees those addresses, so every cached
+   * graph must be dropped (they re-capture on the next decode with the new
+   * pointers). Symptom was a sticky CUDA error surfacing in the NEXT
+   * unrelated cudaGetLastError() — e.g. /generate batch B=8 captured
+   * graphs, then a longer chat prefill grew h_tok and replaying B<=8 read a
+   * freed pinned buffer. */
+  invalidate_graphs(g);
   cudaFree(g->d_tok); cudaFree(g->d_base); cudaFree(g->d_lens);
   cudaFree(g->d_pq); cudaFree(g->d_pk);
   cudaFreeHost(g->h_tok); cudaFreeHost(g->h_base); cudaFreeHost(g->h_lens);

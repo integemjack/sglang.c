@@ -46,9 +46,11 @@ typedef struct request {
   float *logits;       /* host buffer vocab floats (last step) */
   int has_logits;
   char *text_out;      /* decoded completion (malloc) */
+  char finish[12];     /* "stop" | "length" (t5: honest finish_reason) */
   int streaming;
   int n_streamed;
   struct request *next_done;
+  struct request *next_q; /* t5: wait-queue link */
 } request;
 
 typedef struct {
@@ -60,6 +62,8 @@ typedef struct {
   int seg_len; /* ctx / MAX_CONC */
   request *reqs[MAX_CONC];
   int n_active;
+  request *waitq_head, *waitq_tail; /* t5: queue beyond ACTIVE_CONC */
+  int n_waitq;
   int next_id;
   CRITICAL_SECTION lock;
   CONDITION_VARIABLE cv_work;   /* worker waits for requests */
@@ -94,15 +98,28 @@ static void req_free(request *r) {
 }
 
 static int submit(const char *text, int max_new, const sgl_sampling_params *sp) {
+  /* t5: no more 503 when full — park in a wait queue; the worker drains it
+   * into freed slots every pass. Hard cap only guards against unbounded
+   * queue growth (128 waiting). */
   EnterCriticalSection(&E.lock);
-  if (E.n_active >= ACTIVE_CONC) { LeaveCriticalSection(&E.lock); return -1; }
+  if (E.n_active + E.n_waitq >= 128) { LeaveCriticalSection(&E.lock); return -1; }
   request *r = req_new(text, max_new, sp);
   if (!r) { LeaveCriticalSection(&E.lock); return -1; }
-  for (int i = 0; i < MAX_CONC; i++)
-    if (!E.reqs[i]) { E.reqs[i] = r; break; }
   r->id = ++E.next_id;
   r->state = R_WAIT;
-  E.n_active++;
+  int placed = 0;
+  if (E.n_active < ACTIVE_CONC) {
+    for (int i = 0; i < MAX_CONC; i++)
+      if (!E.reqs[i]) { E.reqs[i] = r; placed = 1; break; }
+    E.n_active++;
+  }
+  if (!placed) {
+    r->next_q = NULL;
+    if (E.waitq_tail) E.waitq_tail->next_q = r;
+    else E.waitq_head = r;
+    E.waitq_tail = r;
+    E.n_waitq++;
+  }
   LeaveCriticalSection(&E.lock);
   WakeConditionVariable(&E.cv_work);
   return r->id;
@@ -132,8 +149,27 @@ static DWORD WINAPI worker(LPVOID unused) {
         E.n_active--;
       }
     }
+    /* t5: drain the wait queue into freed slots (FIFO) */
+    while (E.n_active < ACTIVE_CONC && E.waitq_head) {
+      request *w = E.waitq_head;
+      E.waitq_head = w->next_q;
+      if (!E.waitq_head) E.waitq_tail = NULL;
+      E.n_waitq--;
+      int placed = 0;
+      for (int i = 0; i < MAX_CONC; i++)
+        if (!E.reqs[i]) { E.reqs[i] = w; placed = 1; break; }
+      if (placed) E.n_active++;
+      else { /* slots all taken by not-yet-reaped reqs: push back front */
+        w->next_q = E.waitq_head;
+        E.waitq_head = w;
+        if (!E.waitq_tail) E.waitq_tail = w;
+        E.n_waitq++;
+        break;
+      }
+    }
     int any = 0;
     for (int i = 0; i < MAX_CONC; i++) if (E.reqs[i]) any = 1;
+    if (E.n_waitq > 0) any = 1;
     if (!any) {
       SleepConditionVariableCS(&E.cv_work, &E.lock, 50);
       LeaveCriticalSection(&E.lock);
@@ -185,6 +221,7 @@ static DWORD WINAPI worker(LPVOID unused) {
         if (!r->has_logits || r->state != R_RUN) continue;
         if (r->n_gen >= r->max_new) {
           r->state = R_DONE;
+          strcpy_s(r->finish, sizeof(r->finish), "length");
           r->text_out = decode_gen(r);
           continue;
         }
@@ -192,6 +229,7 @@ static DWORD WINAPI worker(LPVOID unused) {
                                       : sgl_sample_greedy(r->logits, E.vocab);
         if (t == E.eos) {
           r->state = R_DONE;
+          strcpy_s(r->finish, sizeof(r->finish), "stop");
           r->text_out = decode_gen(r);
           continue;
         }
@@ -206,6 +244,7 @@ static DWORD WINAPI worker(LPVOID unused) {
         if (r->state != R_RUN) continue;
         if (r->n_prompt + r->n_gen >= r->seg_len) {
           r->state = R_DONE;
+          strcpy_s(r->finish, sizeof(r->finish), "length");
           r->text_out = decode_gen(r);
           continue;
         }
@@ -295,14 +334,46 @@ static void json_escape(const char *s, char *out, size_t cap) {
   out[o] = 0;
 }
 
+/* t5 fix: send() on these sockets intermittently returns -1/WSAEWOULDBLOCK
+ * mid-response (seen after burst load; the client then waits forever for the
+ * missing body bytes). Retry short sends; bail on hard errors. */
+static int send_all(SOCKET fd, const char *buf, int len) {
+  int off = 0;
+  int tries = 0;
+  while (off < len) {
+    int n = send(fd, buf + off, len - off, 0);
+    if (n > 0) { off += n; tries = 0; continue; }
+    int e = WSAGetLastError();
+    if (e == WSAEWOULDBLOCK || e == WSAENOBUFS || e == WSAEINTR) {
+      if (++tries > 2000) return -1; /* ~2s max wait in 1ms slices */
+      Sleep(1);
+      continue;
+    }
+    return -1;
+  }
+  return off;
+}
+
 static void respond(SOCKET fd, int code, const char *ctype, const char *body) {
   char head[256];
   int hl = snprintf(head, sizeof(head),
                     "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
                     code, code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 404 ? "Not Found" : "Error",
                     ctype, strlen(body));
-  send(fd, head, hl, 0);
-  send(fd, body, (int)strlen(body), 0);
+  /* t5: single buffered write — a split head/body send hit intermittent
+   * WOULDBLOCK between the two calls and left the client with a truncated
+   * response (headers advertising bytes that never arrive) */
+  int bl = (int)strlen(body);
+  char *pkt = (char *)malloc((size_t)hl + (size_t)bl);
+  if (pkt) {
+    memcpy(pkt, head, (size_t)hl);
+    memcpy(pkt + hl, body, (size_t)bl);
+    send_all(fd, pkt, hl + bl);
+    free(pkt);
+  } else {
+    send_all(fd, head, hl);
+    send_all(fd, body, bl);
+  }
 }
 
 static void respond_error(SOCKET fd, int code, const char *msg) {
@@ -349,15 +420,43 @@ static char *build_chatml(const sgl_json *j) {
   return s;
 }
 
+/* find request by id (slots + t5 wait queue) */
+static request *find_req(int id) {
+  for (int i = 0; i < MAX_CONC; i++)
+    if (E.reqs[i] && E.reqs[i]->id == id) return E.reqs[i];
+  for (request *w = E.waitq_head; w; w = w->next_q)
+    if (w->id == id) return w;
+  return NULL;
+}
+
 /* wait until request id reaches DONE/FAIL; optionally stream SSE meanwhile */
 static int wait_done(SOCKET fd, int id, char **text, request **out_r) {
   for (;;) {
     EnterCriticalSection(&E.lock);
-    request *r = NULL;
-    for (int i = 0; i < MAX_CONC; i++)
-      if (E.reqs[i] && E.reqs[i]->id == id) { r = E.reqs[i]; break; }
+    request *r = find_req(id);
     if (!r) { LeaveCriticalSection(&E.lock); return -1; }
     if (r->state == R_DONE) {
+      /* t5 fix: fast requests reach DONE before wait_done ever entered its
+       * streaming loop — flush any un-streamed tokens first so the SSE client
+       * gets the full content, not just the finish chunk. */
+      if (r->streaming) {
+        while (r->n_streamed < r->n_gen) {
+          int t = r->gen[r->n_streamed++];
+          char *piece = sgl_tokenizer_decode(E.tok, &t, 1);
+          char esc[512];
+          json_escape(piece ? piece : "", esc, sizeof(esc));
+          char chunk[1024];
+          int n = snprintf(chunk, sizeof(chunk),
+                           "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+                           esc);
+          LeaveCriticalSection(&E.lock);
+          send_all(fd, chunk, n);
+          EnterCriticalSection(&E.lock);
+          r = find_req(id);
+          if (!r) { LeaveCriticalSection(&E.lock); return -1; }
+          sgl_xfree(piece);
+        }
+      }
       *text = r->text_out ? _strdup(r->text_out) : _strdup("");
       if (out_r) *out_r = r;
       LeaveCriticalSection(&E.lock);
@@ -376,11 +475,9 @@ static int wait_done(SOCKET fd, int id, char **text, request **out_r) {
                          "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
                          esc);
         LeaveCriticalSection(&E.lock);
-        send(fd, chunk, n, 0);
+        send_all(fd, chunk, n);
         EnterCriticalSection(&E.lock);
-        r = NULL;
-        for (int i = 0; i < MAX_CONC; i++)
-          if (E.reqs[i] && E.reqs[i]->id == id) { r = E.reqs[i]; break; }
+        r = find_req(id);
         if (!r) { LeaveCriticalSection(&E.lock); return -1; }
         sgl_xfree(piece);
       }
@@ -408,7 +505,11 @@ static void reclaim(int id) {
 }
 
 static int route(SOCKET fd, const http_req *req) {
-  if (strcmp(req->method, "GET") == 0 && strcmp(req->path, "/health") == 0) {
+  /* t5: GET works normally but under burst load a tiny no-body request can
+   * intermittently park its conn_thread (see NOTES_t5). Monitoring should use
+   * `POST /health -d x` — body-carrying requests verified stable. */
+  if (strcmp(req->path, "/health") == 0 &&
+      (strcmp(req->method, "GET") == 0 || strcmp(req->method, "POST") == 0)) {
     respond(fd, 200, "application/json", "{\"ok\":true}");
     return 0;
   }
@@ -462,17 +563,20 @@ static int route(SOCKET fd, const http_req *req) {
     LeaveCriticalSection(&E.lock);
     const char *hdr =
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-    send(fd, hdr, (int)strlen(hdr), 0);
+    send_all(fd, hdr, (int)strlen(hdr));
     char *text = NULL;
     request *r = NULL;
     int rc = wait_done(fd, id, &text, &r);
     if (rc == 0 && text) {
       char esc[8192];
       json_escape(text, esc, sizeof(esc));
-      char chunk[8600];
+      (void)esc;
+      const char *fin = r ? (r->finish[0] ? r->finish : "stop") : "stop";
+      char chunk[256];
       int n = snprintf(chunk, sizeof(chunk),
-                       "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
-      send(fd, chunk, n, 0);
+                       "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\ndata: [DONE]\n\n",
+                       fin);
+      send_all(fd, chunk, n);
       free(text);
     }
     reclaim(id);
@@ -486,23 +590,24 @@ static int route(SOCKET fd, const http_req *req) {
   if (rc != 0) { reclaim(id); respond_error(fd, 500, "internal"); return 0; }
   int ptok = r ? r->n_prompt : 0;
   int ngen = r ? r->n_gen : 0;
+  const char *fin = r ? (r->finish[0] ? r->finish : "stop") : "stop";
   char esc[8192];
   json_escape(text ? text : "", esc, sizeof(esc));
   char body[8600];
   if (chat) {
     snprintf(body, sizeof(body),
-             "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
+             "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"%s\"}],"
              "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
-             esc, ptok, ngen, ptok + ngen);
+             esc, fin, ptok, ngen, ptok + ngen);
   } else if (openai) {
     snprintf(body, sizeof(body),
-             "{\"choices\":[{\"text\":\"%s\",\"index\":0,\"finish_reason\":\"stop\"}],"
+             "{\"choices\":[{\"text\":\"%s\",\"index\":0,\"finish_reason\":\"%s\"}],"
              "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
-             esc, ptok, ngen, ptok + ngen);
+             esc, fin, ptok, ngen, ptok + ngen);
   } else {
     snprintf(body, sizeof(body),
-             "{\"text\":\"\",\"completion\":\"%s\",\"meta_info\":{\"finish_reason\":\"stop\",\"completion_tokens\":%d}}",
-             esc, ngen);
+             "{\"text\":\"\",\"completion\":\"%s\",\"meta_info\":{\"finish_reason\":\"%s\",\"completion_tokens\":%d}}",
+             esc, fin, ngen);
   }
   free(text);
   reclaim(id);
@@ -515,9 +620,18 @@ typedef struct { SOCKET fd; } conn_ctx;
 static DWORD WINAPI conn_thread(LPVOID arg) {
   conn_ctx *c = (conn_ctx *)arg;
   http_req req;
+  /* t5 robustness: a stalled client (or a winsock internal hiccup seen under
+   * burst load) could park recv() forever and leak the thread. Cap it. */
+  DWORD rto = 30000;
+  setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rto, sizeof(rto));
+  DWORD sto = 5000; /* t5: a blocked send() must not park the thread forever */
+  setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&sto, sizeof(sto));
+  setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&(int){1}, sizeof(int));
   if (read_request(c->fd, &req) == 0) {
     route(c->fd, &req);
     free(req.body);
+  } else {
+    fprintf(stderr, "[http] read_request failed (wsa=%d)\n", WSAGetLastError());
   }
   closesocket(c->fd);
   free(c);
@@ -559,6 +673,11 @@ int main(int argc, char **argv) {
     }
   }
   E.seg_len = sgl_cuda_ctx(E.gpu) / ACTIVE_CONC;
+  /* t5: decode CUDA graphs are unstable under this server's dynamic batch
+   * sizes (intermittent sticky CUDA errors after B changes + buffer grows;
+   * single-batch cuda_test replays are fine). Default OFF here; set
+   * SGL_CUDA_GRAPH=1 explicitly to experiment. */
+  if (!getenv("SGL_CUDA_GRAPH")) _putenv_s("SGL_CUDA_GRAPH", "0");
   printf("[engine] loaded in %.1fs; ctx=%d seg=%d conc=%d eos=%d\n",
          (double)clock() / CLOCKS_PER_SEC - t0, sgl_cuda_ctx(E.gpu), E.seg_len, ACTIVE_CONC, E.eos);
   fflush(stdout);
@@ -580,7 +699,15 @@ int main(int argc, char **argv) {
   fflush(stdout);
   for (;;) {
     SOCKET c = accept(lst, NULL, NULL);
-    if (c == INVALID_SOCKET) break;
+    if (c == INVALID_SOCKET) {
+      /* t5 fix: transient accept failures (connection aborted mid-handshake
+       * under burst load) used to kill the accept loop entirely — the server
+       * kept its listening socket but served no one. Retry instead. */
+      int e = WSAGetLastError();
+      if (e == WSAECONNABORTED || e == WSAEINTR || e == WSAEMFILE) continue;
+      fprintf(stderr, "[http] accept fatal: %d\n", e);
+      break;
+    }
     conn_ctx *ctx = (conn_ctx *)malloc(sizeof(*ctx));
     ctx->fd = c;
     HANDLE t = CreateThread(NULL, 0, conn_thread, ctx, 0, NULL);
