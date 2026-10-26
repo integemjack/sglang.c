@@ -34,6 +34,11 @@ int sgl_cuda_ctx(const sgl_cuda_model *m);
 int sgl_cuda_decode_batch(sgl_cuda_model *m, const int *tokens, const int *base_pos,
                           const int *lens, int B, float *logits_out);
 
+/* GEMM micro-benchmark (t1): times cublasSgemm vs fp16 cublasGemmEx on real
+ * model shapes (qwen05 / tinyllama), M in {1,8,64}; prints ms and ratio.
+ * ASCII output; harmless to call any time. */
+void sgl_cuda_gemm_bench(void);
+
 /* 自由显存（MB，调试/规划用）*/
 long sgl_cuda_free_mem_mb(void);
 

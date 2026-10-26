@@ -69,6 +69,7 @@ int main(int argc, char **argv) {
   if (np <= 0) return 2;
 
   float *lg = (float *)malloc(sizeof(float) * (size_t)cpu->vocab);
+  int dbg_gap = getenv("SGL_DEBUG_GAP") != NULL; /* t1: print top1/top2 gap per step */
   sgl_sampling_params sp;
   memset(&sp, 0, sizeof(sp));
   sp.temperature = temp;
@@ -83,6 +84,15 @@ int main(int argc, char **argv) {
   int eos = sgl_tokenizer_eos_id(tok);
   int full_recomp = getenv("SGL_FULL_RECOMP") != NULL;
   for (int s = 0; s < max_new; s++) {
+    if (dbg_gap) {
+      int t1 = 0, t2 = -1;
+      for (int i = 1; i < (int)cpu->vocab; i++) {
+        if (lg[i] > lg[t1]) { t2 = t1; t1 = i; }
+        else if (t2 < 0 || lg[i] > lg[t2]) { t2 = i; }
+      }
+      printf("[gap] step %d: top1=%d gap=%.4g\n", s, t1,
+             t2 >= 0 ? lg[t1] - lg[t2] : 0.0f);
+    }
     int t = sp.temperature > 0 ? sgl_sample(lg, cpu->vocab, &sp, &rng)
                                : sgl_sample_greedy(lg, cpu->vocab);
     if (t == eos) break;

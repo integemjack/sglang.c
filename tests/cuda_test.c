@@ -34,8 +34,33 @@ static double now_sec(void) {
   return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/* t1: fp16 mode = SGL_CUDA_FP16=1. The numpy/CPU references are computed in
+ * fp32, so in fp16 mode the assertion standard is "same tokens, or a flip
+ * whose top1/top2 logit gap is < 1e-2 (explainable fp16 rounding)" instead
+ * of exact fp32 equality. */
+static int FP16 = 0;
+#define LOGITS_MAXERR_LIMIT (FP16 ? 0.15 : 2e-3)
+#define GAP_EXPLAIN 1e-2f
+
+/* top1 index + its gap to top2 (fp16 flips are judged by this gap) */
+static int top1_gap(const float *l, int V, float *gap) {
+  int t1 = 0, t2 = -1;
+  for (int i = 1; i < V; i++) {
+    if (l[i] > l[t1]) { t2 = t1; t1 = i; }
+    else if (t2 < 0 || l[i] > l[t2]) { t2 = i; }
+  }
+  *gap = (t2 >= 0) ? (l[t1] - l[t2]) : 0.0f;
+  return t1;
+}
+
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
+  {
+    const char *fe = getenv("SGL_CUDA_FP16");
+    FP16 = (fe && atoi(fe)) ? 1 : 0;
+  }
+  printf("[mode] SGL_CUDA_FP16=%d -> %s weights\n", FP16, FP16 ? "fp16" : "fp32");
   const char *dir = argc > 1 ? argv[1] : getenv("SGL_TEST_QWEN");
   if (!dir || !*dir) dir = "models/qwen05";
   FILE *f = NULL;
@@ -78,7 +103,13 @@ int main(int argc, char **argv) {
     if (e > maxerr) maxerr = e;
   }
   printf("prefill logits maxerr = %g（CPU vs GPU）\n", maxerr);
-  CHECK(maxerr < 2e-3, "logits 差异过大 %g", maxerr);
+  {
+    float gp;
+    int t1 = top1_gap(lg, V, &gp);
+    printf("[gap] GPU top1=%d top1/top2 gap=%.4g (limit %g)\n", t1, gp,
+           (double)LOGITS_MAXERR_LIMIT);
+  }
+  CHECK(maxerr < LOGITS_MAXERR_LIMIT, "logits 差异过大 %g", maxerr);
 
   int gc = sgl_sample_greedy(lc, V), gg = sgl_sample_greedy(lg, V);
   CHECK(gc == gg, "greedy 首步不同 cpu=%d gpu=%d", gc, gg);
@@ -92,9 +123,16 @@ int main(int argc, char **argv) {
     CHECK(sgl_llama_forward(cpu, &gc, 1, len, pg, lc) == 0, "cpu step");
     gc = sgl_sample_greedy(lc, V);
     if (gg != gc) {
-      printf("step %d 分歧 gpu=%d cpu=%d（cpu lg: gpu_tok=%.5f cpu_tok=%.5f）\n",
-             s, gg, gc, lc[gg], lc[gc]);
-      ok = 0; break;
+      float gp;
+      int t1 = top1_gap(lg, V, &gp);
+      if (FP16 && gp < GAP_EXPLAIN) {
+        printf("[fp16] step %d flip gpu=%d cpu=%d gpu_top1=%d gap=%.4g < %g -> explainable\n",
+               s, gg, gc, t1, gp, (double)GAP_EXPLAIN);
+      } else {
+        printf("step %d 分歧 gpu=%d cpu=%d（cpu lg: gpu_tok=%.5f cpu_tok=%.5f）\n",
+               s, gg, gc, lc[gg], lc[gc]);
+        ok = 0; break;
+      }
     }
     len++;
   }
@@ -127,15 +165,28 @@ int main(int argc, char **argv) {
         /* GPU 纯序列（无交错）*/
         int len2 = np;
         CHECK(sgl_cuda_forward(gpu, ids, np, 0, lg) == 0, "re-prefill");
-        int gmatch = 1;
+        int gmatch = 1, gflip = 0;
         for (int s2 = 0; s2 < 6; s2++) {
           int t2 = sgl_sample_greedy(lg, V);
           int want = (int)g6->items[s2]->num;
-          if (t2 != want) { printf("[GPU 纯] step %d gpu=%d numpy=%d\n", s2, t2, want); gmatch = 0; break; }
+          if (t2 != want) {
+            float gp;
+            int tt1 = top1_gap(lg, V, &gp);
+            if (FP16 && gp < GAP_EXPLAIN) {
+              printf("[fp16] vs numpy step %d flip gpu=%d numpy=%d gap=%.4g -> explainable\n",
+                     s2, t2, want, gp);
+              gflip = 1;
+            } else {
+              printf("[GPU 纯] step %d gpu=%d numpy=%d\n", s2, t2, want);
+              gmatch = 0;
+            }
+            break;
+          }
           if (s2 < 5) CHECK(sgl_cuda_forward(gpu, &t2, 1, len2, lg) == 0, "re-step");
           len2++;
         }
-        printf("[GPU 纯] vs numpy: %s\n", gmatch ? "一致 ✓" : "不一致 ✗");
+        printf("[GPU 纯] vs numpy: %s\n",
+               gmatch ? "一致 ✓" : (FP16 && gflip) ? "fp16 可解释翻转（间隙<1e-2）" : "不一致 ✗");
         /* CPU（MSVC 构建）纯序列 */
         int len3 = np;
         CHECK(sgl_llama_forward(cpu, ids, np, 0, pg, lc) == 0, "cpu re-prefill");
@@ -148,7 +199,7 @@ int main(int argc, char **argv) {
           len3++;
         }
         printf("[CPU 纯] vs numpy: %s\n", cmatch ? "一致 ✓" : "不一致 ✗");
-        CHECK(gmatch, "GPU 与 numpy 不一致");
+        CHECK(gmatch || gflip, "GPU 与 numpy 不一致");
         CHECK(cmatch, "CPU(MSVC) 与 numpy 不一致");
       }
       sgl_json_free(ref);
@@ -159,9 +210,70 @@ int main(int argc, char **argv) {
   int *whole = (int *)sgl_xmalloc(sizeof(int) * (size_t)(np + nsteps));
   memcpy(whole, ids, sizeof(int) * np);
   /* 重新走一遍 GPU 生成拿 token（上面对照循环已保证一致，这里复用 gc 路径）*/
-  printf("greedy %d 步全一致 ✓\n", nsteps);
+  printf("greedy %d 步%s ✓\n", nsteps, FP16 ? "全一致或翻转可解释" : "全一致");
   printf("GPU decode: %.1f tok/s（含 CPU 对照串行，GPU 纯速约为 2x 此值）\n",
          nsteps / dt);
+
+  /* ---- t1 fp16 cross-check: fp16 GPU vs fp32 GPU, same prompt, greedy 24
+   * steps. Runs when the suite itself is fp32 (uploads a second fp16 model);
+   * when SGL_CUDA_FP16=1 the whole suite above already IS the fp16 case
+   * (compared against the fp32 CPU reference with gap-aware assertions). */
+  if (!FP16) {
+    printf("[fp16] uploading second (fp16) model for cross-check...\n");
+    _putenv("SGL_CUDA_FP16=1");
+    sgl_cuda_model *gpu16 = sgl_cuda_from_llama(cpu);
+    _putenv("SGL_CUDA_FP16=0");
+    CHECK(gpu16, "fp16 upload");
+    if (gpu16) {
+      float *l16 = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+      CHECK(sgl_cuda_forward(gpu, ids, np, 0, lg) == 0, "fp32 prefill refresh");
+      CHECK(sgl_cuda_forward(gpu16, ids, np, 0, l16) == 0, "fp16 prefill");
+      double me16 = 0;
+      for (int i = 0; i < V; i++) {
+        double e = fabs((double)lg[i] - l16[i]);
+        if (e > me16) me16 = e;
+      }
+      float gp16, gp32;
+      int t16 = top1_gap(l16, V, &gp16), t32 = top1_gap(lg, V, &gp32);
+      printf("[fp16] prefill maxerr fp32-vs-fp16 GPU = %g; fp16 top1=%d gap=%.4g; fp32 top1=%d gap=%.4g\n",
+             me16, t16, gp16, t32, gp32);
+      CHECK(gp16 < 100.0f && gp32 < 100.0f, "prefill top1 implausible");
+      int s16 = sgl_sample_greedy(l16, V), s32 = sgl_sample_greedy(lg, V);
+      int lenf = np, nflip = 0, bad = (s16 != s32 && gp16 >= GAP_EXPLAIN);
+      if (s16 != s32) nflip++;
+      for (int s = 0; s < 24 && !bad; s++) {
+        CHECK(sgl_cuda_forward(gpu, &s32, 1, lenf, lg) == 0, "fp32 xstep");
+        CHECK(sgl_cuda_forward(gpu16, &s16, 1, lenf, l16) == 0, "fp16 xstep");
+        lenf++;
+        s32 = sgl_sample_greedy(lg, V);
+        s16 = sgl_sample_greedy(l16, V);
+        float gp;
+        int t1 = top1_gap(l16, V, &gp);
+        if (s < 4 || s16 != s32)
+          printf("[fp16] step %d: fp16 tok=%d fp32 tok=%d (fp16 top1=%d top2gap=%.4g)\n",
+                 s, s16, s32, t1, gp);
+        if (s16 != s32) {
+          if (gp < GAP_EXPLAIN) {
+            nflip++;
+            printf("[fp16] step %d flip explainable (gap %.4g < %g)\n", s, gp,
+                   (double)GAP_EXPLAIN);
+          } else {
+            bad = 1;
+            printf("[fp16] step %d UNEXPLAINED flip fp16=%d fp32=%d gap=%.4g\n",
+                   s, s16, s32, gp);
+          }
+        }
+      }
+      printf("[fp16] greedy 24 steps: %d flips, all %s\n", nflip,
+             bad ? "UNEXPLAINED DIVERGENCE" : "explained/identical");
+      CHECK(!bad, "fp16 greedy unexplained divergence");
+      sgl_xfree(l16);
+      sgl_cuda_free(gpu16);
+    }
+  }
+  /* GEMM bench (sgemm vs hgemm on real shapes; also hand M=1 kernels) */
+  sgl_cuda_gemm_bench();
+
 
   sgl_tokenizer_free(tok);
   /* pure GPU throughput: 32 decode steps, no CPU interleaved (before frees) */
@@ -208,7 +320,7 @@ int main(int argc, char **argv) {
       got[b][0] = toks[b];
     }
     float *lgb = (float *)malloc(sizeof(float) * (size_t)NB * V);
-    int okb = 1;
+    int okb = 1, bflip = 0;
     double tbb = now_sec();
     int nsteps = NB;
     for (int s = 1; s < 24; s++) {
@@ -224,14 +336,27 @@ int main(int argc, char **argv) {
     for (int b = 0; b < NB && okb; b++)
       for (int s = 0; s < 24; s++)
         if (got[b][s] != ref[b][s]) {
+          if (FP16) {
+            /* fp16: batched row (GemmEx) vs single-stream row (hand GEMV)
+             * differ in rounding; a flip with tiny top1/top2 gap is fine */
+            float gp;
+            top1_gap(lgb + (size_t)b * V, V, &gp);
+            if (gp < GAP_EXPLAIN) {
+              printf("[fp16][batch] seq %d step %d: got %d want %d gap=%.4g -> explainable\n",
+                     b, s, got[b][s], ref[b][s], gp);
+              bflip = 1;
+              break;
+            }
+          }
           printf("[batch] seq %d step %d: got %d want %d\n", b, s, got[b][s], ref[b][s]);
           okb = 0;
           break;
         }
     printf("[batch] %s (%d tok / %.2fs = %.1f tok/s aggregate)\n",
-           okb ? "batched == single-stream (24 steps x4 seq) OK" : "MISMATCH",
+           okb ? "batched == single-stream (24 steps x4 seq) OK"
+               : (FP16 && bflip) ? "fp16 可解释翻转（间隙<1e-2）" : "MISMATCH",
            nsteps, dtb, nsteps / dtb);
-    CHECK(okb, "batched decode mismatch");
+    CHECK(okb || bflip, "batched decode mismatch");
     free(lgb);
   }
 
@@ -290,7 +415,10 @@ int main(int argc, char **argv) {
       }
       printf("[long] two-pass vs shared-scores (2000 tok): maxerr = %g (NaN a=%d b=%d, lb[0..3]=%.4g %.4g %.4g %.4g)\n",
              me2, nan_a, nan_b, lb[0], lb[1], lb[2], lb[3]);
-      CHECK(me2 < 5e-3, "two-pass kernel mismatch %g", me2);
+      /* fp16 mode: fp32-level kernel differences get amplified by the fp16
+       * activation rounding of the GEMMs in the layers above; greedy top1
+       * still matches (checked next). */
+      CHECK(me2 < (FP16 ? 0.05 : 5e-3), "two-pass kernel mismatch %g", me2);
       CHECK(sgl_sample_greedy(la, V) == sgl_sample_greedy(lb, V),
             "two-pass kernel greedy mismatch");
       _putenv("SGL_FORCE_LONG_ATTN=0");
@@ -310,13 +438,25 @@ int main(int argc, char **argv) {
       /* batched: same 4300-token prompt into two segments, 8 graph steps */
       int bl[2] = {0, 8192}, bll[2], bt2[2];
       int got2[8][2];
+      int ok2 = 1, lflip = 0;
       CHECK(sgl_cuda_forward_seg(gpu, idl, npl, 0, 0, lb) == 0, "4300 b0 prefill");
       bt2[0] = sgl_sample_greedy(lb, V);
       CHECK(sgl_cuda_forward_seg(gpu, idl, npl, 0, 8192, lb) == 0, "4300 b1 prefill");
       bt2[1] = sgl_sample_greedy(lb, V);
       bll[0] = bll[1] = npl;
-      int ok2 = (bt2[0] == tref[0] && bt2[1] == tref[0]);
-      if (!ok2) printf("[long] first token mismatch b0=%d b1=%d want %d\n", bt2[0], bt2[1], tref[0]);
+      ok2 = (bt2[0] == tref[0] && bt2[1] == tref[0]);
+      if (!ok2) {
+        if (FP16) {
+          float gp;
+          top1_gap(lb, V, &gp);
+          if (gp < GAP_EXPLAIN) {
+            printf("[fp16][long] first token flip b0=%d b1=%d want %d gap=%.4g -> explainable\n",
+                   bt2[0], bt2[1], tref[0], gp);
+            lflip = 1;
+          }
+        }
+        if (!lflip) printf("[long] first token mismatch b0=%d b1=%d want %d\n", bt2[0], bt2[1], tref[0]);
+      }
       float *lgb2 = (float *)sgl_xmalloc(sizeof(float) * 2 * (size_t)V);
       double t3 = now_sec();
       int st2 = 0;
@@ -326,6 +466,17 @@ int main(int argc, char **argv) {
           bt2[b] = sgl_sample_greedy(lgb2 + (size_t)b * V, V);
           got2[s][b] = bt2[b];
           if (bt2[b] != tref[s]) {
+            if (FP16) {
+              float gp;
+              top1_gap(lgb2 + (size_t)b * V, V, &gp);
+              if (gp < GAP_EXPLAIN) {
+                printf("[fp16][long] batch seq %d step %d: got %d want %d gap=%.4g -> explainable\n",
+                       b, s, bt2[b], tref[s], gp);
+                lflip = 1;
+                ok2 = 0;
+                break;
+              }
+            }
             printf("[long] batch seq %d step %d: got %d want %d\n", b, s, bt2[b], tref[s]);
             ok2 = 0;
           }
@@ -335,8 +486,9 @@ int main(int argc, char **argv) {
       }
       double dt3 = now_sec() - t3;
       printf("[long] 4300-token batched == single-stream %s (%d tok / %.2fs = %.1f tok/s)\n",
-             ok2 ? "OK" : "MISMATCH", st2, dt3, st2 / dt3);
-      CHECK(ok2, "long batch mismatch");
+             ok2 ? "OK" : (FP16 && lflip) ? "fp16 可解释翻转（间隙<1e-2）" : "MISMATCH",
+             st2, dt3, st2 / dt3);
+      CHECK(ok2 || lflip, "long batch mismatch");
       sgl_xfree(ids2); sgl_xfree(idl); sgl_xfree(la); sgl_xfree(lb); sgl_xfree(lgb2);
     } else {
       printf("[long] SKIP: gpu ctx %d too small (set SGL_CUDA_CTX)\n", gctx);
