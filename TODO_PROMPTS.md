@@ -4,6 +4,26 @@
 > 按价值排序；任务间无强依赖，可任意顺序（标注除外）。
 > v0.2（2026-10-27）：原 t1–t13 已全部完成并验收，见文末索引；本文件现列出
 > 验收时发现但未修的性能/健壮性/广度缺口。
+> v0.3（2026-10-27）：G1–G6、G8、G9 已完成并验收（数据见 docs/NOTES_gaps.md、
+> NOTES_g8.md、NOTES_g9.md，CHANGELOG 有总结）；G7、G10 进行中。
+
+## 状态速查（v0.3）
+
+| 任务 | 状态 | 实测结果 |
+|---|---|---|
+| G1 prefill 提速 | ✅ 完成 | 8K prefill 72.4→8.8s（**8.3x**，同进程 A/B）；`[long]` 阈值未动 |
+| G2 W8 大 M IMMA | ✅ 完成 | [2048,2048] M=8 0.925→0.069ms（**13.4x**）；imma vs dp4a **maxerr=0** |
+| G3 decode graph 稳定 | ✅ 完成 | 预热+捕获、按 B 失败隔离、prewarm 8/8；B=1/4/8 2.4/4.1/3.4x；conc 5×12 全过 |
+| G4 无 body 间歇卡 | ✅ 完成 | 根因=srv->lock 争用饿死 acceptor；拆 conns_lock；600/600 无超时 |
+| G5 显存预检 + soak | ✅ 完成 | 不够时降级服务（/health degraded、/generate 503）；soak 20min 无泄漏 |
+| G6 GPU 前缀缓存 | ✅ 完成 | `[prefix]` 1.43e-05 + greedy 6/6 全同；端到端 0.76→0.34s（2.2x）输出逐字一致 |
+| G7 GPU 投机解码 | ⏳ 进行中 | — |
+| G8 真实 LLaVA + 图片解码 | ✅ 完成 | 真实 CLIP 分层 vs torch **≤1.24e-05**；stb_image PNG/JPEG 进 HTTP image_url，端到端 200 随图变 |
+| G9 模型族补完 | ✅ 完成 | Gemma rope_scaling/softcap/layer_types；Qwen3-Next Gated DeltaNet vs float64 numpy **≤8e-08**；ctest 20→23 |
+| G10 AVX2 重试（条件） | ⏳ 复验中 | winget 无 GCC≥16.3（待复核）；旧 25 轮 SEGFAULT 已证为并发内存压力（修后干净环境 ctest 23/23） |
+
+补测遗留（下次干净机器上跑）：`long_vcpu models/qwen05 8192` 的 8K GPU-vs-CPU 绝对对照、
+`soak_curve.ps1` 无干扰版（斜率判定）。
 
 ---
 

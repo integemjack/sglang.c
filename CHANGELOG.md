@@ -2,6 +2,68 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — 2026-10-27 「缺口关闭 G1–G9」
+
+本批处理 TODO_PROMPTS.md v0.2 列出的缺口。测量口径与全部数字见
+[docs/NOTES_gaps.md](docs/NOTES_gaps.md)（重要：本机空闲显存常小于模型常驻量，
+WDDM 溢出会把绝对时间放大 3–20x，所以性能结论一律用**同进程 A/B**）。
+
+### 性能
+- **G1 flash prefill**：新增单遍分块注意力核 `k_attn_flash`（Q 块驻 shared、K/V 流式、
+  online softmax），长上下文路径优先走它，`SGL_ATTN_TWOPASS=1` 可回退 A/B。
+  8192-token prefill **72.4s → 8.7s（8.3x）**，2048 为 1.7x、512 为 1.5x；
+  `[long]` 各阈值不动（two-pass vs shared 2.19e-05）。
+- **G2 W8 大 M 走 tensor core**：`k_quant_rows` + `cublasGemmEx` int8 IMMA +
+  `k_w8_dequant`（M>1 用 IMMA，M=1 保留 dp4a：实测 0.062 vs 0.068ms）。实测
+  [2048,2048] M=8：**0.925ms → 0.069ms（13.4x）**；整数点积与顺序无关，
+  IMMA vs dp4a prefill **maxerr = 0**，10/10 greedy 与 fp32 全同（`cuda_test [w8]`）。
+- **G3 decode graph 稳定并默认开启**：捕获前先跑一次 plain step 预热（lazy 内核加载与
+  cuBLAS 选算法不能发生在 capture 里），失败只标记**这一个 B**（旧版一个进程级开关
+  让所有 batch 永久走 plain）；新增 `sgl_cuda_prewarm()` 起服务前把 ws/镜像撑到位并
+  预捕获 B=1..conc（实测 8/8，首请求从 ~20s 降到与后续同量级）。fp16 decode A/B：
+  B=1 23.0→9.7ms、B=4 36.6→8.9ms、B=8 38.5→11.3ms（3–4x）。
+- **G6 GPU 前缀缓存**：`sgl_cuda_copy_kv()` + cuda_http 段租让表（最长公共前缀按 token
+  精确比对、LRU、段复用时释放租让）。`[prefix]` 复用 vs 重算 maxerr 1.43e-05、
+  greedy 6/6 全同、prefill 50.4 vs 127.1ms；端到端 756-token 共享 system prompt
+  0.76s → **0.34s（2.2x）**且输出逐字一致。
+
+### 健壮性
+- **G4 HTTP 无 body 请求间歇卡死修复**：根因不是 CUDA，是 `srv->lock` 一把锁同时被
+  worker（每步计算持锁）和 acceptor（登记连接）争用，高负载下 acceptor 饿死——
+  连接被内核握手却长时间不建线程。`active_conns` 拆出独立 `conns_lock`。复验：
+  12 并发 x256 token 负载下 600/600 次 GET /health 无超时（修前同形状 20/300 = 6.7%
+  在 10s 内无首字节）。
+- **G5 显存预检 + 降级服务**：`sgl_cuda_estimate_vram_mb()` / `sgl_cuda_avail_vram_mb()`，
+  上传前算账；不够时不再 `return 2` 死进程，而是照常起服务：`/health` 报
+  `degraded` + 原因，`/generate` 直接 503 + 可执行建议（降 ctx 或开 fp16/W8）。
+
+### 广度
+- **G8 真实多模态**：`openai/clip-vit-base-patch32` 真实权重（pytorch_model.bin →
+  safetensors，抽查 4 张量 maxdiff 0.0），C 视觉塔按真实 CLIP 语义修正
+  （quick_gelu、post-LN 只作用 pooled、输出 last_hidden_state），**分层 vs torch fp32
+  maxerr ≤ 1.24e-05**；新增 stb_image PNG/JPEG 解码接进 CPU HTTP 的
+  `image_url` base64 路径（PNG 解码与 PIL 0 像素级差异，端到端 200 且输出随图变）。
+- **G9 模型族补完**：Gemma `rope_scaling`（线性/dynamic NTK）+ `hidden_softcap`
+  embedding tanh 软上限 + 每层 `layer_types` 滑窗；Qwen3-Next `layer_types` 混合层，
+  linear_attention 按 HF 真实公式（Gated DeltaNet + 因果 depthwise conv1d + gated
+  RMSNorm）实现，对照独立 float64 numpy 参考 **maxerr ≤ 8e-08**。
+  ctest 从 20 套增至 23 套。
+
+### 工具
+`tests/cuda_perf.c`（同进程 A/B 基准）、`tests/conc_test.ps1`、`tests/prefix_e2e.ps1`、
+`tests/soak_curve.ps1`（RSS/VRAM 斜率）、`tests/g4_probe.py`、`tests/bom_fix.ps1`
+（批量补 UTF-8 BOM）、`tests/build_all2.ps1`。
+
+### 已知限制（本批未解决）
+- 前缀缓存是**段级**租让（一条序列一个槽），不是 CPU 侧那种 radix 树；跳段部分共享、
+  显存压力下的主动回收、带 visual token 的请求未覆盖。
+- 真实 Qwen3-Next 的 full_attention 层还有 q 门控 / partial rotary / (1+w) norm / MoE
+  未实现（加载真实权重会报缺张量，不会静默算错）；linear 状态按序列首 KV 页归属，
+  radix 前缀共享场景会互踩（见 docs/NOTES_g9.md §4）。
+- 真实 llava-1.5 的 projector 是两层 MLP + CLIP-336/1024→4096，本仓库仍是单层 linear；
+  `<image>` 只作占位，视觉 token 接在 prompt 末尾。
+- WinLibs GCC 16.2 的 AVX2 自动向量化仍不稳（G10：winget 暂无 16.3）。
+
 ## [Unreleased] — 2026-10-27 「t 系列收尾」
 
 本批完成 TODO_PROMPTS.md 的 13 项任务（t0–t13），全程 numpy 独立参考对照。
