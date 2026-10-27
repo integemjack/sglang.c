@@ -15,8 +15,9 @@
   查模型在不在**不要**只看 `sglang-c/models`。
 - `models/mm-test` = `mistral-rand` 的 LM + `llava-rand` 的 clip_config/clip_model/projector
   + `test.png`/`test.jpg`（G11 验收用；在 `../models/mm-test`）。
-- CPU HTTP 版 `--serve` 只有 MinGW 构建（`build/bin/sglc.exe`）；
-  `build-cuda/bin/Release/sglc.exe` 会报「--serve not available in MSVC builds」。
+- CPU HTTP 与 GPU HTTP 现在是**同一个 `sglc --serve`**（`--device auto` → cuda → mlx → cpu）：
+  MSVC 版 http.c 走 `include/sgl/thread_compat.h`（pthread → Win32 垫片）后才能编，
+  之前 MSVC 构建直接剔除 http.c、`sglc --serve` 报 "use cuda_http.exe"。
 - 本机 GPU：6GB，`cuda_http` 常驻 ~445MB（预检 `ctx=512 rows=64`）；WDDM 会溢出，
   性能结论必须同进程 A/B。
 

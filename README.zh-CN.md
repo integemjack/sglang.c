@@ -20,7 +20,7 @@ bash sglang-c/quickstart.sh
 | --- | --- |
 | `quickstart.bat` / `quickstart.sh` | 缺则编译 → 端口 30000 起服务 → 发 demo 请求 |
 | `... cli [model] [n]` | 单次命令行生成 |
-| `... gpu [model] [port]` | 起 CUDA 服务（`cuda_http`） |
+| `... gpu [model] [port]` | 起服务（同一个 `sglc --serve`，有显卡走 GPU） |
 | `... test` / `... build` / `... help` | 跑 ctest / 全量 CPU+CUDA 编译 / 用法 |
 
 环境变量：`SGL_MODEL`（模型目录）、`SGL_PORT`（端口）、`SGL_NO_BUILD=1`（只跑不编）、`SGL_NO_PAUSE=1`（Windows 结束不按任意键）。
@@ -43,8 +43,8 @@ bash sglang-c/quickstart.sh
 | `linux-x64-cuda / linux-arm64-cuda` | `sglc` + `cuda_cli` + `cuda_http`（附 `libcublas*.so`）；运行时需 NVIDIA 显卡与驱动 |
 | `macos-arm64` | `sglc`（CPU，**单线程**：AppleClang 无 `-fopenmp`，CI 不装 libomp） |
 | `macos-arm64-mlx` | 同上，另附 `tools/ref_llava_mlx.py`：数值参考改用 `mlx.core`（Metal GPU）重算，`test_llava` 变成「C 实现 vs MLX」 |
-| `windows-x64` | `sglc.exe`（CPU，MSVC /MT 静态，单线程） |
-| `windows-x64-cuda` | `sglc.exe` + `cuda_cli.exe` + `cuda_http.exe`（RTX 显卡加速，sm_75+；需驱动，附带 cublas DLL） |
+| `windows-x64` | `sglc.exe`（CPU + HTTP 服务，MSVC /MT 静态，单线程；`--serve` 可用） |
+| `windows-x64-cuda` | `sglc.exe`（CPU+GPU 双引擎 + HTTP 服务，`--device auto`）+ `cuda_cli.exe` + `cuda_http.exe`（RTX 显卡加速，sm_75+；需驱动，附带 cublas DLL） |
 | `windows-arm64-cuda` | **preview**：Windows on Arm 版，用 CUDA 13.4.0 Developer Preview 工具链构建（同时含 sm_75/sm_120 cubin，面向 RTX Spark 这类 Blackwell 级 WoA 机器，驱动 616.41+） |
 
 构建矩阵（`.github/workflows/build.yml`）：`linux-x64`、`linux-arm64`、`linux-x64-cuda`、`linux-arm64-cuda`、
@@ -95,8 +95,10 @@ ctest --test-dir sglang-c/build          # 26 套测试（部分需 models/ 下�
 sglang-c/build/bin/sglc --model models/gpt2 --prompt "The meaning of life is" --max-new 32
 sglang-c/build/bin/sglc --model models/tinyllama --w8 --kv8 --max-new 64   # 量化提速
 
-# HTTP 服务（OpenAI 兼容）
+# HTTP 服务（OpenAI 兼容）；--device auto 默认 cuda → mlx（无实现）→ cpu
 sglang-c/build/bin/sglc --model models/qwen05 --serve --port 30000 --w8
+sglang-c/build-cuda/bin/Release/sglc.exe --model models/qwen05 --serve --port 30000   # 有显卡走 GPU
+sglang-c/build-cuda/bin/Release/sglc.exe --model models/qwen05 --serve --device cpu   # 强制 CPU 引擎
 curl localhost:30000/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
@@ -130,13 +132,19 @@ Qwen2.5-0.5B：单流 **45.7 tok/s**（10.9x CPU）；**批处理（4 序列）1
 prefill maxerr 3.5e-5（vs CPU），greedy 三方一致；批处理输出与各自单流全等；KV 段隔离。
 独立 CLI：`cuda_cli.exe models/qwen05 "prompt" 40 0`（自适应后单流回到 45 tok/s；
 prompt 支持 `@file` 读长文本）。
-GPU HTTP 服务：`cuda_http.exe <model_dir> [port]` —— /health /generate
-/v1/completions /v1/chat/completions（ChatML）；KV 段调度（ctx/N 段）+ 批处理
+GPU HTTP 服务：
+**就是同一个 `sglc.exe`** —— `sglc --serve --port 30000`（`--device auto` 默认：cuda → mlx → cpu）。
+`-DSGL_CUDA=ON` 的构建把 GPU 引擎（原 `apps/cuda_http.c`，现在只留 `sgl_cuda_http_serve()`）
+一起链进 `sglc.exe`，因此 Windows/MSVC 版本也直接带 `--serve`（CPU 版 http.c 走
+`include/sgl/thread_compat.h` 的 Win32 线程垫片，不再依赖 MinGW 的 winpthreads）。
+端点：/health /generate /v1/completions /v1/chat/completions（ChatML）；KV 段调度（ctx/N 段）+ 批处理
 worker；已验证：单请求正确（Paris 事实性回答）+ **两轮 8 并发全部成功且服务存活**
 （根因：req_free 用 free() 释放 sgl_xmalloc 的 text_out——对齐分配/free 不匹配）。
 `SGL_HTTP_CONC` 覆盖并发数（1-8，默认 8；段长 = ctx/并发）。
+旧习惯仍可用：`cuda_http.exe <model_dir> [port]` 仍然编、仍然能跑（CI smoke 也还测它），
+只是不必再带两个 exe 了。
 构建：`cmake -S sglang-c -B sglang-c/build-cuda -G "Visual Studio 17 2022" -A x64 -DSGL_CUDA=ON`
-`cmake --build sglang-c/build-cuda --config Release --target cuda_test cuda_cli cuda_http`
+`cmake --build sglang-c/build-cuda --config Release --target sglc`
 
 ## M26：长上下文 + CUDA Graph（2026-02）
 

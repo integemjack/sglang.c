@@ -18,6 +18,12 @@
 #include "sgl/safetensors.h"
 #include "sgl/scheduler.h"
 
+#ifdef SGL_EMBED_CUDA_HTTP
+#include "sgl/cuda.h" /* sgl_cuda_avail_vram_mb：自动选择后端时的显卡探针 */
+/* cuda_http.c 的引擎入口（那里凡 main 部分用 SGL_EMBED_CUDA_HTTP 包住）*/
+int sgl_cuda_http_serve(const char *dir, int port, const char *host);
+#endif
+
 typedef struct {
   FILE *out;
   int first;
@@ -146,12 +152,14 @@ static void usage(const char *prog) {
   fprintf(stderr,
           "usage: %s --model <dir> [--prompt <text>] [--max-new N] \
           [--temperature F] [--top-k N] [--top-p F] [--seed N] [--verbose] \
-          [--serve [--host H] [--port P]] [--w8] [--kv8] \
+          [--serve [--host H] [--port P] [--device auto|cuda|mlx|cpu]] [--w8] [--kv8] \
           [--lora name=dir[,name2=dir2,...]]\n"
           "  <dir> 需含 config.json / tokenizer.json / model.safetensors\n"
-          "  --w8   int8 权重（W8A16，decode ~1.8x）\n"
-          "  --kv8  int8 KV cache（内存减半）\n"
-          "  --serve 启动 HTTP 服务（/health /generate /v1/completions），Ctrl+C 退出\n"
+          "  --w8   int8 权重（W8A16；CPU 走 decode ~1.8x，CUDA 走 SGL_CUDA_W8）\n"
+          "  --kv8  int8 KV cache（CPU 引擎；显存减半）\n"
+          "  --serve 启动 HTTP 服务（/health /generate /v1/completions /v1/chat/completions）\n"
+          "  --device 服务后端：auto（默认，cuda → mlx → cpu）/ cuda / cpu / mlx\n"
+          "           MLX 目前无后端（只有 macOS 的数值参考脚本），指定它会报错后回落 cpu\n"
           "  --lora 多 LoRA 实例池：每个 adapter 预先合并为独立模型副本（独立 KV 池），\n"
           "         请求 JSON 顶层带 \"lora\":\"name\" 路由；不带该字段走 base 实例\n"
           "  例: %s --model gpt2 --prompt \"The meaning of life is\" --max-new 32\n"
@@ -177,6 +185,7 @@ static int sched_add_loras(sgl_scheduler *sc, const char *model_dir,
 int main(int argc, char **argv) {
   const char *model_dir = NULL, *prompt = "The meaning of life is";
   const char *host = "127.0.0.1";
+  const char *device = "auto"; /* --device：auto / cuda / mlx / cpu */
   const char *vision_dir = NULL, *proj_path = NULL; /* G8 */
   int max_new = 32, port = 30000, serve = 0, w8 = 0, kv8 = 0;
   sgl_sampling_params sp = {0.8f, 50, 0.95f, 0};
@@ -197,6 +206,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--serve")) serve = 1;
     else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
     else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
     else if (!strcmp(argv[i], "--w8")) w8 = 1;
     else if (!strcmp(argv[i], "--kv8")) kv8 = 1;
     else if (!strcmp(argv[i], "--lora") && i + 1 < argc) {
@@ -217,6 +227,11 @@ int main(int argc, char **argv) {
     else { usage(argv[0]); return 1; }
   }
   if (!model_dir) { usage(argv[0]); return 1; }
+  if (strcmp(device, "auto") && strcmp(device, "cuda") && strcmp(device, "cpu") &&
+      strcmp(device, "mlx")) {
+    fprintf(stderr, "unknown --device '%s' (auto|cuda|mlx|cpu)\n", device);
+    return 1;
+  }
 
   /* 量化开关（llama 后端）：须在模型加载前生效 */
 #ifdef _WIN32
@@ -224,19 +239,61 @@ int main(int argc, char **argv) {
 #else
 #define SGLC_SETENV(k, v) setenv(k, v, 1)
 #endif
-  if (w8) SGLC_SETENV("SGL_W8", "1");
-  if (kv8) SGLC_SETENV("SGL_KV8", "1");
   /* --lora 时 base 实例必须加载干净权重（合并由 add_lora 按 adapter 逐份做）*/
   if (n_loras > 0) SGLC_SETENV("SGL_LORA", "");
+  /* 量化开关：serve 分支内部按选中的引擎再设（CUDA 用 SGL_CUDA_W8，不能开 SGL_W8，
+   * 否则 CPU 侧权重已被 int8 化，GPU 上传拿到的不是 fp32 源）*/
+  if (w8 && !serve) SGLC_SETENV("SGL_W8", "1");
+  if (kv8 && !serve) SGLC_SETENV("SGL_KV8", "1");
 
   double t0 = now_sec();
 
   if (serve) {
-#ifdef _MSC_VER
-    /* MSVC 构建不含 pthread 版 http.c（MinGW 专用）；服务端用 cuda_http.exe */
-    fprintf(stderr, "--serve not available in MSVC builds (use cuda_http.exe)\n");
-    return 1;
+    /* ---- 后端选择（--device）----
+     * auto 的次序：cuda → mlx → cpu。
+     *  - cuda：编了 SGL_CUDA、且运行时能拿到一块可用显卡（avail_vram > 0）才用它；
+     *  - mlx：本仓库没有 MLX 后端（只有 macOS 的 tools/ref_llava_mlx.py 数值参考），
+     *         这一档只打一行日志就跳过；
+     *  - cpu：回落路径，调度器 + http.c。
+     * 两个引擎的端点集一致（/health /generate /v1/completions /v1/chat/completions），
+     * 客户端不需要因为换了后端而改代码。*/
+    int dev_auto = !strcmp(device, "auto");
+    int dev_cuda = dev_auto || !strcmp(device, "cuda");
+    if (!strcmp(device, "mlx"))
+      fprintf(stderr, "[device] mlx：本仓库未提供 MLX 后端（只有 macOS 数值参考脚本），回落 cpu\n");
+    else if (dev_auto)
+      SGL_INFO("device: 选择次序 cuda → mlx（未编入）→ cpu");
+#ifdef SGL_EMBED_CUDA_HTTP
+    if (dev_cuda) {
+      long free_mb = sgl_cuda_avail_vram_mb(); /* 无显卡/无驱动 → 负数 */
+      if (free_mb > 0) {
+        if (n_loras > 0) {
+          /* GPU 引擎（cuda_http）只有单实例；多 LoRA 路由在 CPU 调度器里 */
+          fprintf(stderr, "[device] --lora 多实例路由只有 CPU 引擎支持；改用 cpu 引擎\n");
+          if (!dev_auto) return 1;
+        } else {
+          if (w8) SGLC_SETENV("SGL_CUDA_W8", "1"); /* GPU 侧 int8 权重 */
+          SGL_INFO("device: cuda（空闲显存 %ld MB）—— GPU 引擎起服务，端口 %d", free_mb, port);
+          return sgl_cuda_http_serve(model_dir, port, host);
+        }
+      } else {
+        if (!dev_auto) {
+          fprintf(stderr, "[device] --device cuda：没有可用的 CUDA 设备/驱动（avail_vram=%ld MB）\n",
+                  free_mb);
+          return 2;
+        }
+        SGL_INFO("device: cuda 不可用（avail_vram=%ld MB）→ cpu", free_mb);
+      }
+    }
 #else
+    if (!dev_auto && !strcmp(device, "cuda")) {
+      fprintf(stderr, "[device] --device cuda：这个构建没编 CUDA 后端（cmake -DSGL_CUDA=ON）；只用 cpu\n");
+      return 1;
+    }
+    if (dev_auto) SGL_INFO("device: 本构建未编入 CUDA 后端 → cpu");
+#endif
+    if (w8) SGLC_SETENV("SGL_W8", "1");
+    if (kv8) SGLC_SETENV("SGL_KV8", "1");
     /* 服务模式：调度器 + HTTP（对应 sglang launch_server）*/
     sgl_scheduler *sched = sgl_sched_new(model_dir, 0);
     if (!sched) return 2;
@@ -263,7 +320,6 @@ int main(int argc, char **argv) {
     sgl_http_stop(srv);
     sgl_sched_free(sched);
     return 0;
-#endif
   }
 
   /* 单发路径：走调度器（全后端，含量化/radix）*/

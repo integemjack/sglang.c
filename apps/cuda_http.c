@@ -1080,13 +1080,10 @@ SGL_THREAD_SIG(conn_thread) {
   SGL_THREAD_RETURN;
 }
 
-int main(int argc, char **argv) {
-  if (argc < 2) {
-    fprintf(stderr, "usage: %s <model_dir> [port=30001]\n", argv[0]);
-    return 1;
-  }
-  const char *dir = argv[1];
-  int port = argc > 2 ? atoi(argv[2]) : 30001;
+/* 引擎入口：sglc.exe 内嵌调用（编宏 SGL_EMBED_CUDA_HTTP）与独立 cuda_http.exe 共用。
+ * host 语义同 http.c：NULL / "127.0.0.1" / "localhost" 只听本机；
+ * "0.0.0.0" / "any" / "*" 听全部网卡；其他按 IPv4 字面量解析（失败回退 loopback）。 */
+int sgl_cuda_http_serve(const char *dir, int port, const char *host) {
 
 #ifdef _WIN32
   WSADATA wsa;
@@ -1255,10 +1252,14 @@ int main(int argc, char **argv) {
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons((unsigned short)port);
-#ifdef _WIN32
-  addr.sin_addr.S_un.S_addr = inet_addr("127.0.0.1");
-#else
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  /* host → 监听地址（与 http.c 的 sgl_http_serve 保持一致）*/
+  if (!host || !strcmp(host, "127.0.0.1") || !strcmp(host, "localhost"))
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  else if (!strcmp(host, "0.0.0.0") || !strcmp(host, "any") || !strcmp(host, "*"))
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  else if (inet_pton(AF_INET, host, &addr.sin_addr) != 1)
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#ifndef _WIN32
   /* 重启服务时不被 TIME_WAIT 卡住（Windows 的 SO_REUSEADDR 语义不同，不动它）*/
   setsockopt(lst, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
 #endif
@@ -1267,7 +1268,8 @@ int main(int argc, char **argv) {
     return 2;
   }
   listen(lst, 16);
-  printf("[http] serving on 127.0.0.1:%d (/health /generate /v1/completions /v1/chat/completions)\n", port);
+  printf("[http] serving on %s:%d (/health /generate /v1/completions /v1/chat/completions)\n",
+         host ? host : "127.0.0.1", port);
   fflush(stdout);
   for (;;) {
     SOCKET c = accept(lst, NULL, NULL);
@@ -1305,3 +1307,13 @@ int main(int argc, char **argv) {
 #endif
   return 0;
 }
+
+#ifndef SGL_EMBED_CUDA_HTTP
+int main(int argc, char **argv) {
+  if (argc < 2) {
+    fprintf(stderr, "usage: %s <model_dir> [port=30001]\n", argv[0]);
+    return 1;
+  }
+  return sgl_cuda_http_serve(argv[1], argc > 2 ? atoi(argv[2]) : 30001, argc > 3 ? argv[3] : NULL);
+}
+#endif

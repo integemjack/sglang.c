@@ -119,8 +119,8 @@ publishes them automatically):
 | `linux-x64-cuda` / `linux-arm64-cuda` | `sglc` + `cuda_cli` + `cuda_http` (+ the bundled `libcublas*.so`); needs an NVIDIA GPU and driver at runtime |
 | `macos-arm64` | `sglc` (CPU, **single-threaded**: AppleClang has no `-fopenmp` and CI does not install libomp) |
 | `macos-arm64-mlx` | same binary plus `tools/ref_llava_mlx.py`: the LLaVA numeric reference recomputed with `mlx.core` on the Metal GPU (`test_llava` then compares C against MLX) |
-| `windows-x64` | `sglc.exe` (CPU, MSVC `/MT` static, single-threaded) |
-| `windows-x64-cuda` | `sglc.exe` + `cuda_cli.exe` + `cuda_http.exe` (RTX acceleration, sm_75+; needs a driver, ships the cuBLAS DLLs) |
+| `windows-x64` | `sglc.exe` (CPU + HTTP server, MSVC `/MT` static, single-threaded; `--serve` works) |
+| `windows-x64-cuda` | `sglc.exe` (CPU+GPU engines + HTTP server via `--device auto`) + `cuda_cli.exe` + `cuda_http.exe` (RTX acceleration, sm_75+; needs a driver, ships the cuBLAS DLLs) |
 | `windows-arm64-cuda` | **preview**: Windows on Arm build made with the CUDA 13.4.0 *Developer Preview* toolkit (sm_75 + sm_120 cubins, aimed at Blackwell-class Windows-on-Arm machines such as RTX Spark with driver 616.41+) |
 
 Build matrix (`.github/workflows/build.yml`): `linux-x64`, `linux-arm64`, `linux-x64-cuda`, `linux-arm64-cuda`,
@@ -204,14 +204,22 @@ sglang-c/build/bin/sglc --model models/qwen05 --serve --port 30000 --w8
 | `--kv8` | int8 KV cache (half the memory) |
 | `--serve` | Start the HTTP server (`/health` `/generate` `/v1/completions` `/v1/chat/completions`) |
 | `--host H` / `--port P` | Bind address / port (default port 30000) |
+| `--device auto\|cuda\|mlx\|cpu` | Server backend; `auto` (default) tries cuda → mlx → cpu |
 | `--vision <clip_dir>` / `--projector <file>` | Enable the LLaVA vision path |
 | `--lora name=dir[,name2=dir2,...]` | LoRA instance pool (each adapter pre-merged into its own model copy) |
 | `--verbose` | Debug logging |
 
-Note: MSVC builds of `sglc` have no `--serve`; use `cuda_http.exe` for the GPU HTTP server.
+**One executable.** `sglc --serve` works in every build, MSVC included: `src/http.c` now sits on a
+pthread-compatible Win32 shim (`include/sgl/thread_compat.h`), so the MSVC build no longer drops the
+HTTP server. With `-DSGL_CUDA=ON` the GPU engine (`apps/cuda_http.c`, no longer a separate program) is
+linked into the same `sglc.exe`, and `--device auto` picks **cuda → mlx → cpu**: CUDA is used when the
+build has it and a device with free VRAM is present, otherwise the CPU scheduler serves. There is no
+MLX backend in this repo (only the macOS numerical reference script), so that step is a no-op and says so.
+Both engines expose the same endpoints, so clients do not change.
 
 The CUDA CLI is positional: `cuda_cli.exe <model_dir> "<prompt>" [max_new] [seed]`
-(`@file` reads a long prompt from disk). The CUDA server is `cuda_http.exe <model_dir> [port]`.
+(`@file` reads a long prompt from disk). `cuda_http.exe <model_dir> [port]` still exists and is still
+built, but is no longer needed — `sglc --serve` covers it.
 
 ## HTTP API
 

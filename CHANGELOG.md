@@ -2,6 +2,26 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — 单可执行文件：`sglc` 自带 CPU/GPU 双引擎与 HTTP 服务
+
+- **`sglc --serve` 在所有构建里可用（含 Windows/MSVC）**：`src/http.c` 原来依赖 MinGW 的
+  winpthreads，MSVC 构建直接把 http.c 从库里剔除、`sglc --serve` 报
+  "--serve not available in MSVC builds (use cuda_http.exe)"。新增
+  `include/sgl/thread_compat.h`（mutex/cond/thread → `CRITICAL_SECTION` /
+  `CONDITION_VARIABLE` / `_beginthreadex`），MSVC 也编 http.c。
+- **一个 exe**：`apps/cuda_http.c` 的入口拆成 `sgl_cuda_http_serve(dir, port, host)`
+  （`main` 用 `SGL_EMBED_CUDA_HTTP` 包住，独立 `cuda_http.exe` 照旧编），`-DSGL_CUDA=ON`
+  时随 sglc 一起编、且只链 `sgl_cuda`（该库改为包含 `src/` 全部源，避免同一份源
+  进两个静态库撞符号）。`cuda_http.exe` 不再是必需程序，只是保留的兼容入口。
+- **`--device auto|cuda|mlx|cpu`**（默认 auto = cuda → mlx → cpu）：CUDA 是否可用用
+  `sgl_cuda_avail_vram_mb()` 探针判断，不可用/未编入就回落 CPU 调度器；MLX 本仓库
+  没有实现（只有 macOS 数值参考脚本），`--device mlx` 会明确提示后回落。
+  `--w8` 在 GPU 路径映射到 `SGL_CUDA_W8`（不能同时开 `SGL_W8`，否则上传源已被 int8 化）。
+- 多 LoRA 路由只在 CPU 引擎里：`--lora` + auto 时自动用 CPU，显式 `--device cuda` 报错。
+- 验收：MSVC/CUDA 构建 `sglc --serve`（auto，RTX 2060）→ `/health` 报 `"gpu":true`、
+  `/generate` 正常；`--device cpu` → http.c 引擎 `/health` + `/generate` 正常；
+  MinGW 构建 `sglc --serve` 正常；两套构建 ctest 全绿（MinGW 26/26、MSVC-CUDA 25/25）。
+
 ## [v0.4.0] — 2026-10-27 「G11–G19 收尾 + 跨平台打包」
 
 本版把 TODO_PROMPTS v0.4 的缺口（G11–G19）收尾，并把构建/打包矩阵从「x64 为主」扩到

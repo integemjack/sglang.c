@@ -21,10 +21,6 @@ endif()
 
 # ---- 库 ----（先建目标，再挂选项）
 file(GLOB_RECURSE SGL_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.c)
-if(MSVC)
-  # http.c 依赖 winpthreads（MinGW 专属）；MSVC 构建排除，sglc --serve 同步禁用
-  list(REMOVE_ITEM SGL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/http.c)
-endif()
 add_library(sgl STATIC ${SGL_SOURCES})
 # third_party/stb：图片解码（G8，single-header，MIT）
 target_include_directories(sgl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -285,15 +281,15 @@ if(SGL_CUDA)
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_backend.cu
     COMMENT "nvcc cuda_backend.cu (sm_${SGL_CUDA_ARCH})"
     VERBATIM)
-  set(SGL_CORE_SRC
-      src/alloc.c src/log.c src/json.c src/tensor.c src/safetensors.c
-      src/bpe.c src/ops.c src/quant.c src/llama.c src/gpt2.c src/sampling.c src/clip.c
-      src/image.c # G11: PNG/JPEG 解码 + CLIP 预处理（cuda_http 现在收真实图片）
-      src/cuda_spec.c) # G7: GPU 侧投机解码（纯 host C，调 sgl_cuda_* API）
+  # sgl_cuda = 与 CPU 库 sgl 同一份源（含 http.c / scheduler.c / radix.c）+ nvcc 后端对象。
+  # 这样 sglc.exe 可以只链 sgl_cuda 一个库，就把 CPU 引擎和 GPU 引擎都编进同一个可执行文件
+  # （--device auto：有显卡跑 GPU，没显卡回落 CPU，不再需要 cuda_http.exe 这个额外程序）。
+  set(SGL_CORE_SRC ${SGL_SOURCES})
   if(MSVC)
     # dot_avx2_msvc.c 只服务 MSVC（需要 /arch:AVX2 + <intrin.h>）：GCC/Clang 的 AVX2 内积
     # 在 ops.c 用函数级 target("avx2,fma") 实现，两处都编会撞符号（sgl_dot_f32_avx2 重复定义）
-    list(APPEND SGL_CORE_SRC src/dot_avx2_msvc.c) # G18: MSVC 的 AVX2 内积（单独 /arch:AVX2 编译 + CPUID 分派）
+    list(APPEND SGL_CORE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/dot_avx2_msvc.c) # G18: MSVC 的 AVX2 内积（单独 /arch:AVX2 编译 + CPUID 分派）
+    list(REMOVE_DUPLICATES SGL_CORE_SRC)
   endif()
   add_library(sgl_cuda STATIC ${SGL_CORE_SRC} ${SGL_CUDA_OBJ})
   # dot_avx2_msvc.c 单独开 /arch:AVX2（MSVC 没有函数级 target 属性）
@@ -332,6 +328,13 @@ if(SGL_CUDA)
   add_executable(cuda_perf tests/cuda_perf.c)  # G1/G2/G3 perf A/B (no assertions)
   target_link_libraries(cuda_perf PRIVATE sgl_cuda)
   add_executable(cuda_http apps/cuda_http.c)
+  # ---- sglc 单 exe：内嵌 GPU 引擎（sglc --serve --device auto 时优先用它）----
+  # cuda_http.c 的 main 被 SGL_EMBED_CUDA_HTTP 包住，sglc 只调它的 sgl_cuda_http_serve()。
+  # 只链 sgl_cuda（含 CPU 侧全部源），不再链 sgl：同一份源进两个静态库会撞符号。
+  target_sources(sglc PRIVATE apps/cuda_http.c)
+  target_compile_definitions(sglc PRIVATE SGL_EMBED_CUDA_HTTP=1)
+  set_target_properties(sglc PROPERTIES LINK_LIBRARIES "")
+  target_link_libraries(sglc PRIVATE sgl_cuda)
   if(WIN32)
     target_link_libraries(cuda_http PRIVATE sgl_cuda ws2_32) # winsock
   else()
@@ -353,7 +356,7 @@ if(SGL_CUDA)
       message(FATAL_ERROR "cublas.lib not found under ${CUDA_TOOLKIT_DIR}/lib (arch ${SGL_WIN_CUDA_ARCH_DIR})")
     endif()
     message(STATUS "CUDA libs: ${SGL_WIN_CUDA_LIBDIR}")
-    foreach(t cuda_test cuda_cli long_vcpu cuda_perf cuda_http)
+    foreach(t cuda_test cuda_cli long_vcpu cuda_perf cuda_http sglc)
       target_link_libraries(${t} PRIVATE
           "${SGL_WIN_CUDA_LIBDIR}/cudart_static.lib"
           "${SGL_WIN_CUDA_LIBDIR}/cublas.lib")
@@ -375,7 +378,7 @@ if(SGL_CUDA)
     # 才报 "undefined reference to __cxa_guard_acquire"。
     set(SGL_CUDA_RUNTIME_LIBS ${SGL_CUDART_STATIC} ${SGL_CUBLAS_LIB} stdc++ pthread dl rt m)
     message(STATUS "CUDA link libs: ${SGL_CUDA_RUNTIME_LIBS}")
-    foreach(t cuda_test cuda_cli long_vcpu cuda_perf cuda_http)
+    foreach(t cuda_test cuda_cli long_vcpu cuda_perf cuda_http sglc)
       target_link_libraries(${t} PRIVATE ${SGL_CUDA_RUNTIME_LIBS})
     endforeach()
   endif()

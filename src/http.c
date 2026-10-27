@@ -12,9 +12,10 @@
 
 #ifdef _WIN32
 #include "sgl/port.h"
-#include <pthread.h>          /* MinGW winpthreads */
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include "sgl/thread_compat.h" /* MinGW = winpthreads；MSVC = Win32 兼容层。
+                               * 必须排在 winsock2.h 之后（它会 include <windows.h>）*/
 static void sgl_sock_init(void) {
   WSADATA wd;
   if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) SGL_ERROR("WSAStartup failed");
@@ -28,7 +29,7 @@ static void sgl_sleep_ms(int ms) { Sleep(ms); }
 #include <netinet/tcp.h> /* TCP_NODELAY（t11 加的 ND 开关；Linux/macOS 不在这里声明） */
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <pthread.h>
+#include "sgl/thread_compat.h" /* POSIX = 真 pthread */
 typedef int SOCKET;
 #define INVALID_SOCKET (-1)
 #define closesocket(s) close(s)
