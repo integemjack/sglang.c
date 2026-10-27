@@ -1,0 +1,23 @@
+<|im_start|>system
+You are a helpful assistant.
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"function": {"description": "Get weather", "name": "get_weather", "parameters": {"properties": {"city": {"type": "string"}}, "type": "object"}}, "type": "function"}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call><|im_end|>
+<|im_start|>user
+What is the capital of France?<|im_end|>
+<|im_start|>assistant
+Paris.<|im_end|>
+<|im_start|>user
+And of Japan?<|im_end|>
+<|im_start|>assistant

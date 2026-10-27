@@ -33,4 +33,8 @@ int sgl_tokenizer_piece_id(const sgl_tokenizer *t, const char *piece);
 /* 返回 malloc 的 NUL 结尾 UTF-8 字符串；调用方 free。 */
 char *sgl_tokenizer_decode(const sgl_tokenizer *t, const int *ids, int n);
 
+/* P1: 取单个 token 的真实 UTF-8 字节（GPT-2 byte-level 反映射 / Llama ▁ 与 <0xXX>），
+ * 给 grammar 词表用。写入 buf（容量 cap），返回字节数；不可用（越界/特殊 token）返回 0。*/
+int sgl_tokenizer_piece_bytes(const sgl_tokenizer *t, int id, char *buf, int cap);
+
 #endif

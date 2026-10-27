@@ -1,4 +1,4 @@
-/* sglc — sglang-c 推理 CLI（对应 sglang 的 python -m sglang.launch_server 单机路径）*/
+﻿/* sglc — sglang-c 推理 CLI（对应 sglang 的 python -m sglang.launch_server 单机路径）*/
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include "sgl/bpe.h"
+#include "sgl/bert.h"
 #include "sgl/clip.h"
 #include "sgl/generate.h"
 #include "sgl/gpt2.h"
@@ -153,7 +154,7 @@ static void usage(const char *prog) {
           "usage: %s --model <dir> [--prompt <text>] [--max-new N] \
           [--temperature F] [--top-k N] [--top-p F] [--seed N] [--verbose] \
           [--serve [--host H] [--port P] [--device auto|cuda|mlx|cpu]] [--w8] [--kv8] \
-          [--lora name=dir[,name2=dir2,...]]\n"
+          [--lora name=dir[,name2=dir2,...]] [--embedding-model DIR] [--dp N]\n"
           "  <dir> 需含 config.json / tokenizer.json / model.safetensors\n"
           "  --w8   int8 权重（W8A16；CPU 走 decode ~1.8x，CUDA 走 SGL_CUDA_W8）\n"
           "  --kv8  int8 KV cache（CPU 引擎；显存减半）\n"
@@ -162,6 +163,8 @@ static void usage(const char *prog) {
           "           MLX 目前无后端（只有 macOS 的数值参考脚本），指定它会报错后回落 cpu\n"
           "  --lora 多 LoRA 实例池：每个 adapter 预先合并为独立模型副本（独立 KV 池），\n"
           "         请求 JSON 顶层带 \"lora\":\"name\" 路由；不带该字段走 base 实例\n"
+          "  --embedding-model BERT/RoBERTa 类目录，启用 /v1/embeddings 与 /v1/rerank\n"
+          "  --dp N 数据并行：加载 N 份完整模型副本（独立 KV 池），请求按负载路由\n"
           "  例: %s --model gpt2 --prompt \"The meaning of life is\" --max-new 32\n"
           "      %s --model gpt2 --serve --port 30000\n"
           "      %s --model model --serve --lora a=models/adapter-a,b=models/adapter-b\n",
@@ -244,6 +247,8 @@ int main(int argc, char **argv) {
   sgl_sampling_params sp = {0.8f, 50, 0.95f, 0};
   lora_spec loras[16];
   int n_loras = 0;
+  const char *embed_dir = NULL; /* P2: --embedding-model（BERT 类 embedding/rerank）*/
+  int dp = 1; /* P1: --dp N 数据并行副本数 */
 
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
@@ -260,6 +265,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
     else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
+    else if (!strcmp(argv[i], "--embedding-model") && i + 1 < argc) embed_dir = argv[++i];
+    else if (!strcmp(argv[i], "--dp") && i + 1 < argc) dp = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--w8")) w8 = 1;
     else if (!strcmp(argv[i], "--kv8")) kv8 = 1;
     else if (!strcmp(argv[i], "--lora") && i + 1 < argc) {
@@ -368,10 +375,31 @@ int main(int argc, char **argv) {
     /* 服务模式：调度器 + HTTP（对应 sglang launch_server）*/
     sgl_scheduler *sched = sgl_sched_new(model_dir, 0);
     if (!sched) return 2;
+    /* P1: --dp N：再加载 N-1 份完整模型（各自独立 KV 池），请求按负载路由 */
+    if (dp > 8) dp = 8;
+    for (int k = 1; k < dp; k++) {
+      if (sgl_sched_add_replica(sched, model_dir) < 0) {
+        SGL_ERROR("--dp %d: replica %d load failed, continuing with %d", dp, k, k);
+        break;
+      }
+    }
     if (n_loras > 0 && sched_add_loras(sched, model_dir, loras, n_loras) != 0) { sgl_sched_free(sched); return 2; }
     SGL_INFO("model loaded in %.2fs", now_sec() - t0);
     sgl_http_server *srv = sgl_http_serve(sched, host, port);
     if (!srv) { sgl_sched_free(sched); return 2; }
+    /* P0-2: 有 tokenizer_config.json 的 chat_template 就用它 */
+    sgl_http_set_chat_template(srv, model_dir);
+    /* P2: --embedding-model 给 /v1/embeddings 与 /v1/rerank 用 */
+    sgl_bert *em = NULL;
+    if (embed_dir) {
+      em = sgl_bert_load(embed_dir);
+      if (em) {
+        sgl_http_set_embedding(srv, em);
+        SGL_INFO("embedding model ready: %s (hidden=%d)", embed_dir, sgl_bert_hidden(em));
+      } else {
+        SGL_ERROR("embedding model load failed: %s", embed_dir);
+      }
+    }
     /* G8: 装了视觉塔就注册图片回调（/v1/chat/completions 的 image_url）*/
     if (vision_dir) {
       char pj[1024];

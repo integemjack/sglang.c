@@ -5,6 +5,7 @@
 #include "sgl/image.h"
 #include "sgl/log.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,7 +44,10 @@ static void sgl_sleep_ms(int ms) {
 #endif
 
 #include "sgl/alloc.h"
+#include "sgl/bert.h"
+#include "sgl/grammar.h"
 #include "sgl/json.h"
+#include "sgl/parser.h"
 #include "sgl/log.h"
 
 #define SGL_HTTP_BODY_MAX (4 << 20) /* 4 MiB */
@@ -53,6 +57,8 @@ typedef struct done_item {
   char *text;   /* 生成的文本（不含 prompt）*/
   int *ids;
   int n_ids;
+  float *lp;    /* P0-3: 每个生成 token 的 logprob（可为 NULL）*/
+  int n_lp;
   int prompt_tokens;
   struct done_item *next;
 } done_item;
@@ -78,12 +84,28 @@ struct sgl_http_server {
   long req_counter;    /* OpenAI id 生成 */
   sgl_http_vision_fn vision;   /* G8: 图片→视觉 token 回调（NULL = 不支持图片）*/
   void *vision_ud;
+  sgl_jinja *jinja;            /* P0-2: 模型自带 chat_template（NULL = 回退 ChatML）*/
+  sgl_bert *embed;             /* P2: embedding / rerank 模型（NULL = 未加载）*/
+  char model_name[256];        /* 响应体里的 model 字段（模型目录 basename）*/
 };
 
 void sgl_http_set_vision(sgl_http_server *srv, sgl_http_vision_fn fn, void *ud) {
   if (!srv) return;
   srv->vision = fn;
   srv->vision_ud = ud;
+}
+
+void sgl_http_set_embedding(sgl_http_server *srv, sgl_bert *m) { srv->embed = m; }
+
+void sgl_http_set_chat_template(sgl_http_server *srv, const char *model_dir) {
+  if (!srv || !model_dir) return;
+  srv->jinja = sgl_jinja_load_dir(model_dir);
+  /* 模型名：取目录末段 */
+  const char *b = model_dir;
+  for (const char *p = model_dir; *p; p++)
+    if (*p == '/' || *p == '\\') b = p + 1;
+  snprintf(srv->model_name, sizeof(srv->model_name), "%s", b);
+  if (!srv->jinja) SGL_INFO("http: no chat_template in %s, falling back to ChatML", model_dir);
 }
 
 /* ---------- 响应构造：动态字符串 + JSON 转义 ---------- */
@@ -135,6 +157,20 @@ static void respond(SOCKET fd, int code, const char *status, const char *body) {
   sb_init(&r);
   char head[256];
   snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+           code, status, strlen(body));
+  sb_puts(&r, head);
+  sb_puts(&r, body);
+  send_all(fd, r.buf, r.len);
+  sgl_xfree(r.buf);
+}
+
+/* text/plain（Prometheus /metrics）*/
+static void respond_text(SOCKET fd, int code, const char *status, const char *body) {
+  sbuf r;
+  sb_init(&r);
+  char head[256];
+  snprintf(head, sizeof(head),
+           "HTTP/1.1 %d %s\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
            code, status, strlen(body));
   sb_puts(&r, head);
   sb_puts(&r, body);
@@ -224,9 +260,12 @@ static int read_request(SOCKET fd, http_req *req) {
 
 /* ---------- 完成队列 ---------- */
 
-static void done_push(sgl_http_server *srv, int id, char *text, int *ids, int n, int ptok) {
+static void done_push(sgl_http_server *srv, int id, char *text, int *ids, int n, int ptok,
+                      float *lp, int n_lp) {
   done_item *d = (done_item *)sgl_xmalloc(sizeof(*d));
   d->req_id = id; d->text = text; d->ids = ids; d->n_ids = n; d->prompt_tokens = ptok; d->next = NULL;
+  d->lp = lp;
+  d->n_lp = n_lp;
   if (srv->done_tail) srv->done_tail->next = d; else srv->done_head = d;
   srv->done_tail = d;
 }
@@ -260,9 +299,9 @@ static void *worker_fn(void *arg) {
       continue;
     }
     sgl_sched_step(srv->sched);
-    int id, n, npt, nhit; char *text; int *ids;
-    while (sgl_sched_poll(srv->sched, &id, &text, &ids, &n, &npt, &nhit))
-      done_push(srv, id, text, ids, n, npt);
+    int id, n, npt, nhit; char *text; int *ids; float *lp = NULL; int nlp = 0;
+    while (sgl_sched_poll_lp(srv->sched, &id, &text, &ids, &n, &npt, &nhit, &lp, &nlp))
+      done_push(srv, id, text, ids, n, npt, lp, nlp);
     pthread_cond_broadcast(&srv->cv_done);
     pthread_mutex_unlock(&srv->lock);
   }
@@ -314,6 +353,31 @@ static int apply_stops(char stops[4][128], int n_stops, char *text) {
   return 0;
 }
 
+/* P0-3: OpenAI / sglang 采样参数（三个端点共用）*/
+static void parse_sampling_json(const sgl_json *j, sgl_sampling_params *sp, int *max_new, int def_max,
+                                int max_cap) {
+  if (!j || !sp) return;
+  if (max_new) {
+    *max_new = sgl_json_get_int(j, "max_tokens", sgl_json_get_int(j, "max_new_tokens", def_max));
+    if (*max_new <= 0 || *max_new > max_cap) *max_new = def_max;
+  }
+  sp->temperature = (float)sgl_json_get_num(j, "temperature", 0.0);
+  sp->top_p = (float)sgl_json_get_num(j, "top_p", 0.0);
+  sp->top_k = sgl_json_get_int(j, "top_k", 0);
+  sp->min_p = (float)sgl_json_get_num(j, "min_p", 0.0);
+  sp->repetition_penalty = (float)sgl_json_get_num(j, "repetition_penalty", 1.0);
+  sp->frequency_penalty = (float)sgl_json_get_num(j, "frequency_penalty", 0.0);
+  sp->presence_penalty = (float)sgl_json_get_num(j, "presence_penalty", 0.0);
+  sp->ignore_eos = json_bool(j, "ignore_eos");
+  sp->seed = (uint64_t)sgl_json_get_int(j, "seed", 0);
+  sp->n_stop_ids = 0;
+  const sgl_json *st = sgl_json_get(j, "stop_token_ids");
+  if (st && st->type == SGL_JSON_ARRAY)
+    for (int i = 0; i < st->count && sp->n_stop_ids < SGL_MAX_STOP_TOKENS; i++)
+      if (st->items[i]->type == SGL_JSON_NUMBER)
+        sp->stop_ids[sp->n_stop_ids++] = (int)st->items[i]->num;
+}
+
 /* 流式响应头（close 分帧：无 Content-Length，连接关闭即结束）*/
 static void respond_open_stream(SOCKET fd) {
   const char *hdr =
@@ -325,15 +389,436 @@ static void respond_open_stream(SOCKET fd) {
   send(fd, hdr, (int)strlen(hdr), 0);
 }
 
+/* ---------- P0-2: Jinja chat template ---------- */
+
+static void dump_json(sbuf *o, const sgl_json *j) {
+  if (!j) {
+    sb_puts(o, "null");
+    return;
+  }
+  switch (j->type) {
+    case SGL_JSON_NULL: sb_puts(o, "null"); break;
+    case SGL_JSON_BOOL: sb_puts(o, j->boolean ? "true" : "false"); break;
+    case SGL_JSON_NUMBER: {
+      char b[64];
+      snprintf(b, sizeof(b), "%.17g", j->num);
+      sb_puts(o, b);
+      break;
+    }
+    case SGL_JSON_STRING: sb_putjson(o, j->str ? j->str : ""); break;
+    case SGL_JSON_ARRAY:
+      sb_puts(o, "[");
+      for (int i = 0; i < j->count; i++) {
+        if (i) sb_puts(o, ",");
+        dump_json(o, j->items[i]);
+      }
+      sb_puts(o, "]");
+      break;
+    case SGL_JSON_OBJECT:
+      sb_puts(o, "{");
+      for (int i = 0; i < j->count; i++) {
+        if (i) sb_puts(o, ",");
+        sb_putjson(o, j->keys[i]);
+        sb_puts(o, ":");
+        dump_json(o, j->items[i]);
+      }
+      sb_puts(o, "}");
+      break;
+  }
+}
+
+/* 用模型自带的 chat_template 渲染 messages。
+ * content[] 里的 image_url 先编码成视觉特征（与旧 ChatML 路径一致），
+ * 文本里留 <image> 占位；tool_calls 等其余字段原样交给模板。
+ * 失败返回 NULL，*err 给原因。 */
+static char *chat_render_template(sgl_http_server *srv, const sgl_json *reqj, const sgl_json *msgs,
+                                  float **feats_out, long *n_feats_out, int *feat_row_out,
+                                  int *n_img_tok_out, const char **err) {
+  sbuf t;
+  sb_init(&t);
+  sb_puts(&t, "[");
+  float *feats = NULL;
+  long n_feats = 0;
+  int feat_row = 0, n_img_tok = 0;
+  const char *myerr = NULL;
+
+  for (int i = 0; i < msgs->count; i++) {
+    const sgl_json *m = msgs->items[i];
+    const char *role = sgl_json_get_str(m, "role", "user");
+    const sgl_json *cj = sgl_json_get(m, "content");
+    if (i) sb_puts(&t, ",");
+    sb_puts(&t, "{\"role\":");
+    sb_putjson(&t, role);
+    sb_puts(&t, ",\"content\":");
+    if (cj && cj->type == SGL_JSON_ARRAY) {
+      sbuf txt;
+      sb_init(&txt);
+      for (int k = 0; k < cj->count; k++) {
+        const sgl_json *part = cj->items[k];
+        const char *ptype = sgl_json_get_str(part, "type", "text");
+        if (strcmp(ptype, "image_url") != 0) {
+          sb_puts(&txt, sgl_json_get_str(part, "text", ""));
+          continue;
+        }
+        sb_puts(&txt, "<image>");
+        if (myerr) continue;
+        if (!srv->vision) {
+          myerr = "server has no vision tower (use --vision)";
+          continue;
+        }
+        const sgl_json *iu = sgl_json_get(part, "image_url");
+        const char *url = iu ? sgl_json_get_str(iu, "url", "") : "";
+        const char *b64 = url;
+        const char *cm = strchr(url, ',');
+        if (!strncmp(url, "data:", 5) && cm) b64 = cm + 1;
+        unsigned char *bytes = NULL;
+        size_t bn = 0;
+        if (sgl_base64_decode(b64, strlen(b64), &bytes, &bn) != 0) {
+          myerr = "image_url base64 decode failed";
+          continue;
+        }
+        int ni = 0, el = 0;
+        float *f = srv->vision(srv->vision_ud, bytes, bn, &ni, &el);
+        sgl_xfree(bytes);
+        if (!f || ni <= 0 || el <= 0) {
+          sgl_xfree(f);
+          myerr = "image decode / vision encode failed";
+          continue;
+        }
+        if (feat_row == 0) feat_row = el;
+        if (feat_row != el) {
+          sgl_xfree(f);
+          myerr = "images with different feature width";
+          continue;
+        }
+        feats = (float *)sgl_xrealloc(feats, sizeof(float) * (size_t)(n_feats + (long)ni * el));
+        memcpy(feats + n_feats, f, sizeof(float) * (size_t)ni * el);
+        n_feats += (long)ni * el;
+        n_img_tok += ni;
+        sgl_xfree(f);
+      }
+      sb_putjson(&t, txt.buf ? txt.buf : "");
+      sgl_xfree(txt.buf);
+    } else if (cj && cj->type == SGL_JSON_STRING) {
+      sb_putjson(&t, cj->str ? cj->str : "");
+    } else {
+      sb_putjson(&t, "");
+    }
+    /* 其余字段（tool_calls / name / tool_call_id …）原样保留 */
+    for (int k = 0; k < m->count; k++) {
+      const char *kn = m->keys[k];
+      if (!strcmp(kn, "role") || !strcmp(kn, "content")) continue;
+      sb_puts(&t, ",");
+      sb_putjson(&t, kn);
+      sb_puts(&t, ":");
+      dump_json(&t, m->items[k]);
+    }
+    sb_puts(&t, "}");
+  }
+  sb_puts(&t, "]");
+
+  *feats_out = feats;
+  *n_feats_out = n_feats;
+  *feat_row_out = feat_row;
+  *n_img_tok_out = n_img_tok;
+  *err = myerr;
+  if (myerr) {
+    sgl_xfree(t.buf);
+    return NULL;
+  }
+
+  /* kwargs：chat_template_kwargs 展开到顶层 + tools（Qwen3 的 enable_thinking 等走这里）*/
+  sbuf kw;
+  sb_init(&kw);
+  sb_puts(&kw, "{");
+  int first = 1;
+  const sgl_json *ck = sgl_json_get(reqj, "chat_template_kwargs");
+  if (ck && ck->type == SGL_JSON_OBJECT)
+    for (int i = 0; i < ck->count; i++) {
+      if (!first) sb_puts(&kw, ",");
+      first = 0;
+      sb_putjson(&kw, ck->keys[i]);
+      sb_puts(&kw, ":");
+      dump_json(&kw, ck->items[i]);
+    }
+  const sgl_json *tools = sgl_json_get(reqj, "tools");
+  if (tools) {
+    if (!first) sb_puts(&kw, ",");
+    sb_puts(&kw, "\"tools\":");
+    dump_json(&kw, tools);
+  }
+  sb_puts(&kw, "}");
+
+  sgl_json *m2 = sgl_json_parse(t.buf, t.len);
+  sgl_json *kwj = sgl_json_parse(kw.buf, kw.len);
+  char *out = NULL;
+  size_t outlen = 0;
+  int rc = (m2 && srv->jinja) ? sgl_jinja_render(srv->jinja, m2, 1, kwj, &out, &outlen) : -1;
+  if (rc != 0) {
+    *err = "chat template render failed";
+    out = NULL;
+  }
+  if (m2) sgl_json_free(m2);
+  if (kwj) sgl_json_free(kwj);
+  sgl_xfree(kw.buf);
+  sgl_xfree(t.buf);
+  return out;
+}
+
+/* ---------- P2: /v1/embeddings /v1/rerank（BERT 类编码器）---------- */
+
+/* 提取 embedding 输入：string 或 string[]（也接受 [ [1,2] ] 的 token 数组，按空格拼接走文本）*/
+static void handle_embeddings(sgl_http_server *srv, SOCKET fd, const sgl_json *j) {
+  if (!srv->embed) {
+    respond_error(fd, 400, "no embedding model loaded (start with --embedding-model DIR)");
+    return;
+  }
+  const sgl_json *in = sgl_json_get(j, "input");
+  if (!in) {
+    respond_error(fd, 400, "\"input\" required");
+    return;
+  }
+  int n = (in->type == SGL_JSON_ARRAY) ? in->count : 1;
+  int E = sgl_bert_hidden(srv->embed);
+  float *buf = (float *)sgl_xmalloc(sizeof(float) * (size_t)(E > 0 ? E : 1));
+  sbuf b;
+  sb_init(&b);
+  sb_puts(&b, "{\"object\":\"list\",\"data\":[");
+  int emitted = 0;
+  for (int i = 0; i < n; i++) {
+    const sgl_json *it = (in->type == SGL_JSON_ARRAY) ? in->items[i] : in;
+    const char *txt = NULL;
+    if (it->type == SGL_JSON_STRING) {
+      txt = it->str;
+    } else {
+      continue; /* token 数组：BERT 词表不通用，直接忽略 */
+    }
+    if (sgl_bert_encode(srv->embed, txt ? txt : "", SGL_BERT_POOL_MEAN, buf, E) != 0) {
+      sgl_xfree(buf);
+      sgl_xfree(b.buf);
+      respond_error(fd, 500, "embedding forward failed");
+      return;
+    }
+    if (emitted) sb_puts(&b, ",");
+    emitted++;
+    char head[96];
+    snprintf(head, sizeof(head), "{\"object\":\"embedding\",\"index\":%d,\"embedding\":[", i);
+    sb_puts(&b, head);
+    for (int k = 0; k < E; k++) {
+      char t2[40];
+      snprintf(t2, sizeof(t2), "%s%.6f", k ? "," : "", (double)buf[k]);
+      sb_puts(&b, t2);
+    }
+    sb_puts(&b, "]}");
+  }
+  sb_puts(&b, "],\"model\":\"");
+  sb_puts(&b, srv->model_name[0] ? srv->model_name : "sglang-c");
+  sb_puts(&b, "\",\"usage\":{\"prompt_tokens\":0,\"total_tokens\":0}}");
+  respond(fd, 200, "OK", b.buf);
+  sgl_xfree(b.buf);
+  sgl_xfree(buf);
+}
+
+static void handle_rerank(sgl_http_server *srv, SOCKET fd, const sgl_json *j) {
+  if (!srv->embed) {
+    respond_error(fd, 400, "no rerank model loaded (start with --embedding-model DIR)");
+    return;
+  }
+  const char *q = sgl_json_get_str(j, "query", sgl_json_get_str(j, "text_1", NULL));
+  const sgl_json *docs = sgl_json_get(j, "documents");
+  const char *d1 = sgl_json_get_str(j, "text_2", NULL);
+  if (!q || (!docs && !d1)) {
+    respond_error(fd, 400, "\"query\" and \"documents\" required");
+    return;
+  }
+  int n = docs ? (docs->type == SGL_JSON_ARRAY ? docs->count : 1) : 1;
+  sbuf b;
+  sb_init(&b);
+  sb_puts(&b, "{\"object\":\"list\",\"results\":[");
+  for (int i = 0; i < n; i++) {
+    const char *d = NULL;
+    if (d1) d = d1;
+    else {
+      const sgl_json *it = docs->type == SGL_JSON_ARRAY ? docs->items[i] : docs;
+      if (it->type == SGL_JSON_STRING) d = it->str;
+    }
+    if (!d) continue;
+    float sc = sgl_bert_rerank(srv->embed, q, d);
+    if (i) sb_puts(&b, ",");
+    char t2[160];
+    snprintf(t2, sizeof(t2), "{\"index\":%d,\"relevance_score\":%.6f}", i, (double)sc);
+    sb_puts(&b, t2);
+  }
+  sb_puts(&b, "],\"model\":\"");
+  sb_puts(&b, srv->model_name[0] ? srv->model_name : "sglang-c");
+  sb_puts(&b, "\",\"usage\":{\"prompt_tokens\":0,\"total_tokens\":0}}");
+  respond(fd, 200, "OK", b.buf);
+  sgl_xfree(b.buf);
+}
+
+/* P2: /v1/score — 两段文本的 embedding 余弦相似度（对应上游 /v1/score）*/
+static void handle_score(sgl_http_server *srv, SOCKET fd, const sgl_json *j) {
+  if (!srv->embed) {
+    respond_error(fd, 400, "no embedding model loaded (start with --embedding-model DIR)");
+    return;
+  }
+  const char *t1 = sgl_json_get_str(j, "text_1", sgl_json_get_str(j, "query", NULL));
+  const char *t2 = sgl_json_get_str(j, "text_2", sgl_json_get_str(j, "document", NULL));
+  if (!t1 || !t2) {
+    respond_error(fd, 400, "\"text_1\" and \"text_2\" required");
+    return;
+  }
+  int E = sgl_bert_hidden(srv->embed);
+  float *a = (float *)sgl_xmalloc(sizeof(float) * (size_t)E);
+  float *b2 = (float *)sgl_xmalloc(sizeof(float) * (size_t)E);
+  if (sgl_bert_encode(srv->embed, t1, SGL_BERT_POOL_MEAN, a, E) != 0 ||
+      sgl_bert_encode(srv->embed, t2, SGL_BERT_POOL_MEAN, b2, E) != 0) {
+    sgl_xfree(a);
+    sgl_xfree(b2);
+    respond_error(fd, 500, "embedding forward failed");
+    return;
+  }
+  double dot = 0, na = 0, nb = 0;
+  for (int k = 0; k < E; k++) {
+    dot += (double)a[k] * b2[k];
+    na += (double)a[k] * a[k];
+    nb += (double)b2[k] * b2[k];
+  }
+  double cos = (na > 0 && nb > 0) ? dot / (sqrt(na) * sqrt(nb)) : 0.0;
+  sbuf b;
+  sb_init(&b);
+  char t[256];
+  snprintf(t, sizeof(t),
+           "{\"object\":\"list\",\"data\":[{\"index\":0,\"score\":%.6f}],\"usage\":{"
+           "\"prompt_tokens\":0,\"total_tokens\":0}}",
+           cos);
+  sb_puts(&b, t);
+  respond(fd, 200, "OK", b.buf);
+  sgl_xfree(b.buf);
+  sgl_xfree(a);
+  sgl_xfree(b2);
+}
+
 static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
-  if (strcmp(req->method, "GET") == 0 && strcmp(req->path, "/health") == 0) {
+  /* ---------- 只读/管理端点（P1，与上游 sglang 同名）---------- */
+  if (strcmp(req->method, "GET") == 0) {
+    if (!strcmp(req->path, "/health")) {
+      sgl_sched_stats st = sgl_sched_get_stats(srv->sched);
+      sbuf b;
+      sb_init(&b);
+      char t[512];
+      snprintf(t, sizeof(t),
+               "{\"ok\":true,\"model\":\"%s\",\"n_running\":%d,\"n_waiting\":%d,"
+               "\"prefill_tokens\":%ld,\"decode_tokens\":%ld,\"cache_hit_tokens\":%ld}",
+               srv->model_name[0] ? srv->model_name : "sglang-c", st.n_running, st.n_waiting,
+               st.prefill_tokens, st.decode_tokens, st.cache_hit_tokens);
+      sb_puts(&b, t);
+      respond(fd, 200, "OK", b.buf);
+      sgl_xfree(b.buf);
+      return;
+    }
+    if (!strcmp(req->path, "/ready") || !strcmp(req->path, "/health_generate") ||
+        !strcmp(req->path, "/ping")) {
+      respond(fd, 200, "OK", "{\"ok\":true}");
+      return;
+    }
+    if (!strcmp(req->path, "/v1/models")) {
+      sbuf b;
+      sb_init(&b);
+      sb_puts(&b, "{\"object\":\"list\",\"data\":[{\"id\":\"");
+      sb_puts(&b, srv->model_name[0] ? srv->model_name : "sglang-c");
+      sb_puts(&b, "\",\"object\":\"model\",\"owned_by\":\"sglang-c\"}]}");
+      respond(fd, 200, "OK", b.buf);
+      sgl_xfree(b.buf);
+      return;
+    }
+    if (!strcmp(req->path, "/get_server_info") || !strcmp(req->path, "/server_info") ||
+        !strcmp(req->path, "/get_model_info")) {
+      sgl_sched_stats st = sgl_sched_get_stats(srv->sched);
+      sbuf b;
+      sb_init(&b);
+      char t[768];
+      snprintf(t, sizeof(t),
+               "{\"model\":\"%s\",\"prefill_chunk\":%d,\"pool_pages\":%d,\"pool_free\":%d,"
+               "\"n_running\":%d,\"n_waiting\":%d,\"prefill_tokens\":%ld,\"decode_tokens\":%ld,"
+               "\"cache_hit_tokens\":%ld,\"n_finished\":%d,\"n_preempt\":%ld,\"dp_replicas\":%d}",
+               srv->model_name[0] ? srv->model_name : "sglang-c", st.prefill_chunk, st.pool_pages,
+               st.pool_free, st.n_running, st.n_waiting, st.prefill_tokens, st.decode_tokens,
+               st.cache_hit_tokens, st.n_finished, st.n_preempt, st.n_replicas);
+      sb_puts(&b, t);
+      respond(fd, 200, "OK", b.buf);
+      sgl_xfree(b.buf);
+      return;
+    }
+    if (!strcmp(req->path, "/metrics")) {
+      sgl_sched_stats st = sgl_sched_get_stats(srv->sched);
+      sbuf b;
+      sb_init(&b);
+      char t[1024];
+      snprintf(t, sizeof(t),
+               "# TYPE sgl_prefill_tokens_total counter\nsgl_prefill_tokens_total %ld\n"
+               "# TYPE sgl_decode_tokens_total counter\nsgl_decode_tokens_total %ld\n"
+               "# TYPE sgl_cache_hit_tokens_total counter\nsgl_cache_hit_tokens_total %ld\n"
+               "# TYPE sgl_requests_finished_total counter\nsgl_requests_finished_total %d\n"
+               "# TYPE sgl_requests_running gauge\nsgl_requests_running %d\n"
+               "# TYPE sgl_requests_waiting gauge\nsgl_requests_waiting %d\n"
+               "# TYPE sgl_kv_pool_pages gauge\nsgl_kv_pool_pages %d\n"
+               "# TYPE sgl_kv_pool_free gauge\nsgl_kv_pool_free %d\n"
+               "# TYPE sgl_preemptions_total counter\nsgl_preemptions_total %ld\n",
+               st.prefill_tokens, st.decode_tokens, st.cache_hit_tokens, st.n_finished, st.n_running,
+               st.n_waiting, st.pool_pages, st.pool_free, st.n_preempt);
+      sb_puts(&b, t);
+      respond_text(fd, 200, "OK", b.buf);
+      sgl_xfree(b.buf);
+      return;
+    }
+  }
+  if (strcmp(req->method, "POST") == 0 &&
+      (!strcmp(req->path, "/v1/embeddings") || !strcmp(req->path, "/v1/rerank") ||
+       !strcmp(req->path, "/v1/score"))) {
+    sgl_json *ej = sgl_json_parse(req->body, req->body_len);
+    if (!ej) {
+      respond_error(fd, 400, "invalid JSON body");
+      return;
+    }
+    if (!strcmp(req->path, "/v1/embeddings")) handle_embeddings(srv, fd, ej);
+    else if (!strcmp(req->path, "/v1/rerank")) handle_rerank(srv, fd, ej);
+    else handle_score(srv, fd, ej);
+    sgl_json_free(ej);
+    return;
+  }
+  if (strcmp(req->method, "POST") == 0 && !strcmp(req->path, "/update_weights_from_disk")) {
+    sgl_json *uj = sgl_json_parse(req->body, req->body_len);
+    const char *mp = uj ? sgl_json_get_str(uj, "model_path", NULL) : NULL;
+    int inst = uj ? sgl_json_get_int(uj, "instance", -1) : -1;
+    int rc = mp ? sgl_sched_reload_weights(srv->sched, inst, mp) : -1;
+    if (uj) sgl_json_free(uj);
+    if (rc == 0) respond(fd, 200, "OK", "{\"ok\":true}");
+    else if (rc == -2) respond_error(fd, 409, "instance busy (wait for in-flight requests)");
+    else respond_error(fd, 400, "reload failed (bad model_path or load error)");
+    return;
+  }
+  if (strcmp(req->method, "POST") == 0 && !strcmp(req->path, "/flush_cache")) {
+    sgl_sched_flush_cache(srv->sched);
     respond(fd, 200, "OK", "{\"ok\":true}");
+    return;
+  }
+  if (strcmp(req->method, "POST") == 0 && !strcmp(req->path, "/abort_request")) {
+    sgl_json *aj = sgl_json_parse(req->body, req->body_len);
+    int rid = aj ? sgl_json_get_int(aj, "rid", sgl_json_get_int(aj, "request_id", -1)) : -1;
+    int rc = sgl_sched_abort(srv->sched, rid);
+    if (aj) sgl_json_free(aj);
+    if (rc == 0) respond(fd, 200, "OK", "{\"ok\":true}");
+    else respond_error(fd, 404, "no such rid");
     return;
   }
   if (strcmp(req->method, "POST") != 0 ||
       (strcmp(req->path, "/generate") != 0 && strcmp(req->path, "/v1/completions") != 0 &&
        strcmp(req->path, "/v1/chat/completions") != 0)) {
-    respond_error(fd, 404, "only GET /health, POST /generate, /v1/completions, /v1/chat/completions");
+    respond_error(fd, 404,
+                  "only GET /health /ready /v1/models /get_server_info /metrics, POST /generate "
+                  "/v1/completions /v1/chat/completions /v1/embeddings /v1/rerank /v1/score "
+                  "/flush_cache /abort_request /update_weights_from_disk");
     return;
   }
   int chat = strcmp(req->path, "/v1/chat/completions") == 0;
@@ -372,6 +857,10 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
   sgl_sampling_params sp;
   memset(&sp, 0, sizeof(sp));
   int max_new = 16;
+  int want_lp = 0; /* P0-3: logprobs */
+  int *prompt_ids = NULL; /* P0-3: prompt/input_ids 直接给 token */
+  int n_prompt_ids = 0;
+  sgl_grammar *gram = NULL; /* P1: 约束解码 */
   int openai = strcmp(req->path, "/v1/completions") == 0;
   char *chatml = NULL; /* chat 模式下渲染后的 prompt */
 
@@ -383,6 +872,17 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
       respond_error(fd, 400, "\"messages\" array required");
       return;
     }
+    if (srv->jinja) {
+      /* P0-2: 模型自带 Jinja 模板（含 tools / chat_template_kwargs）*/
+      chatml = chat_render_template(srv, j, msgs, &feats, &n_feats, &feat_row, &n_img_tok, &img_err);
+      if (!chatml) {
+        sgl_json_free(j);
+        sgl_xfree(feats);
+        respond_error(fd, 400, img_err ? img_err : "chat template render failed");
+        return;
+      }
+    } else {
+    /* 回退：内置 ChatML（Qwen 系默认格式）*/
     sbuf ml;
     sb_init(&ml);
     /* G8: content[] 里的 image_url → 视觉 token（多张图按顺序拼接）
@@ -444,10 +944,9 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     }
     sb_puts(&ml, "<|im_start|>assistant\n");
     chatml = ml.buf;
-    max_new = sgl_json_get_int(j, "max_tokens", 256);
-    sp.temperature = (float)sgl_json_get_num(j, "temperature", 0.0);
-    sp.top_p = (float)sgl_json_get_num(j, "top_p", 0.0);
-    sp.seed = (uint64_t)sgl_json_get_int(j, "seed", 0);
+    }
+    parse_sampling_json(j, &sp, &max_new, 256, 4096);
+    want_lp = json_bool(j, "logprobs") || sgl_json_get_int(j, "top_logprobs", 0) > 0;
     is_stream = chat && json_bool(j, "stream");
     parse_stops(j, stops, &n_stops);
     n_choices = sgl_json_get_int(j, "n", 1);
@@ -463,11 +962,16 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     text = chatml;
   } else if (openai) {
     text = sgl_json_get_str(j, "prompt", NULL);
-    max_new = sgl_json_get_int(j, "max_tokens", 16);
-    sp.temperature = (float)sgl_json_get_num(j, "temperature", 0.0);
-    sp.top_p = (float)sgl_json_get_num(j, "top_p", 0.0);
-    sp.top_k = sgl_json_get_int(j, "top_k", 0); /* OpenAI 无 top_k，兼容透传 */
-    sp.seed = (uint64_t)sgl_json_get_int(j, "seed", 0);
+    /* P0-3: prompt 也可以是 token id 数组 */
+    const sgl_json *pj = sgl_json_get(j, "prompt");
+    if (pj && pj->type == SGL_JSON_ARRAY) {
+      prompt_ids = (int *)sgl_xmalloc(sizeof(int) * (size_t)(pj->count > 0 ? pj->count : 1));
+      for (int k = 0; k < pj->count; k++)
+        if (pj->items[k]->type == SGL_JSON_NUMBER) prompt_ids[n_prompt_ids++] = (int)pj->items[k]->num;
+      if (n_prompt_ids > 0) text = "";
+    }
+    parse_sampling_json(j, &sp, &max_new, 16, 1024);
+    want_lp = json_bool(j, "logprobs") || sgl_json_get_int(j, "logprobs", 0) > 0;
     parse_stops(j, stops, &n_stops);
     n_choices = sgl_json_get_int(j, "n", 1);
     if (n_choices < 1) n_choices = 1;
@@ -475,17 +979,19 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     if (max_new <= 0 || max_new > 1024) max_new = 16;
   } else {
     text = sgl_json_get_str(j, "text", NULL);
-    const sgl_json *spj = sgl_json_get(j, "sampling_params");
-    if (spj) {
-      max_new = sgl_json_get_int(spj, "max_new_tokens", 16);
-      sp.temperature = (float)sgl_json_get_num(spj, "temperature", 0.0);
-      sp.top_p = (float)sgl_json_get_num(spj, "top_p", 0.0);
-      sp.top_k = sgl_json_get_int(spj, "top_k", 0);
-      sp.seed = (uint64_t)sgl_json_get_int(spj, "seed", 0);
+    /* P0-3: sglang 原生 /generate 支持 input_ids 直接给 token */
+    const sgl_json *ij = sgl_json_get(j, "input_ids");
+    if (ij && ij->type == SGL_JSON_ARRAY) {
+      prompt_ids = (int *)sgl_xmalloc(sizeof(int) * (size_t)(ij->count > 0 ? ij->count : 1));
+      for (int k = 0; k < ij->count; k++)
+        if (ij->items[k]->type == SGL_JSON_NUMBER) prompt_ids[n_prompt_ids++] = (int)ij->items[k]->num;
+      if (n_prompt_ids > 0) text = "";
     }
+    const sgl_json *spj = sgl_json_get(j, "sampling_params");
+    if (spj) parse_sampling_json(spj, &sp, &max_new, 16, 1024);
     if (max_new <= 0 || max_new > 1024) max_new = 16;
   }
-  if (!text || !*text) {
+  if ((!text || !*text) && n_prompt_ids <= 0) {
     sgl_json_free(j);
     respond_error(fd, 400, openai ? "\"prompt\"" : "\"text\" is required");
     return;
@@ -495,18 +1001,56 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
   char *prompt_copy;
   if (chat) {
     prompt_copy = chatml;
+  } else if (n_prompt_ids > 0) {
+      prompt_copy = NULL; /* 不再需要文本 */
+      sgl_json_free(j);
   } else {
-    size_t plen = strlen(text) + 1;
-    char *pc = (char *)sgl_xmalloc(plen);
-    memcpy(pc, text, plen);
-    prompt_copy = pc;
-    sgl_json_free(j);
+      size_t plen = strlen(text) + 1;
+      char *pc = (char *)sgl_xmalloc(plen);
+      memcpy(pc, text, plen);
+      prompt_copy = pc;
+      sgl_json_free(j);
   }
   text = prompt_copy;
 
+  /* P1: 结构化输出约束（response_format / grammar）*/
+  if (chat) {
+    const sgl_json *rf = sgl_json_get(j, "response_format");
+    const sgl_json *gs = NULL;
+    int want = 0;
+    if (rf && rf->type == SGL_JSON_OBJECT) {
+      const char *rt = sgl_json_get_str(rf, "type", "text");
+      if (!strcmp(rt, "json_object")) {
+        want = 1;
+        gram = sgl_grammar_from_json_schema("{\"type\":\"object\"}", 19);
+      } else if (!strcmp(rt, "json_schema")) {
+        const sgl_json *js = sgl_json_get(rf, "json_schema");
+        gs = js ? sgl_json_get(js, "schema") : NULL;
+        want = 1;
+        if (gs) {
+          sbuf sj;
+          sb_init(&sj);
+          dump_json(&sj, gs);
+          gram = sgl_grammar_from_json_schema(sj.buf, sj.len);
+          sgl_xfree(sj.buf);
+        }
+      } else if (!strcmp(rt, "structural_tag") || !strcmp(rt, "regex")) {
+        const char *pat = sgl_json_get_str(rf, "regex", sgl_json_get_str(rf, "pattern", NULL));
+        want = 1;
+        if (pat) gram = sgl_grammar_from_regex(pat);
+      }
+    }
+    if (want && !gram) {
+      sgl_xfree(prompt_copy);
+      sgl_xfree(feats);
+      respond_error(fd, 400, "response_format not supported by grammar engine");
+      return;
+    }
+  }
+
   /* t11: same pathological-prompt guard as cuda_http — a huge single-char
    * body parks BPE encode for minutes on the CPU stack too. */
-  if (strlen(text) > 65536) {
+  if (text && strlen(text) > 65536) {
     sgl_xfree(prompt_copy);
     sgl_xfree(feats);
     respond_error(fd, 503, "prompt too long (>64KB)");
@@ -536,11 +1080,15 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     ids[i] = is_stream
         ? sgl_sched_submit_stream_lora(srv->sched, text, max_new, &spi, lor)
         : feats ? sgl_sched_submit_img(srv->sched, text, max_new, &spi, feats, n_img_tok)
+        : gram ? sgl_sched_submit_grammar(srv->sched, text, max_new, &spi, lor, gram)
+        : n_prompt_ids > 0 ? sgl_sched_submit_ids(srv->sched, prompt_ids, n_prompt_ids, max_new, &spi, lor)
                 : sgl_sched_submit_lora(srv->sched, text, max_new, &spi, lor);
+    if (gram) gram = NULL; /* 所有权已转给调度器 */
     if (feats) feats = NULL; /* 所有权已转给调度器（失败时 submit_img 自己回收）*/
     if (ids[i] < 0) break;
   }
   pthread_mutex_unlock(&srv->lock);
+  sgl_xfree(prompt_ids);
   if (ids[0] < 0) {
     sgl_xfree(prompt_copy);
     respond_error(fd, 500, "submit failed (pool exhausted?)");
@@ -632,9 +1180,85 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
       char ib[16];
       snprintf(ib, sizeof(ib), "%d", i);
       sb_puts(&b, ib);
-      sb_puts(&b, ",\"message\":{\"role\":\"assistant\",\"content\":");
-      sb_putjson(&b, ds[i]->text ? ds[i]->text : "");
-      sb_puts(&b, hit_stop[i] ? "},\"finish_reason\":\"stop\"}" : "},\"finish_reason\":\"length\"}");
+      sb_puts(&b, ",\"message\":{\"role\":\"assistant\"");
+      /* P2: reasoning 分离（DeepSeek-R1 / Qwen3），正文里如果有 <tool_call> 就解成 tool_calls */
+      {
+        char *rtext = NULL;
+        const char *body = NULL;
+        int had_reason = sgl_parse_reasoning(ds[i]->text ? ds[i]->text : "", &rtext, &body, NULL);
+        int n_calls = 0;
+        char *calls = sgl_parse_tool_calls(body ? body : "", &n_calls);
+        const char *visible = body ? body : "";
+        if (n_calls > 0) {
+          /* 去掉 <tool_call> 段，只留前面的叙述文字（OpenAI 的行为）*/
+          const char *p = strstr(visible, "<tool_call>");
+          size_t keep = p ? (size_t)(p - visible) : strlen(visible);
+          char *trimmed = (char *)sgl_xmalloc(keep + 1);
+          memcpy(trimmed, visible, keep);
+          trimmed[keep] = 0;
+          sb_puts(&b, ",\"content\":");
+          sb_putjson(&b, trimmed[0] ? trimmed : "");
+          sgl_xfree(trimmed);
+        } else {
+          sb_puts(&b, ",\"content\":");
+          sb_putjson(&b, visible);
+        }
+        if (had_reason && rtext) {
+          sb_puts(&b, ",\"reasoning_content\":");
+          sb_putjson(&b, rtext);
+        }
+        if (n_calls > 0) {
+          /* OpenAI tool_calls 形状：id/type/function{name,arguments}；这里把解析出的
+           * JSON 对象原样作为 function.arguments（它对模型输出是权威形式）。*/
+          sb_puts(&b, ",\"tool_calls\":[");
+          sgl_json *arr = sgl_json_parse(calls, strlen(calls));
+          int nc = (arr && arr->type == SGL_JSON_ARRAY) ? arr->count : 0;
+          for (int k = 0; k < nc; k++) {
+            const sgl_json *o = arr->items[k];
+            const char *nm = o->type == SGL_JSON_OBJECT ? sgl_json_get_str(o, "name", "") : "";
+            const sgl_json *args = o->type == SGL_JSON_OBJECT ? sgl_json_get(o, "arguments") : NULL;
+            if (k) sb_puts(&b, ",");
+            char th[160];
+            snprintf(th, sizeof(th),
+                     "{\"id\":\"call_%d_%d\",\"type\":\"function\",\"function\":{\"name\":", i, k);
+            sb_puts(&b, th);
+            sb_putjson(&b, nm);
+            sb_puts(&b, ",\"arguments\":");
+            if (args) {
+              sbuf ab;
+              sb_init(&ab);
+              dump_json(&ab, args);
+              sb_putjson(&b, ab.buf ? ab.buf : "{}");
+              sgl_xfree(ab.buf);
+            } else {
+              sb_putjson(&b, "{}");
+            }
+            sb_puts(&b, "}}");
+          }
+          if (arr) sgl_json_free(arr);
+          sb_puts(&b, "]");
+        }
+        sgl_xfree(calls);
+        sgl_xfree(rtext);
+        /* finish_reason 统一由下面（logprobs 之后）输出；有 tool_call 时要报 tool_calls */
+        if (n_calls > 0) hit_stop[i] = 2;
+        sb_puts(&b, "}");
+      }
+    choice_done:;
+      /* P0-3: logprobs（OpenAI chat 格式：choices[].logprobs.content[]）*/
+      if (want_lp && ds[i]->lp && ds[i]->n_lp > 0) {
+        sb_puts(&b, ",\"logprobs\":{\"content\":[");
+        for (int k = 0; k < ds[i]->n_lp; k++) {
+          if (k) sb_puts(&b, ",");
+          char t2[160];
+          snprintf(t2, sizeof(t2), "{\"token\":\"\",\"logprob\":%.6f}", (double)ds[i]->lp[k]);
+          sb_puts(&b, t2);
+        }
+        sb_puts(&b, "]}");
+      }
+      sb_puts(&b, hit_stop[i] == 2 ? ",\"finish_reason\":\"tool_calls\"}"
+                                   : hit_stop[i] ? ",\"finish_reason\":\"stop\"}"
+                                                : ",\"finish_reason\":\"length\"}");
     }
     char tail[160];
     snprintf(tail, sizeof(tail), "],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
@@ -647,14 +1271,28 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     pthread_mutex_unlock(&srv->lock);
     snprintf(idbuf, sizeof(idbuf), "cmpl-%ld", seq);
     char head[192];
-    snprintf(head, sizeof(head), "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":\"sglang-c-gpt2\",\"choices\":[", idbuf, created);
+    snprintf(head, sizeof(head),
+             "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":\"%s\",\"choices\":[",
+             idbuf, created, srv->model_name[0] ? srv->model_name : "sglang-c");
     sb_puts(&b, head);
     for (int i = 0; i < n_done; i++) {
       if (i) sb_puts(&b, ",");
       sb_puts(&b, "{\"text\":");
       sb_putjson(&b, ds[i]->text ? ds[i]->text : "");
       char ct[96];
-      snprintf(ct, sizeof(ct), ",\"index\":%d,\"finish_reason\":\"%s\"}", i, hit_stop[i] ? "stop" : "length");
+      snprintf(ct, sizeof(ct), ",\"index\":%d", i);
+      sb_puts(&b, ct);
+      if (want_lp && ds[i]->lp && ds[i]->n_lp > 0) {
+        /* P0-3: OpenAI completions 的 logprobs（token_logprobs 数组）*/
+        sb_puts(&b, ",\"logprobs\":{\"tokens\":[],\"token_logprobs\":[");
+        for (int k = 0; k < ds[i]->n_lp; k++) {
+          char t2[48];
+          snprintf(t2, sizeof(t2), "%s%.6f", k ? "," : "", (double)ds[i]->lp[k]);
+          sb_puts(&b, t2);
+        }
+        sb_puts(&b, "]}");
+      }
+      snprintf(ct, sizeof(ct), ",\"finish_reason\":\"%s\"}", hit_stop[i] ? "stop" : "length");
       sb_puts(&b, ct);
     }
     char tail[192];
@@ -677,6 +1315,7 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
   for (int i = 0; i < n_done; i++) {
     sgl_xfree(ds[i]->text);
     sgl_xfree(ds[i]->ids);
+    sgl_xfree(ds[i]->lp);
     sgl_xfree(ds[i]);
   }
 }

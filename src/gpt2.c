@@ -63,11 +63,12 @@ sgl_gpt2 *sgl_gpt2_load(const char *model_dir) {
   SGL_INFO("GPT-2 config: L=%d H=%d E=%d ctx=%d vocab=%d eps=%g",
            m->n_layer, m->n_head, m->n_embd, m->n_ctx, m->vocab, m->ln_eps);
 
-  /* 打开权重（model.safetensors 或 model.safetensors.index 不支持则报错）*/
-  char *wpath = path_join(model_dir, "model.safetensors");
-  m->st = sgl_st_open(wpath);
-  sgl_xfree(wpath);
-  if (!m->st) { sgl_gpt2_free(m); return NULL; }
+  /* 打开权重：model.safetensors / model.safetensors.index.json（多分片）*/
+  m->st = sgl_st_open_dir(model_dir);
+  if (!m->st) {
+    sgl_gpt2_free(m);
+    return NULL;
+  }
 
   int64_t vocab2 = m->vocab, ctx2 = m->n_ctx, e = m->n_embd;
   int64_t e3 = 3 * e, e4 = 4 * e;

@@ -46,6 +46,27 @@ void sgl_rmsnorm_p1(const float *x, const float *weight, float *y, int M, int N,
  * qk[n, D] 行主序，in-place 安全。 */
 void sgl_rope_inplace(float *qk, int n, int head_dim, int pos0, double theta);
 
+/* P1: YaRN（HF modeling_rope_utils._compute_yarn_parameters）的逆频率表。
+ *   out[i] = inv_freq[i]（i = 0..dim/2-1），写 dim/2 个数；返回实际写多少个。
+ *   truncate = HF 的 rope_parameters.truncate（默认 1）。
+ * 公式：
+ *   inv_extrap = base^(-2i/dim)，inv_interp = inv_extrap / factor
+ *   low/high = find_correction_range(beta_fast, beta_slow, …)（对应“已训上下文”的
+ *   波长边界），ramp = clamp((i - low)/(high - low), 0, 1)
+ *   out = inv_interp * ramp + inv_extrap * (1 - ramp) */
+int sgl_rope_yarn_invf(double *out, int dim, double base, double factor, double beta_fast,
+                       double beta_slow, double orig_max_pos, int truncate);
+
+/* P1: YaRN 的 attention factor（mscale），HF 同样是 attention_factor 乘到 cos/sin 上。
+ *   mscale/mscale_all_dim 都为 0 时只按 factor 算；否则返回
+ *   get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)。 */
+double sgl_rope_yarn_attention_factor(double factor, double mscale, double mscale_all_dim);
+
+/* P1: YaRN 的 get_mscale(factor, mscale) = 0.1*mscale*ln(factor)+1（factor<=1 → 1）。
+ * DeepSeek 系用它：softmax_scale *= mscale²（mscale 用 mscale_all_dim，同 HF
+ * DeepseekV2Attention.scaling / 官方 inference 代码），而不是乘到 cos/sin 上。*/
+double sgl_rope_yarn_get_mscale(double factor, double mscale);
+
 /* embedding 查表：out[n,d] = table[ids[i], :] */
 void sgl_embedding_get(const float *table, const int *ids, int n, int d,
                        float *out);

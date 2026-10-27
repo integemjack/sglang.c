@@ -583,6 +583,43 @@ int *sgl_tokenizer_encode(const sgl_tokenizer *t, const char *text, size_t len,
   return ids;
 }
 
+int sgl_tokenizer_piece_bytes(const sgl_tokenizer *t, int id, char *buf, int cap) {
+  if (!t || !buf || cap <= 1) return 0;
+  if (id < 0 || id >= t->vocab_size) return 0;
+  const char *tok = t->id2tok ? t->id2tok[id] : NULL;
+  if (!tok) return 0;
+  int len = 0;
+  if (t->style == 1) {
+    if (tok[0] == '<' && tok[1] == '0' && tok[2] == 'x' && strlen(tok) == 6) {
+      buf[len++] = (char)strtol(tok + 3, NULL, 16);
+      buf[len] = 0;
+      return len;
+    }
+    const unsigned char *p = (const unsigned char *)tok;
+    while (*p && len + 2 < cap) {
+      if (p[0] == 0xE2 && p[1] == 0x96 && p[2] == 0x81) { /* ▁ → 空格 */
+        buf[len++] = ' ';
+        p += 3;
+      } else {
+        buf[len++] = (char)*p++;
+      }
+    }
+    buf[len] = 0;
+    return len;
+  }
+  const unsigned char *p = (const unsigned char *)tok;
+  while (*p && len + 2 < cap) {
+    int w;
+    unsigned cp = utf8_next(p, 4, &w);
+    int byte = (cp < 512) ? t->cp_to_byte[cp] : -1;
+    if (byte < 0) byte = '?';
+    buf[len++] = (char)byte;
+    p += w;
+  }
+  buf[len] = 0;
+  return len;
+}
+
 char *sgl_tokenizer_decode(const sgl_tokenizer *t, const int *ids, int n) {
   if (t->style == 1) {
     /* Llama：token 字符串原样输出，"▁"→空格，"<0xXX>"→字节 */

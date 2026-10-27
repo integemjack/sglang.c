@@ -1,4 +1,4 @@
-﻿/* test_http.c — HTTP 服务端到端测试（进程内起服务 + winsock 客户端）
+/* test_http.c — HTTP 服务端到端测试（进程内起服务 + winsock 客户端）
  * 验证：
  *   1. GET /health
  *   2. POST /generate（greedy，与已验证的参考续写精确比对）
@@ -273,6 +273,91 @@ int main(int argc, char **argv) {
     sgl_xfree(req);
     CHECK(status == 400, "400 got %d", status);
     sgl_xfree(resp);
+  }
+
+  /* 9. P1 新增端点：/v1/models、/get_server_info、/metrics、/flush_cache、
+   *    /update_weights_from_disk、/abort_request、/ready */
+  resp = http_raw("GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                  strlen("GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), &status);
+  CHECK(resp && status == 200 && strstr(resp, "\"object\":\"model\""), "/v1/models: %d", status);
+  sgl_xfree(resp);
+
+  resp = http_raw("GET /get_server_info HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                  strlen("GET /get_server_info HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+                  &status);
+  CHECK(resp && status == 200 && strstr(resp, "\"pool_pages\""), "/get_server_info: %d", status);
+  sgl_xfree(resp);
+
+  resp = http_raw("GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                  strlen("GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), &status);
+  CHECK(resp && status == 200 && strstr(resp, "sgl_decode_tokens_total"), "/metrics: %d", status);
+  sgl_xfree(resp);
+
+  resp = http_raw("GET /ready HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                  strlen("GET /ready HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), &status);
+  CHECK(resp && status == 200, "/ready: %d", status);
+  sgl_xfree(resp);
+
+  {
+    size_t rl;
+    char *req = build_post("/flush_cache", "{}", &rl);
+    resp = http_raw(req, rl, &status);
+    sgl_xfree(req);
+    CHECK(resp && status == 200, "/flush_cache: %d", status);
+    sgl_xfree(resp);
+  }
+
+  {
+    /* 热更新同一目录后仍能正常生成（且结果不变）*/
+    size_t rl;
+    char body[1200];
+    snprintf(body, sizeof(body), "{\"model_path\":\"%s\"}", dir);
+    char *req = build_post("/update_weights_from_disk", body, &rl);
+    resp = http_raw(req, rl, &status);
+    sgl_xfree(req);
+    CHECK(resp && status == 200, "/update_weights_from_disk: %d", status);
+    sgl_xfree(resp);
+    gen_job c = { "The meaning of life is", 8, REF_A, 0 };
+    gen_thread(&c);
+    CHECK(c.ok, "热更新后 /generate 结果与参考不一致");
+  }
+
+  {
+    size_t rl;
+    char *req = build_post("/abort_request", "{\"rid\":999999}", &rl);
+    resp = http_raw(req, rl, &status);
+    sgl_xfree(req);
+    CHECK(status == 404, "abort_request 未知 rid 应 404，got %d", status);
+    sgl_xfree(resp);
+  }
+
+  /* 10. P1 约束解码：response_format=json_schema 下输出必须是合法 JSON */
+  {
+    size_t rl;
+    char *req = build_post(
+        "/v1/chat/completions",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":24,"
+        "\"temperature\":0,\"response_format\":{\"type\":\"json_schema\",\"json_schema\":"
+        "{\"name\":\"p\",\"schema\":{\"type\":\"object\",\"properties\":{\"a\":"
+        "{\"type\":\"integer\"}},\"required\":[\"a\"],\"additionalProperties\":false}}}}",
+        &rl);
+    resp = http_raw(req, rl, &status);
+    sgl_xfree(req);
+    CHECK(resp && status == 200, "grammar chat status=%d", status);
+    if (resp) {
+      sgl_json *r = sgl_json_parse(resp, strlen(resp));
+      const sgl_json *ch = r ? sgl_json_get(r, "choices") : NULL;
+      const sgl_json *msg = ch && ch->count ? sgl_json_get(ch->items[0], "message") : NULL;
+      const char *txt = msg ? sgl_json_get_str(msg, "content", "") : "";
+      sgl_json *cj = sgl_json_parse(txt, strlen(txt));
+      CHECK(cj != NULL, "约束输出不是合法 JSON: [%s]", txt);
+      if (cj) {
+        CHECK(sgl_json_get(cj, "a") != NULL, "约束输出缺少字段 a: [%s]", txt);
+        sgl_json_free(cj);
+      }
+      if (r) sgl_json_free(r);
+      sgl_xfree(resp);
+    }
   }
 
   sgl_http_stop(srv);

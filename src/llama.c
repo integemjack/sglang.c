@@ -182,13 +182,34 @@ sgl_llama *sgl_llama_load(const char *dir) {
   /* ---- G9: gemma hidden_softcap / rope_scaling / layer_types / qwen3-next linear dims ---- */
   m->emb_softcap = (float)sgl_json_get_num(cfg, "hidden_softcap", 0.0);
   m->rope_pos_scale = 1.0;
+  m->rope_attn_factor = 1.0; /* P1: 非 yarn 时乘 1 */
   {
+    /* P1: 新/旧两种键名都要认：transformers 5.x 的 save_pretrained 写的是
+     * `rope_parameters`（已归一化），旧模型/手写 config 写的是 `rope_scaling`。*/
     const sgl_json *rs = sgl_json_get(cfg, "rope_scaling");
+    if (!rs || rs->type != SGL_JSON_OBJECT) rs = sgl_json_get(cfg, "rope_parameters");
     const char *rtype = rs ? sgl_json_get_str(rs, "rope_type", "default") : "default";
     double factor = rs ? sgl_json_get_num(rs, "factor", 1.0) : 1.0;
     double global_base = rs ? sgl_json_get_num(rs, "global_base_freq", 0.0) : 0.0;
     double local_base = sgl_json_get_num(cfg, "rope_local_base_freq", 0.0);
     if (factor <= 0.0) factor = 1.0;
+    /* P1: YaRN（Llama-3.x / Qwen2.5 长上下文权重的 rope_type=yarn）：
+     * 逐层逆频率表改用 sgl_rope_yarn_invf()，并把 attention_factor 乘到 cos/sin 上。
+     * 频率表与 attention factor 均对 transformers 的 _compute_yarn_parameters 验过。*/
+    int yarn = !strcmp(rtype, "yarn");
+    if (yarn) {
+      m->rope_attn_factor =
+          sgl_rope_yarn_attention_factor(factor, rs ? sgl_json_get_num(rs, "mscale", 0) : 0,
+                                         rs ? sgl_json_get_num(rs, "mscale_all_dim", 0) : 0);
+      m->yarn_beta_fast = rs ? sgl_json_get_num(rs, "beta_fast", 32.0) : 32.0;
+      m->yarn_beta_slow = rs ? sgl_json_get_num(rs, "beta_slow", 1.0) : 1.0;
+      m->yarn_factor = factor;
+      double orig = rs ? sgl_json_get_num(rs, "original_max_position_embeddings", 0.0) : 0.0;
+      m->yarn_orig = orig > 0 ? orig : (double)m->n_ctx;
+      SGL_INFO("rope_type=yarn factor=%g orig=%g beta=%.0f/%.0f attention_factor=%.6f",
+               m->yarn_factor, m->yarn_orig, m->yarn_beta_fast, m->yarn_beta_slow,
+               (double)m->rope_attn_factor);
+    }
     /* layer_types：按字符串判类型；不认识的字符串宽松忽略（按 full_attention）*/
     const sgl_json *lt = sgl_json_get(cfg, "layer_types");
     /* G13: 真实 Qwen3-Next config 没有 layer_types，而是 full_attention_interval
@@ -297,12 +318,19 @@ sgl_llama *sgl_llama_load(const char *dir) {
         base *= pow(factor, (double)m->head_dim / (double)(m->head_dim - 2));
       for (int i = 0; i < half; i++)
         m->layer_invf[(size_t)l * half + i] = pow(base, -(double)(2 * i) / (double)m->head_dim);
+      /* P1: YaRN——整张逆频率表覆盖（attention_factor 已在 rope_layer 里乘上）*/
+      if (yarn)
+        sgl_rope_yarn_invf(m->layer_invf + (size_t)l * half, m->head_dim, base, m->yarn_factor,
+                           m->yarn_beta_fast, m->yarn_beta_slow, m->yarn_orig, 1);
       /* G13 partial rotary：旋转维数 rot_dim，逆频率分母用 rot_dim（同 HF：
        * inv_freq = 1/(base ** (arange(0,dim,2)/dim))，dim = head_dim*factor）*/
       if (m->rot_dim > 0) {
         int hr = m->rot_dim / 2;
         for (int i = 0; i < hr; i++)
           m->rot_invf[(size_t)l * hr + i] = pow(base, -(double)(2 * i) / (double)m->rot_dim);
+        if (yarn)
+          sgl_rope_yarn_invf(m->rot_invf + (size_t)l * hr, m->rot_dim, base, m->yarn_factor,
+                             m->yarn_beta_fast, m->yarn_beta_slow, m->yarn_orig, 1);
       }
       /* 无 layer_types：全局 sliding_window 对所有层生效（mistral 旧行为）；
        * 有 layer_types：仅 sliding_attention 层开窗 */
@@ -320,10 +348,11 @@ sgl_llama *sgl_llama_load(const char *dir) {
            m->n_layer, m->n_head, m->n_kv_head, m->n_embd, m->n_inter, m->head_dim,
            m->n_ctx, m->vocab, m->rms_eps, m->rope_theta, m->tie_embeddings);
 
-  char *wpath = path_join_(dir, "model.safetensors");
-  m->st = sgl_st_open(wpath);
-  sgl_xfree(wpath);
-  if (!m->st) { sgl_llama_free(m); return NULL; }
+  m->st = sgl_st_open_dir(dir); /* P0-1: 支持 model.safetensors.index.json 多分片 */
+  if (!m->st) {
+    sgl_llama_free(m);
+    return NULL;
+  }
 
   int64_t E = m->n_embd, K = m->kv_dim, I = m->n_inter, V = m->vocab;
   int64_t QD = (int64_t)m->n_head * m->head_dim; /* q/o width: E unless explicit head_dim (qwen3: 2048) */
@@ -701,11 +730,13 @@ static void rmsn(const sgl_llama *m, const float *x, const float *w, float *y,
 static void rope_layer(const sgl_llama *m, int l, float *qk, int n_heads, int D, double pos) {
   int half = D / 2;
   const double *invf = m->layer_invf + (size_t)l * (size_t)half;
+  /* P1: YaRN 的 attention_factor 乘在 cos/sin 上（HF 同做法）*/
+  const double sc = m->rope_attn_factor;
   for (int h = 0; h < n_heads; h++) {
     float *head = qk + (size_t)h * D;
     for (int i = 0; i < half; i++) {
       double ang = pos * invf[i];
-      float c = (float)cos(ang), s = (float)sin(ang);
+      float c = (float)(cos(ang) * sc), s = (float)(sin(ang) * sc);
       float a = head[i], b = head[i + half];
       head[i] = a * c - b * s;
       head[i + half] = a * s + b * c;

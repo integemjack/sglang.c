@@ -28,3 +28,7 @@ models/llava-mlp/
 models/qwen3-06/
 models/tiny-llama-hf/
 *.npy
+
+# Python 缓存
+__pycache__/
+*.pyc

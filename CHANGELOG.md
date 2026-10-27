@@ -2,6 +2,52 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — YaRN / 交错 RoPE / 对 HF 逐位对齐（2026-10-27 第二轮）
+
+起点是给 DeepSeek 后端找金标准：用 transformers 5.20 自己的 `DeepseekV2ForCausalLM`
+与 `LlamaForCausalLM` 生成小模型和参考 logits 对打，查出两个**真 bug** 和一个缺口：
+
+- **修：DeepSeek 的 RoPE 配对搞反了**（真 bug）。DeepSeek 官方 / HF 的 `apply_rotary_emb` 用的是
+  **交错**配对 `(2i, 2i+1)`（`view_as_complex` × `freqs_cis`），而之前默认走的是非交错
+  `rotate_half` `(i, i+dim/2)`。旧测试模型的注意力分数接近均匀、对 RoPE 不敏感，所以一直没被测出来。
+  修后与 HF 对打：plain 配置 logits max|d| **2.5e-07**、YaRN 配置 **3.0e-07**（`test_deepseek_hf`）。
+  老的 `rope_interleave:false` 仍可显式指定（兼容旧测试模型）。
+- **修：DeepSeek 的 mscale 位置错了**（真 bug）。HF / 官方代码是 `softmax_scale *= mscale²`，
+  `mscale = 0.1*mscale_all_dim*ln(factor)+1`；不是乘到 cos/sin 上（那是 llama 系的做法）。
+- **新增 YaRN RoPE**（llama + deepseek）：`sgl_rope_yarn_invf()` 逐行对应 HF
+  `modeling_rope_utils._compute_yarn_parameters`（含 `find_correction_range` / 线性 ramp / truncate），
+  `sgl_rope_yarn_attention_factor()` / `sgl_rope_yarn_get_mscale()` 对应 HF 的 attention scaling。
+  逆频率表与服务端 6 组配置比对 max rel **1.5e-07**（`test_yarn`）；llama 整模型对 `LlamaForCausalLM`
+  logits max|d| **1.5e-07**（`test_llama_yarn`，含 mscale=1/0.5 的非 1 attention_factor 用例）。
+- **新增：`rope_parameters` 新键**（transformers 5.x 的 `save_pretrained` 不再写 `rope_scaling`），
+  llama/deepseek 两边都优先读 `rope_scaling`、回退 `rope_parameters`。
+- **新增测试与生成器**：`tests/gen_hf_deepseek.py`（HF DeepSeek 金标准：plain / yarn / 分组路由）、
+  `tests/gen_hf_llama_yarn.py`（HF Llama + YaRN，两种 attention_factor）、
+  `tests/gen_yarn_ref.py`（直接用 HF 的内部函数导出频率表）、`test_yarn` / `test_llama_yarn` / `test_deepseek_hf`；
+  `gen_random_deepseek.py` 加 `--yarn`（numpy 参考直接用 HF 算出来的频率表，避免“参考和被测抄同一份错”）。
+- 此时全量 **39 个测试全绿**（CPU/MinGW），MSVC+CUDA 构建同样通过。
+
+## [Unreleased] — 对齐上游 sglang：P0/P1/P2 差距补齐（2026-10-27）
+
+以 `docs/GAP_vs_upstream.md` 的差距清单为准，本轮把其中属于「能用起来」的部分实现并验证（CPU 侧 33/33 测试全绿，`src`+`include`+`apps` 从 11,440 行到 15,519 行）：
+
+- **P0-1 分片权重**：`sgl_st_open_dir()` 按 `model.safetensors.index.json` 的 `weight_map` 跨分片取张量（最多 128 片），`sgl_st_open()` 单文件语义不变；`test_st_index` 自造两片+索引，逐元素校验。
+- **P0-2 Jinja chat template**：新增 `src/jinja.c`（约 1800 行）—— 词法/表达式/语句（`{% if/for/set/namespace/elif/else/endif/endfor %}`、`{{- -}}` 空白控制）、过滤器（`length/lower/upper/strip/tojson/join/first/last/default/selectattr/map/int/string/replace/split/list/items`…）、方法（`startswith/split/strip/rstrip/lstrip/replace/lower/upper/join/index`）、切片、`is defined/none/string/false/mapping/iterable`、`loop.*`。`tokenizer_config.json` 里 `chat_template` 生效，`tools` 与 `chat_template_kwargs` 原样喂给模板；无模板时退回内置 ChatML。`test_jinja` 与 Python jinja2 3.1.6 的渲染结果**逐字节**比对（Qwen2.5 / Qwen3 / TinyLlama 三份真实模板 + 内联用例）。
+- **P0-3 采样面补齐**：`min_p`、`repetition_penalty`、`frequency_penalty`、`presence_penalty`、`ignore_eos`、`stop_token_ids`、`logprobs`/`top_logprobs`；`prompt`/`input_ids` 可直接是 token 数组（`sgl_sched_submit_ids`）。
+- **P0-4 chunked prefill + 抢占**：prefill 按 `SGL_PREFILL_CHUNK`（默认 512 token）切片，长 prompt 不再堵住整批 decode；KV 池不足时抢占「生成最少」的运行中请求并重算（`n_preempt` 计入统计）。
+- **P1 约束解码**：新增 `src/grammar.c`（JSON Schema + 正则 → 字节级自动机，token 级掩码）。`response_format: {"type":"json_schema"|"json_object"|"regex"}`；`test_grammar` 213 条断言（合法串全接受、非法串在最深字节被拒、增量喂字节、enum 同首字节并集）。
+- **P1 FP8 权重**：safetensors 支持 `F8_E4M3` / `F8_E5M2`，加载时解成 f32（`test_fp8` 覆盖 subnormal/最大值/NaN 共 15 个位模式）。
+- **P1 服务面**：`GET /ready /v1/models /get_server_info /metrics`（Prometheus 文本）、`POST /flush_cache /abort_request`；`/health` 带上运行/等待/吞吐字段。
+- **P2 embedding/rerank**：新增 BERT/RoBERTa 编码器（`src/bert.c` + `src/wordpiece.c`，WordPiece + mean/CLS pooling + cross-encoder 头），`--embedding-model DIR` 打开 `POST /v1/embeddings`、`/v1/rerank`；真实权重 `all-MiniLM-L6-v2` 对 transformers 参考 maxerr 1.3e-07。
+- **P2 输出解析**：新增 `src/parser.c`——reasoning 分离（DeepSeek-R1 的 `思考和`、Qwen3 的 `<|end_of_thinking|>`）与 `<tool_call>` 提取，`/v1/chat/completions` 输出 `reasoning_content` 与 OpenAI 形状的 `tool_calls`（`finish_reason: tool_calls`）。
+- **P1 数据并行副本**：`--dp N` 再加载 N-1 份完整模型（各自独立 KV 池 + RadixCache），请求按「运行中请求数最少」路由；`/get_server_info` 报 `dp_replicas`，池容量/空闲页按副本累加。`test_dp` 验三副本容量累加 + 6 并发请求全部完成且贪心输出一致。
+- **P1 权重热更新**：`POST /update_weights_from_disk {"model_path":"...","instance":-1}` → `sgl_sched_reload_weights`；实例有在飞请求时返 409（不丢请求），成功后 KV 池与 RadixCache 一并换新。`test_reload` 验重载后输出不变、越界/坏目录不影响原模型、在飞时拒绕。
+- **P2 `/v1/score`**：两段文本的 embedding 余弦相似度（同 `--embedding-model`）。
+- **`test_http` 扩测**：新增 9 个断言覆盖 `/v1/models` `/get_server_info` `/metrics` `/ready` `/flush_cache` `/update_weights_from_disk` `/abort_request`（404 语义）与约束解码的 JSON 合法性。
+- **P0-6 DeepSeek-V2/V3 完整模型后端**：新增 `src/deepseek.c`（约 900 行）+ `include/sgl/deepseek.h`，已接进 `sgl_model_load`（`kind=2`，`sgl_deepseek_detect()` 先认 `kv_lora_rank`+`qk_nope_head_dim` / `model_type`）：embed → L×（Pre-Norm MLA + dense SwiGLU / MoE）→ final norm → lm_head；MoE 支持 V2 的 softmax+greedy 与 V3 的 sigmoid+group_limited_greedy+`e_score_correction_bias`+`routed_scaling_factor`、共享专家、三维融合专家布局（`experts.gate_up_proj/down_proj`）与逐专家布局、`norm_topk_prob`、`rope_interleave`；分页 KV 池与 gpt2/llama 同语义（行宽只有 `kv_lora+qk_rope`）。`test_deepseek` 在 5 个随机小配置上对 float64 numpy 参考：prefill 1.2e-06、压缩 KV 1.1e-07、增量/分块/decode_batch 一致；`sglc --model <deepseek 目录> --serve` 端到端可跑（配合 `tests/gen_ds_tokenizer.py` 给随机模型补最小词表）。
+- **修掉的问题**：`/v1/completions` 响应体里的 `model` 字段写死成 `sglang-c-gpt2`（现按实际模型目录名）；约束解码中「有 `required` 但未写 `additionalProperties`」的 schema 原先静默不强制 required（现在按严格模式处理，与 `additionalProperties:false` 同义）；`sgl_jinja_render` 的返回缓冲原先用 `malloc`，调用方却用 `sgl_xfree`（Windows 上是 `_aligned_free`）—— 堆损坏，`/v1/chat/completions` 拿到 200 之后进程崩（0xC0000374），现统一走 `sgl_xmalloc`。
+- **P0-5 DeepSeek MLA 注意力**：新增 `src/mla.c` —— 吸收式（W_UK/W_UV absorbed）MLA，解耦 RoPE（HF 的非交错 rotate_half，只打在 q/k 的 rope 部分），KV cache 每位置只存 `kv_lora_rank + qk_rope_head_dim` 个数。对 numpy 参考：prefill max rel 1.2e-05、KV cache 2.7e-05，全序列 / 逐 token / 分块 / 半段 prefill+decode 四条路径结果完全一致；`test_mla` 同时跑 `q_lora_rank=null` 变体（变异测试验过断言非空转：改 softmax scale 或改用交错 RoPE 都会 FAIL）。尚未接进 `sgl_model_load` 的模型分发（还差 MoE/共享专家/lm_head/`rope_scaling`-yarn）。
+
 ## [Unreleased] — 单可执行文件：`sglc` 自带 CPU/GPU 双引擎与 HTTP 服务
 
 - **`sglc --serve` 在所有构建里可用（含 Windows/MSVC）**：`src/http.c` 原来依赖 MinGW 的

@@ -16,6 +16,10 @@
 
 #include "sgl/scheduler.h"
 
+typedef struct sgl_bert sgl_bert; /* P2: embedding/rerank 模型（sgl/bert.h）*/
+
+#include "sgl/jinja.h"
+
 typedef struct sgl_http_server sgl_http_server;
 
 /* 启动服务（acceptor + worker 线程已在跑），失败返回 NULL */
@@ -32,7 +36,15 @@ typedef float *(*sgl_http_vision_fn)(void *ud, const unsigned char *bytes,
                                      size_t n, int *n_img, int *e_lm);
 void sgl_http_set_vision(sgl_http_server *srv, sgl_http_vision_fn fn, void *ud);
 
+/* P0-2: 启用模型自带的 Jinja chat_template（读 <model_dir>/tokenizer_config.json）。
+ * 找不到模板时保持 NULL，/v1/chat/completions 退回内置 ChatML。 */
+void sgl_http_set_chat_template(sgl_http_server *srv, const char *model_dir);
+
 /* 停止并释放（断开监听，等待线程退出）*/
 void sgl_http_stop(sgl_http_server *srv);
 
+typedef struct { int dummy; } sgl_embed_dummy; /* 占位，避免空头文件 */
+
+/* P2: embedding / rerank 模型（NULL = 没加载）*/
+void sgl_http_set_embedding(sgl_http_server *srv, sgl_bert *m);
 #endif

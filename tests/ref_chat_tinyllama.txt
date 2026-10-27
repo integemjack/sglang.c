@@ -1,0 +1,26 @@
+
+
+<|system|>
+You are a helpful assistant.</s>
+
+
+
+
+<|user|>
+What is the capital of France?</s>
+
+
+
+
+<|assistant|>
+Paris.</s>
+
+
+
+
+<|user|>
+And of Japan?</s>
+
+
+<|assistant|>
+

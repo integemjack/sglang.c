@@ -1,4 +1,4 @@
-/* sgl/port.h — 跨平台垫片（MSVC / MinGW / POSIX）
+﻿/* sgl/port.h — 跨平台垫片（MSVC / MinGW / POSIX）
  * Windows 原生 API 保持不变；POSIX 侧把 MSVC/C11-K 风格调用映射到 POSIX 等价物。 */
 #ifndef SGL_PORT_H
 #define SGL_PORT_H

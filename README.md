@@ -156,10 +156,30 @@ needed cross-compilation from an arm64 host plus Rosetta to run the tests, and I
 | **Qwen3-Next (hybrid layers + MoE)** | `srt/models/qwen3_next.py` | ✅ linear attention (gated deltanet) + full layers with q-gating / partial rotary / `(1+w)` RMSNorm / MoE (top-k routing + shared experts + routed scaling); vs float64 numpy **2.5e-08–5.8e-08**; recurrent state keyed per sequence (prefix sharing cannot collide) |
 | **CPU OpenBLAS / AVX2 dot** | backend | ✅ 3.1x on large-M GEMM (195 GFLOPs), optional at runtime, zero hard dependency |
 | SSE streaming | `--stream` | ✅ streamed output strictly identical to non-streamed |
+| **Sharded safetensors** (`model.safetensors.index.json`) | `model_loader/` | ✅ P0-1: `sgl_st_open_dir()` follows `weight_map` across up to 128 shards (byte-exact test in `test_st_index`) |
+| **FP8 weights** (`F8_E4M3` / `F8_E5M2`) | `layers/quantization/fp8` | ✅ P1: dequantized to f32 on load (`test_fp8` checks 15 bit patterns incl. subnormals/max/NaN) |
+| **Jinja chat templates** | HF `apply_chat_template` | ✅ P0-2: Jinja2 subset engine (`src/jinja.c`); byte-identical to Python jinja2 3.1.6 on Qwen2.5 / Qwen3 / TinyLlama templates, incl. `tools` and `namespace`/slice/`is defined` |
+| **Full sampling surface** | `sampling/` | ✅ P0-3: `top_k/top_p/min_p/temperature/seed/ignore_eos/stop_token_ids/repetition·frequency·presence penalty/logprobs`, `prompt`/`input_ids` as token arrays |
+| **Chunked prefill + preemption** | `scheduler.py` | ✅ P0-4: prefill sliced by `SGL_PREFILL_CHUNK` (default 512) so decode is not blocked by long prompts; KV-pool exhaustion preempts the least-progressed request and recomputes it |
+| **Constrained decoding** | `srt/constrained` (xgrammar/outlines) | ✅ P1: JSON Schema + regex → byte-level automaton, token masking during sampling (`src/grammar.c`, `test_grammar` 213 assertions); `response_format: json_schema/json_object/regex` |
+| **Service surface** | `entrypoints/http_server.py` | ✅ P1: `/health` `/ready` `/v1/models` `/get_server_info` `/metrics` (Prometheus) `/flush_cache` `/abort_request` `/v1/embeddings` `/v1/rerank` `/v1/score` `/update_weights_from_disk` |
+| **Data parallel replicas** | `--dp-size` | ✅ P1: `--dp N` loads N full replicas (independent KV pools + radix caches), routes by least-loaded (`test_dp`) |
+| **Weight hot reload** | `/update_weights_from_disk` | ✅ P1: reloads a model dir into an instance (or all base replicas), 409 when the instance has in-flight requests (`test_reload`, plus HTTP coverage) |
+| **Embedding / rerank encoder** | `srt/models/bert.py` | ✅ P2: BERT/RoBERTa (WordPiece + `[CLS]`-pool / mean-pool + cross-encoder head); verified against `all-MiniLM-L6-v2` real weights at 1.3e-07 |
+| **Output parsers** | `srt/parser/` | ✅ P2: reasoning split (DeepSeek-R1 / Qwen3 markers) + `<tool_call>` extraction → OpenAI `tool_calls` / `reasoning_content` |
+| **DeepSeek MLA attention** | `srt/models/deepseek_v2.py` | ✅ P0-5 (kernel): absorbed (W_UK/W_UV) MLA with decoupled RoPE, compressed KV (`kv_lora+qk_rope` per position); vs numpy reference max rel 1.2e-06 (`test_mla`) |
+| **DeepSeek-V2/V3 full backend** | `srt/models/deepseek_v2.py` | ✅ P0-6: end-to-end model (embed → MLA → dense/SwiGLU **MoE with shared experts**, V2 `softmax`+`greedy` and V3 `sigmoid`+`group_limited_greedy`+`e_score_correction_bias`+`routed_scaling_factor`, 3-D fused expert layout) wired into `sgl_model_load` as backend `deepseek`. **Cross-checked against transformers' own `DeepseekV2ForCausalLM`** (not just a hand-written numpy ref): logits 2.5e-07 max abs on a plain config, 3.0e-07 with YaRN; compressed-KV / incremental / chunked paths bit-identical (`test_deepseek_hf`, `test_deepseek` 402 checks) |
+| **YaRN RoPE (+ mscale)** | `modeling_rope_utils._compute_yarn_parameters` | ✅ P1: frequency table matches HF to 1.5e-07 over 6 configs (`test_yarn`). llama path multiplies cos/sin by HF's `attention_factor` and matches `LlamaForCausalLM` logits to 1.5e-07 (`test_llama_yarn`); DeepSeek follows its own convention (`softmax_scale *= mscale²`, mscale from `mscale_all_dim`) and matches HF to 3.0e-07. Reads both `rope_scaling` (old) and `rope_parameters` (transformers 5.x) |
 
-**Not covered:** tensor parallelism; the full LLaVA **7B language model** end to end (CLIP-L/14-336 and
-`mm_projector` were verified against real weights piecewise; the 7B LM was not downloaded due to disk/VRAM);
-GPU-side sliding window; the CUDA path for Qwen3-Next (CPU reference implementation only).
+**Not covered:** tensor parallelism; GPU data parallel (the CPU build's `--dp` replicas are real processes-in-one
+scheduler, each with its own KV pool, but they share one host); the full LLaVA **7B language model** end to end
+(CLIP-L/14-336 and `mm_projector` were verified against real weights piecewise; the 7B LM was not downloaded
+due to disk/VRAM); GPU-side sliding window; the CUDA path for Qwen3-Next and for the new P0/P1 features
+(they are wired into the CPU scheduler); HiCache-style host/disk KV tiering (the CPU build's KV pool *is*
+host memory, so offload has nothing to gain there); W4A16 / GPTQ / AWQ; DeepSeek's grouped-MoE routing is
+validated against the official formula rather than HF (transformers 5.20's `DeepseekV2` router does not
+implement `scoring_func`/`norm_topk_prob`/`e_score_correction_bias`, so it agrees only to ~3e-04 there);
+GGUF / legacy `.bin` checkpoints.
 
 ## Build from source
 
@@ -169,7 +189,7 @@ The quickstart scripts do this for you; for a manual build use:
 # CPU (MinGW-w64 on Windows, or any host C compiler elsewhere)
 cmake -S sglang-c -B sglang-c/build -G Ninja
 cmake --build sglang-c/build
-ctest --test-dir sglang-c/build          # 26 suites (some need real weights under models/)
+ctest --test-dir sglang-c/build          # 39 suites (some need real weights under models/)
 
 # CUDA backend (separate build dir; MSVC + nvcc on Windows)
 cmake -S sglang-c -B sglang-c/build-cuda -G "Visual Studio 17 2022" -A x64 -DSGL_CUDA=ON

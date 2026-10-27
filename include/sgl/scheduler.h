@@ -7,6 +7,7 @@
 #define SGL_SCHEDULER_H
 
 #include <stdint.h>
+#include "sgl/grammar.h"
 
 #include "sgl/bpe.h"
 #include "sgl/gpt2.h"
@@ -23,6 +24,10 @@ typedef struct {
   int  n_running;        /* 当前运行中 */
   int  n_waiting;        /* 当前等待中 */
   int  pool_pages;       /* KV 池总页数 */
+  int  pool_free;        /* KV 池空闲页数 */
+  int  n_replicas;       /* P1 DP：base 副本数（含主副本）*/
+  long n_preempt;        /* 被抢占（重算）的请求次数 */
+  int  prefill_chunk;    /* chunked prefill 的块大小（token）*/
 } sgl_sched_stats;
 
 sgl_scheduler *sgl_sched_new(const char *model_dir, uint64_t seed);
@@ -45,12 +50,26 @@ int sgl_sched_poll(sgl_scheduler *s, int *req_id, char **text, int **ids,
 /* 运行中 + 等待中的请求总数（=0 表示全部做完）*/
 int sgl_sched_nactive(sgl_scheduler *s);
 
+/* P0-4: 中止一个请求（运行中/等待中均可），释放其 KV 页；0 = 成功。 */
+int sgl_sched_abort(sgl_scheduler *s, int req_id);
+
+/* P1: 清空所有实例的 RadixCache（对应 /flush_cache）*/
+void sgl_sched_flush_cache(sgl_scheduler *s);
+
+/* P0-3: 取某个已完成请求每个生成 token 的 logprob（拷贝，调用方 sgl_xfree）。
+ * 需在 poll 之后、请求仍留在调度器里时调用。*/
+int sgl_sched_poll_logprobs(sgl_scheduler *s, int req_id, float **out, int *n);
+
+/* 同 sgl_sched_poll，但额外返回每个生成 token 的 logprob（P0-3）*/
+int sgl_sched_poll_lp(sgl_scheduler *s, int *req_id, char **text, int **ids, int *n_ids,
+                      int *n_prompt, int *n_hit, float **lp_out, int *n_lp);
+
 sgl_sched_stats sgl_sched_get_stats(const sgl_scheduler *s);
 
 /* ---- 流式（SSE 用）---- */
 typedef enum {
   SGL_STREAM_MORE = 0,  /* 运行中，暂无新 token */
-  SGL_STREAM_TOKEN,     /* *piece（malloc，sgl_xfree 释放）/*tok_id 是新 token */
+  SGL_STREAM_TOKEN,     /* *piece（malloc，sgl_xfree 释放），*tok_id 是新 token */
   SGL_STREAM_DONE,      /* 结束（新 token 已在前几次全部交出）*/
 } sgl_stream_ev;
 
@@ -79,6 +98,21 @@ int sgl_sched_add_lora(sgl_scheduler *s, const char *name, const char *model_dir
 int sgl_sched_find_lora(const sgl_scheduler *s, const char *name);
 
 /* 同 submit / submit_stream，但按 lora 名路由实例；未知名返回 -1 */
+/* P0-3: 直接给 token id 提交（不经 tokenizer）*/
+int sgl_sched_submit_ids(sgl_scheduler *s, const int *ids, int n_ids, int max_new,
+                         const sgl_sampling_params *sp, const char *lora);
+
+/* P1: 按 grammar 约束提交（gram 所有权转给调度器；失败时自行释放）*/
+int sgl_sched_submit_grammar(sgl_scheduler *s, const char *text, int max_new,
+                            const sgl_sampling_params *sp, const char *lora, sgl_grammar *gram);
+
+/* P1: 加一份 base 副本（数据并行）*/
+int sgl_sched_add_replica(sgl_scheduler *s, const char *model_dir);
+
+/* P1: 热更新权重（对应 /update_weights_from_disk）：把模型 dir 重新加载到指定实例（-1 = 所有
+ * base 副本）。该实例还有未完成的请求时返回 -2；成功返回 0。KV 池与 Radix 一并换新。*/
+int sgl_sched_reload_weights(sgl_scheduler *s, int inst, const char *model_dir);
+
 int sgl_sched_submit_lora(sgl_scheduler *s, const char *text, int max_new,
                           const sgl_sampling_params *sp, const char *lora);
 int sgl_sched_submit_stream_lora(sgl_scheduler *s, const char *text, int max_new,

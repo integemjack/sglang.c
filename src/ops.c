@@ -1,4 +1,4 @@
-﻿/* sgl ops 实现：OpenMP 并行的 CPU 算子 */
+/* sgl ops 实现：OpenMP 并行的 CPU 算子 */
 #include "sgl/ops.h"
 
 #include <math.h>
@@ -316,6 +316,59 @@ void sgl_rmsnorm_p1(const float *x, const float *weight, float *y, int M, int N,
     float inv = (float)(1.0 / sqrt(ss / N + eps));
     for (int i = 0; i < N; i++) yr[i] = xr[i] * inv * (1.0f + weight[i]);
   }
+}
+
+/* P1: YaRN 逆频率表（逐行对应 HF modeling_rope_utils._compute_yarn_parameters）*/
+#ifndef M_PI
+#define M_PI 3.14159265358979323846 /* MSVC 的 math.h 不定义 */
+#endif
+static double yarn_correction_dim_(double num_rot, int dim, double base, double max_pos) {
+  return (dim * log(max_pos / (num_rot * 2.0 * M_PI))) / (2.0 * log(base));
+}
+
+int sgl_rope_yarn_invf(double *out, int dim, double base, double factor, double beta_fast,
+                       double beta_slow, double orig_max_pos, int truncate) {
+  if (!out || dim < 2 || base <= 0 || factor <= 0 || orig_max_pos <= 0) return 0;
+  int half = dim / 2;
+  double low = yarn_correction_dim_(beta_fast, dim, base, orig_max_pos);
+  double high = yarn_correction_dim_(beta_slow, dim, base, orig_max_pos);
+  if (truncate) {
+    low = floor(low);
+    high = ceil(high);
+  }
+  if (low < 0) low = 0;
+  if (high > dim - 1) high = dim - 1;
+  if (low == high) high += 0.001; /* HF: 防奇点 */
+  for (int i = 0; i < half; i++) {
+    double pos_freq = pow(base, (double)(2 * i) / (double)dim);
+    double inv_extrap = 1.0 / pos_freq;
+    double inv_interp = 1.0 / (factor * pos_freq);
+    double ramp = ((double)i - low) / (high - low);
+    if (ramp < 0) ramp = 0;
+    if (ramp > 1) ramp = 1;
+    out[i] = inv_interp * ramp + inv_extrap * (1.0 - ramp);
+  }
+  return half;
+}
+
+/* P1: YaRN 的 get_mscale（HF yarn_get_mscale，attention scaling 用）*/
+double sgl_rope_yarn_get_mscale(double factor, double mscale) {
+  if (factor <= 1.0) return 1.0;
+  return 0.1 * mscale * log(factor) + 1.0;
+}
+
+double sgl_rope_yarn_attention_factor(double factor, double mscale, double mscale_all_dim) {
+  double f = factor > 0 ? factor : 1.0;
+  double get_mscale = 0.0;
+  if (f <= 1.0) return 1.0;
+  if (mscale > 0 && mscale_all_dim > 0) {
+    double num = 0.1 * mscale * log(f) + 1.0;
+    double den = 0.1 * mscale_all_dim * log(f) + 1.0;
+    get_mscale = num / den;
+  } else {
+    get_mscale = 0.1 * log(f) + 1.0;
+  }
+  return get_mscale;
 }
 
 void sgl_rope_inplace(float *qk, int n, int head_dim, int pos0, double theta) {

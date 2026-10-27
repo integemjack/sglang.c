@@ -50,6 +50,9 @@ typedef struct {
   double *layer_invf;        /* [n_layer][head_dim/2] 每层预计算 rope 逆频率（含 scaling/局部基频）*/
   int *layer_window;         /* [n_layer] 每层 sliding 窗口（0=无）*/
   double rope_pos_scale;     /* rope_type=linear: 1/factor；否则 1.0（角度 = pos*scale*invf）*/
+  /* P1: rope_type=yarn 的参数（逆频率表由 sgl_rope_yarn_invf 逐层生成）*/
+  double yarn_factor, yarn_orig, yarn_beta_fast, yarn_beta_slow;
+  double rope_attn_factor;   /* mscale（YaRN 的 attention_factor，乘到 cos/sin 上；非 yarn 为 1）*/
   float rms_eps;
   double rope_theta;
   int tie_embeddings;
