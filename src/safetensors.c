@@ -1,4 +1,4 @@
-﻿/* sgl safetensors 实现
+/* sgl safetensors 实现
  * 文件格式：<u64 header_len><header JSON><数据区>
  * header: { "tensor": {"dtype":"F32","shape":[..],"data_offsets":[s,e]}, ... }
  *
@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "sgl/alloc.h"
+#include "sgl/gguf.h"
 #include "sgl/json.h"
 #include "sgl/log.h"
 #include "sgl/port.h"
@@ -48,17 +49,39 @@ struct sgl_st_ctx {
   sgl_json *wmap; /* root.weight_map；NULL = 单文件模式 */
   char *dir;
   int from_index;
+  /* GGUF 权重源（目录里只有 .gguf 时）：sgl_st_get 走反量化路径。
+   * 上层 llama/deepseek 不用区分权重格式。*/
+  sgl_gguf *gg;
+  /* GGUF 反量化得到的 f32 缓冲，归 ctx 生命周期（f32 已经是 owned）*/
+  void **gowned;
+  int n_gowned, cap_gowned;
 };
 
-/* IEEE 754 half → float（位运算，无依赖）*/
+/* IEEE 754 half → float（位运算，无依赖）
+ * 次正规项必须归一化：值 = frac * 2^-24，直接 frac<<13 会变成 f32 的
+ * 次正规（~1e-38），差 2^-125 倍。*/ 
 static float f16_to_f32(uint16_t h) {
-  uint32_t sign = (uint32_t)(h >> 15) & 1;
-  uint32_t exp = (uint32_t)(h >> 10) & 0x1F;
-  uint32_t frac = (uint32_t)h & 0x3FF;
+  uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+  int32_t e = (int32_t)((h >> 10) & 0x1F);
+  uint32_t m = (uint32_t)(h & 0x3FFu);
   uint32_t f;
-  if (exp == 0) f = sign << 31 | frac << 13;                     /* 次正规 */
-  else if (exp == 31) f = sign << 31 | 0x7F800000u | frac << 13; /* inf/nan */
-  else f = sign << 31 | (exp - 15 + 127) << 23 | frac << 13;
+  if (e == 0) {
+    if (m == 0) {
+      f = s;
+    } else {
+      e = 1;
+      while (!(m & 0x400u)) {
+        m <<= 1;
+        e--;
+      }
+      m &= 0x3FFu;
+      f = s | ((uint32_t)(e - 15 + 127) << 23) | (m << 13);
+    }
+  } else if (e == 31) {
+    f = s | 0x7F800000u | (m << 13); /* inf/nan */
+  } else {
+    f = s | ((uint32_t)(e - 15 + 127) << 23) | (m << 13);
+  }
   float out;
   memcpy(&out, &f, 4);
   return out;
@@ -234,9 +257,21 @@ static sgl_st_ctx *ctx_new(void) { return (sgl_st_ctx *)sgl_xcalloc(1, sizeof(sg
 static void ctx_free(sgl_st_ctx *c) {
   if (!c) return;
   for (int i = 0; i < c->n_sh; i++) shard_close(&c->sh[i]);
+  for (int i = 0; i < c->n_gowned; i++) sgl_xfree(c->gowned[i]);
+  sgl_xfree(c->gowned);
+  if (c->gg) sgl_gguf_close(c->gg);
   if (c->root) sgl_json_free(c->root);
   sgl_xfree(c->dir);
   sgl_xfree(c);
+}
+
+/* GGUF 反量化缓冲登记（close 时统一释放）*/
+static void ctx_track(sgl_st_ctx *c, void *p) {
+  if (c->n_gowned == c->cap_gowned) {
+    c->cap_gowned = c->cap_gowned ? c->cap_gowned * 2 : 64;
+    c->gowned = (void **)sgl_xrealloc(c->gowned, sizeof(void *) * (size_t)c->cap_gowned);
+  }
+  c->gowned[c->n_gowned++] = p;
 }
 
 static int file_exists_(const char *p) {
@@ -345,7 +380,20 @@ sgl_st_ctx *sgl_st_open_dir(const char *dir) {
     snprintf(p, sizeof(p), "%s/%s", dir, cand[i]);
     if (file_exists_(p)) return sgl_st_open(p);
   }
-  SGL_ERROR("no weights found in %s (need model.safetensors or model.safetensors.index.json)", dir);
+
+  /* 4) 没有 safetensors：退到 GGUF（llama.cpp 的量化格式）*/
+  {
+    sgl_gguf *gg = sgl_gguf_open_dir(dir);
+    if (gg) {
+      sgl_st_ctx *c = ctx_new();
+      c->gg = gg;
+      c->dir = xstrdup_(dir);
+      SGL_INFO("weights: GGUF source in %s", dir);
+      return c;
+    }
+  }
+  SGL_ERROR("no weights found in %s (need *.safetensors, model.safetensors.index.json, or *.gguf)",
+            dir);
   return NULL;
 }
 
@@ -353,7 +401,31 @@ void sgl_st_close(sgl_st_ctx *c) { ctx_free(c); }
 
 sgl_tensor sgl_st_get(sgl_st_ctx *c, const char *name, int expect_ndim,
                       const int64_t *expect_shape) {
-  if (!c || c->n_sh == 0) return sgl_tensor_null();
+  if (!c || (c->n_sh == 0 && !c->gg)) return sgl_tensor_null();
+  /* GGUF 权重源：按 HF 名映射 + 反量化成 f32 */
+  if (c->gg) {
+    int nd = 0;
+    int64_t sh[4] = {1, 1, 1, 1};
+    float *buf = sgl_gguf_get_f32(c->gg, name, &nd, sh);
+    if (!buf) return sgl_tensor_null();
+    if (expect_ndim >= 0) {
+      int bad = expect_ndim != nd;
+      for (int i = 0; !bad && expect_shape && i < nd; i++)
+        if (expect_shape[i] >= 0 && expect_shape[i] != sh[i]) bad = 1;
+      if (bad) {
+        SGL_ERROR("gguf tensor '%s' shape %lldx%lld != expected %d-dim(%lld,%lld)", name,
+                  (long long)sh[0], (long long)sh[1], expect_ndim,
+                  (long long)(expect_shape ? expect_shape[0] : -1),
+                  (long long)(expect_shape && expect_ndim > 1 ? expect_shape[1] : -1));
+        sgl_xfree(buf);
+        return sgl_tensor_null();
+      }
+    }
+    ctx_track(c, buf);
+    /* llama.cpp 的 GGUF 把 q/k_proj 按 head 交错重排了，这里的 forward 是 HF 布局 → 还原 */
+    sgl_gguf_unpermute_qk(c->gg, name, buf, nd, sh);
+    return sgl_tensor_from_data(nd, sh, buf);
+  }
   if (c->wmap) {
     const sgl_json *v = sgl_json_get(c->wmap, name);
     if (!v || v->type != SGL_JSON_STRING || !v->str) {
@@ -373,7 +445,12 @@ sgl_tensor sgl_st_get(sgl_st_ctx *c, const char *name, int expect_ndim,
 }
 
 int sgl_st_names(sgl_st_ctx *c, const char ***names) {
-  if (!c || c->n_sh == 0) {
+  if (!c) {
+    *names = NULL;
+    return 0;
+  }
+  if (c->gg) return sgl_gguf_names(c->gg, names);
+  if (c->n_sh == 0) {
     *names = NULL;
     return 0;
   }
@@ -385,4 +462,7 @@ int sgl_st_names(sgl_st_ctx *c, const char ***names) {
   return c->sh[0].header->count;
 }
 
-int sgl_st_shard_count(const sgl_st_ctx *c) { return c ? c->n_sh : 0; }
+int sgl_st_shard_count(const sgl_st_ctx *c) {
+  if (!c) return 0;
+  return c->gg ? 1 : c->n_sh;
+}

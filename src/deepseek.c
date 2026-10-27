@@ -1,4 +1,4 @@
-﻿/* sgl deepseek 实现：DeepSeek-V2 / V3 系完整前向（MLA + MoE）
+/* sgl deepseek 实现：DeepSeek-V2 / V3 系完整前向（MLA + MoE）
  * 公式照 HF modeling_deepseek_v2.py / modeling_deepseek_v3.py（结构见 sgl/deepseek.h）。
  * 只依赖 sgl/ops.h 的算子 + sgl_xmalloc/sgl_xfree + safetensors。
  *
@@ -24,6 +24,7 @@
 #endif
 
 #include "sgl/alloc.h"
+#include "sgl/gguf.h"
 #include "sgl/json.h"
 #include "sgl/log.h"
 #include "sgl/ops.h"
@@ -84,20 +85,13 @@ static sgl_tensor get_opt_1d_(sgl_st_ctx *st, const char *name, int64_t n) {
 /* ---------------- 模型识别 ---------------- */
 
 int sgl_deepseek_detect(const char *model_dir) {
-  char *cpath = path_join_(model_dir, "config.json");
-  FILE *f = NULL;
-  if (fopen_s(&f, cpath, "rb") != 0 || !f) f = fopen(cpath, "rb");
-  sgl_xfree(cpath);
-  if (!f) return -1;
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (sz <= 0) { fclose(f); return -1; }
-  char *buf = (char *)sgl_xmalloc((size_t)sz + 1);
-  size_t got = fread(buf, 1, (size_t)sz, f);
-  fclose(f);
-  buf[got] = 0;
-  sgl_json *cfg = sgl_json_parse(buf, got);
+  size_t sz = 0;
+  char *buf = sgl_config_read_text(model_dir, &sz);
+  if (!buf || sz == 0) {
+    sgl_xfree(buf);
+    return -1;
+  }
+  sgl_json *cfg = sgl_json_parse(buf, sz);
   sgl_xfree(buf);
   if (!cfg) return -1;
   int yes = 0;
@@ -193,23 +187,14 @@ static int load_moe_(sgl_deepseek *m, int l, sgl_deepseek_layer *L) {
 
 sgl_deepseek *sgl_deepseek_load(const char *dir) {
   if (!dir || !*dir) return NULL;
-  char *cpath = path_join_(dir, "config.json");
-  FILE *f = NULL;
-  if (fopen_s(&f, cpath, "rb") != 0 || !f) f = fopen(cpath, "rb");
-  sgl_xfree(cpath);
-  if (!f) {
-    SGL_ERROR("deepseek: cannot open config.json in %s", dir);
+  size_t sz = 0;
+  char *buf = sgl_config_read_text(dir, &sz);
+  if (!buf || sz == 0) {
+    SGL_ERROR("deepseek: no config.json and no GGUF metadata in %s", dir);
+    sgl_xfree(buf);
     return NULL;
   }
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (sz <= 0) { fclose(f); return NULL; }
-  char *buf = (char *)sgl_xmalloc((size_t)sz + 1);
-  size_t got = fread(buf, 1, (size_t)sz, f);
-  fclose(f);
-  buf[got] = 0;
-  sgl_json *cfg = sgl_json_parse(buf, got);
+  sgl_json *cfg = sgl_json_parse(buf, sz);
   sgl_xfree(buf);
   if (!cfg) return NULL;
 

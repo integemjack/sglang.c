@@ -1,4 +1,4 @@
-﻿/* sgl bpe 实现：GPT-2 字节级 BPE（HF tokenizer.json 格式）*/
+/* sgl bpe 实现：GPT-2 字节级 BPE（HF tokenizer.json 格式）*/
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/bpe.h"
 
@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "sgl/alloc.h"
+#include "sgl/gguf.h"
 #include "sgl/json.h"
 #include "sgl/log.h"
 
@@ -25,6 +26,14 @@ static char *xstrdup(const char *s) {
   size_t n = strlen(s) + 1;
   char *p = (char *)sgl_xmalloc(n);
   memcpy(p, s, n);
+  return p;
+}
+
+/* GGUF 的字符串没有 NUL 结尾 */
+static char *xstrndup(const char *s, size_t n) {
+  char *p = (char *)sgl_xmalloc(n + 1);
+  if (n) memcpy(p, s, n);
+  p[n] = 0;
   return p;
 }
 
@@ -243,12 +252,93 @@ sgl_tokenizer *sgl_tokenizer_load(const char *path) {
   return t;
 }
 
+/* 从 GGUF 的 tokenizer.ggml.* 元数据构造 tokenizer。
+ * 单文件 .gguf 下载下来没有 tokenizer.json，但 HF 转 gguf 时把词表/合并表
+ * 全写进去了，所以这条路能让"只有一个 gguf"的目录直接可用。*/
+sgl_tokenizer *sgl_tokenizer_load_gguf(sgl_gguf *gg) {
+  if (!gg) return NULL;
+  int n = sgl_gguf_meta_str_array_n(gg, "tokenizer.ggml.tokens");
+  if (n <= 0) {
+    SGL_ERROR("gguf: tokenizer.ggml.tokens 缺失，无法从 GGUF 建 tokenizer");
+    return NULL;
+  }
+  const char *model = sgl_gguf_meta_str(gg, "tokenizer.ggml.model", "");
+  sgl_tokenizer *t = (sgl_tokenizer *)sgl_xcalloc(1, sizeof(sgl_tokenizer));
+  build_byte_tables(t);
+
+  sm_init(&t->vocab, n);
+  t->vocab_size = n;
+  t->id2tok = (char **)sgl_xcalloc((size_t)n, sizeof(char *));
+  int nt = sgl_gguf_meta_i32_array_n(gg, "tokenizer.ggml.token_type");
+  int n_sp = 0;
+  for (int i = 0; i < n; i++) {
+    const char *s = NULL;
+    size_t len = 0;
+    if (sgl_gguf_meta_str_array_at(gg, "tokenizer.ggml.tokens", i, &s, &len) != 0) continue;
+    char *tok = xstrndup(s, len);
+    sm_put(&t->vocab, tok, i);
+    t->id2tok[i] = tok;
+    int ty = nt > 0 ? sgl_gguf_meta_i32_array_at(gg, "tokenizer.ggml.token_type", i) : 1;
+    if (ty == 2 || ty == 3) n_sp++; /* CONTROL / USER_DEFINED */
+  }
+
+  int nm = sgl_gguf_meta_str_array_n(gg, "tokenizer.ggml.merges");
+  sm_init(&t->merges, nm > 0 ? nm : 16);
+  for (int i = 0; i < nm; i++) {
+    const char *s = NULL;
+    size_t len = 0;
+    if (sgl_gguf_meta_str_array_at(gg, "tokenizer.ggml.merges", i, &s, &len) != 0) continue;
+    char *k = xstrndup(s, len);
+    sm_put(&t->merges, k, i);
+    sgl_xfree(k);
+  }
+
+  /* 特殊 token（<|im_start|> 这类要能被 piece_id 找到）*/
+  t->n_added = 0;
+  t->added_tokens = (char **)sgl_xcalloc((size_t)n_sp + 1, sizeof(char *));
+  t->added_ids = (int *)sgl_xcalloc((size_t)n_sp + 1, sizeof(int));
+  for (int i = 0; i < n && nt > 0; i++) {
+    int ty = sgl_gguf_meta_i32_array_at(gg, "tokenizer.ggml.token_type", i);
+    if (ty != 2 && ty != 3) continue;
+    t->added_tokens[t->n_added] = xstrdup(t->id2tok[i] ? t->id2tok[i] : "");
+    t->added_ids[t->n_added] = i;
+    t->n_added++;
+  }
+
+  if (!strcmp(model, "llama") || !strcmp(model, "spm")) t->style = 1;
+  if (sm_get(&t->vocab, "<s>") >= 0 && sm_get(&t->vocab, "<0x41>") >= 0) t->style = 1;
+  t->bos_id = sm_get(&t->vocab, "<s>");
+  if (t->bos_id < 0) t->bos_id = sgl_gguf_meta_i32(gg, "tokenizer.ggml.bos_token_id", -1);
+  t->eos_id = sm_get(&t->vocab, "</s>");
+  if (t->eos_id < 0) t->eos_id = sm_get(&t->vocab, "<|endoftext|>");
+  if (t->eos_id < 0) t->eos_id = sgl_gguf_meta_i32(gg, "tokenizer.ggml.eos_token_id", -1);
+  if (t->eos_id < 0) t->eos_id = n - 1;
+  for (int b = 0; b < 256; b++) {
+    char kname[8];
+    snprintf(kname, sizeof(kname), "<0x%02X>", b);
+    t->byte_tok_ids[b] = sm_get(&t->vocab, kname);
+  }
+
+  SGL_INFO("tokenizer from GGUF: model=%s style=%s vocab=%d merges=%d special=%d bos=%d eos=%d",
+           model, t->style ? "llama/SP" : "gpt2/ByteLevel", t->vocab_size, nm, t->n_added,
+           t->bos_id, t->eos_id);
+  return t;
+}
+
 /* 按目录加载：tokenizer.json 为主；若同目录 tokenizer_config.json 给了
- * eos_token_id/bos_token_id（如 Qwen 的 <|im_end|>），用它覆盖。 */
+ * eos_token_id/bos_token_id（如 Qwen 的 <|im_end|>），用它覆盖。
+ * 没有 tokenizer.json 时退到 GGUF 内嵌 tokenizer（单文件 .gguf 场景）。*/
 sgl_tokenizer *sgl_tokenizer_load_dir(const char *dir) {
   char path[1024];
   snprintf(path, sizeof(path), "%s/tokenizer.json", dir);
   sgl_tokenizer *t = sgl_tokenizer_load(path);
+  if (!t) {
+    sgl_gguf *gg = sgl_gguf_open_dir(dir);
+    if (gg) {
+      t = sgl_tokenizer_load_gguf(gg);
+      sgl_gguf_close(gg);
+    }
+  }
   if (!t) return NULL;
   snprintf(path, sizeof(path), "%s/tokenizer_config.json", dir);
   FILE *f = fopen(path, "rb");

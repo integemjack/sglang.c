@@ -1,4 +1,4 @@
-﻿/* sgl mla 实现：DeepSeek 系 MLA 前向（吸收式 / absorbed，见 mla.h 顶部说明）
+/* sgl mla 实现：DeepSeek 系 MLA 前向（吸收式 / absorbed，见 mla.h 顶部说明）
  * 数值公式照 HF modeling_deepseek_v2.py 的 DeepseekV2Attention.forward：
  *   q = q_b_proj(q_a_layernorm(q_a_proj(x)))
  *   kv_a = kv_a_proj_with_mqa(x) → [c | k_pe]；c = kv_a_layernorm(c)
@@ -20,6 +20,7 @@
 #endif
 
 #include "sgl/alloc.h"
+#include "sgl/gguf.h"
 #include "sgl/json.h"
 #include "sgl/log.h"
 #include "sgl/ops.h"
@@ -125,26 +126,14 @@ sgl_mla *sgl_mla_load(const char *model_dir) { return sgl_mla_load_layer(model_d
 
 sgl_mla *sgl_mla_load_layer(const char *model_dir, int layer) {
   if (!model_dir || !*model_dir) return NULL;
-  char *cpath = path_join_(model_dir, "config.json");
-  FILE *f = NULL;
-  if (fopen_s(&f, cpath, "rb") != 0 || !f) f = fopen(cpath, "rb");
-  sgl_xfree(cpath);
-  if (!f) {
-    SGL_ERROR("mla: cannot open config.json in %s", model_dir);
+  size_t sz = 0;
+  char *buf = sgl_config_read_text(model_dir, &sz);
+  if (!buf || sz == 0) {
+    SGL_ERROR("mla: no config.json / GGUF metadata in %s", model_dir);
+    sgl_xfree(buf);
     return NULL;
   }
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (sz <= 0) {
-    fclose(f);
-    return NULL;
-  }
-  char *buf = (char *)sgl_xmalloc((size_t)sz + 1);
-  size_t got = fread(buf, 1, (size_t)sz, f);
-  fclose(f);
-  buf[got] = 0;
-  sgl_json *cfg = sgl_json_parse(buf, got);
+  sgl_json *cfg = sgl_json_parse(buf, sz);
   sgl_xfree(buf);
   if (!cfg) return NULL;
 

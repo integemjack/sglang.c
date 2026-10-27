@@ -1,4 +1,4 @@
-﻿/* sgl/bpe.h — GPT-2 字节级 BPE tokenizer（加载 HF tokenizer.json）
+/* sgl/bpe.h — GPT-2 字节级 BPE tokenizer（加载 HF tokenizer.json）
  * 对应 sglang srt/tokenizer/tokenizer_manager.py 底下的 HF tokenizers。 */
 #ifndef SGL_BPE_H
 #define SGL_BPE_H
@@ -7,11 +7,14 @@
 #include <stdint.h>
 
 typedef struct sgl_tokenizer sgl_tokenizer;
+typedef struct sgl_gguf sgl_gguf;
 
 /* 失败返回 NULL（原因打日志）*/
 sgl_tokenizer *sgl_tokenizer_load(const char *tokenizer_json_path);
 /* 按目录加载（tokenizer.json + 可选 tokenizer_config.json 的 eos/bos 覆盖）*/
 sgl_tokenizer *sgl_tokenizer_load_dir(const char *model_dir);
+/* 从 GGUF 内嵌元数据构造（单文件 .gguf 场景；sgl_tokenizer_load_dir 会自动回退到它）*/
+sgl_tokenizer *sgl_tokenizer_load_gguf(sgl_gguf *gg);
 void sgl_tokenizer_free(sgl_tokenizer *t);
 
 int sgl_tokenizer_vocab_size(const sgl_tokenizer *t);

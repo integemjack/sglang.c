@@ -2,6 +2,41 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — GGUF 权重格式：容器 + 12 种量化反解 + 内嵌 tokenizer（2026-10-27 第四轮）
+
+起点是 `docs/GAP_vs_upstream.md` 的 P0 第一项（权重格式太窄：只有 safetensors + 自研 int8，
+市面上下载量最大的那批 gguf 一个都打不开）。本轮把 **GGUF 全链路** 做掉，AWQ/GPTQ 留到下一轮。
+
+- **新增 `src/gguf.c` + `include/sgl/gguf.h`（约 1300 行）**：GGUF v2/v3 容器解析（元数据 KV / 张量信息表 /
+  对齐后的 data 区，全 mmap 零拷贝），**12 种 ggml 类型的反量化**：F32/F16/BF16、Q4_0/Q4_1/Q5_0/Q5_1/Q8_0、
+  Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K、IQ4_NL（`kvalues_iq4nl` 码本）。
+- **GGUF→HF 张量名映射**：`token_embd → model.embed_tokens`、`blk.N.attn_q → model.layers.N.self_attn.q_proj`
+  等（含 bias / qk-norm），`sgl_st_get()` 的签名不变，所以 llama/deepseek 两条加载路径和 79 处调用点一行没改。
+- **从 GGUF 元数据合成 HF 风格 config**：`sgl_config_read_text()` 先读 `config.json`，没有就用
+  `{arch}.block_count` / `embedding_length` / `attention.head_count{,_kv}` / `rope.freq_base` / `rope.scaling.*`
+  拼一份 JSON。于是“只下载了一个 `.gguf`”的目录也能起模型。
+- **q/k_proj 的 head 逆置换**：llama.cpp 的 convert 脚本会按 head 把 q_proj/k_proj 的行交错重排
+  （为了让 ggml 的交错 RoPE 直接可用），而本项目的 forward 是 HF 的 rotate_half 配对 `(i, i+D/2)`。
+  不还原时 q/k 的 rel_rms 是 **1.38**（等于完全错）；还原后降到 **0.050**（量化误差量级），
+  端到端输出也从“Paris. The capital of France.”的重复变成连贯句子。可用 `SGL_GGUF_NO_PERMUTE=1` 关掉。
+- **GGUF 内嵌 tokenizer**：`sgl_tokenizer_load_gguf()` 从 `tokenizer.ggml.tokens/merges/token_type` 建词表、
+  合并表和特殊 token；`sgl_tokenizer_load_dir()` 在没有 `tokenizer.json` 时自动回退。实测 SmolLM2-135M：
+  vocab 49152 / merges 48900 / 17 个特殊 token，**与同模型 `tokenizer.json` 编出完全相同的 token 序列**。
+- **修一个既有 bug（`safetensors.c`）**：f16 → f32 的次正规数转换少了归一化，`frac << 13` 直接成了 f32 的
+  次正规（~1e-38），比正确值小 2^125 倍。平时权重里极少出现次正规 f16 所以一直没暴露；GGUF 的量化块
+  尺度 `d` 恰好会落在 5e-5 这个量级（f16 次正规区间），一读就错。两处（`gguf.c`/`safetensors.c`）都已修正，
+  并在 `test_fp8` 里加了 10 条 f16 位模式（±0 / 最小次正规 / 最大次正规 / 最小正常数 / 65504）。
+- **验证**（金标准是「原始权重」和「另一份独立实现」两条腿）：
+  - `tests/gguf_ref_dequant.py`：用 numpy 按 ggml 公开的块结构写了一份独立反量化（只共用位布局规范，
+    不共用代码），`test_gguf` 对 96 个张量逐元素比，**rel_rms = 0**（覆盖 F32/Q4_K/Q5_K/Q5_0/Q5_1/Q6_K/Q8_0/Q3_K/IQ4_NL）。
+  - 与原始 safetensors 逐张量比（SmolLM2-135M 真实权重）：Q8_0 0.6–0.7%、Q6_K 1.9%、
+    Q5_0 4.2–5.4%、Q4_K 7.5%、Q3_K 15.4%、IQ4_NL 8.7% —— 全在各量化的理论误差范围内。
+  - 三个真实文件（bartowski 的 Q4_K_M / Q2_K / Q3_K_M）都能端到端生成正确文本；
+    `Q2_K` 目录只有 `.gguf` 一个文件（无 config.json / tokenizer.json），照样跑通。
+  - CPU ctest **40/40**（新增 test_gguf），MSVC 同步验证。
+- 测试素材不在 git 里（模型太大）：`tests/gguf_ref_dequant.py` 的输出 `.refmeta/.refbin` 由你自己生成，
+  没有时测试会 SKIP 并说明；原始权重缺失时对照段也 SKIP。
+
 ## [Unreleased] — GPU 服务对齐 CPU：模板 / 约束解码 / logprobs / 监控（2026-10-27 第三轮）
 
 发现 `apps/cuda_http.c` 是 CPU `src/http.c` 的**独立实现**，前面几轮做的 Jinja 模板、约束解码、logprobs、

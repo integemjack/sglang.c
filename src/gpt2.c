@@ -1,4 +1,4 @@
-﻿/* sgl gpt2 实现 */
+/* sgl gpt2 实现 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/gpt2.h"
 
@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "sgl/alloc.h"
+#include "sgl/gguf.h"
 #include "sgl/json.h"
 #include "sgl/log.h"
 #include "sgl/ops.h"
@@ -23,25 +24,10 @@ static char *path_join(const char *dir, const char *name) {
   return p;
 }
 
-static char *read_file_all(const char *path, size_t *out_len) {
-  FILE *f = fopen(path, "rb");
-  if (!f) { SGL_ERROR("open %s failed", path); return NULL; }
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  char *buf = (char *)sgl_xmalloc((size_t)sz + 1);
-  if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); sgl_xfree(buf); return NULL; }
-  fclose(f);
-  buf[sz] = 0;
-  *out_len = (size_t)sz;
-  return buf;
-}
 
 sgl_gpt2 *sgl_gpt2_load(const char *model_dir) {
   size_t clen = 0;
-  char *cpath = path_join(model_dir, "config.json");
-  char *cfg_text = read_file_all(cpath, &clen);
-  sgl_xfree(cpath);
+  char *cfg_text = sgl_config_read_text(model_dir, &clen);
   if (!cfg_text) return NULL;
   sgl_json *cfg = sgl_json_parse(cfg_text, clen);
   sgl_xfree(cfg_text);

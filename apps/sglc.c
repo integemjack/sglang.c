@@ -1,14 +1,16 @@
-﻿/* sglc — sglang-c 推理 CLI（对应 sglang 的 python -m sglang.launch_server 单机路径）*/
+/* sglc — sglang-c 推理 CLI（对应 sglang 的 python -m sglang.launch_server 单机路径）*/
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#include "sgl/alloc.h"
 #include "sgl/bpe.h"
 #include "sgl/bert.h"
 #include "sgl/clip.h"
 #include "sgl/generate.h"
+#include "sgl/gguf.h"
 #include "sgl/gpt2.h"
 #include "sgl/image.h"
 #include "sgl/json.h"
@@ -64,21 +66,13 @@ static float *vision_cb(void *ud, const unsigned char *bytes, size_t n,
   return out;
 }
 
-/* 读模型 config.json 的 hidden_size / n_embd（LM embedding 宽）*/
+/* 读模型 config 的 hidden_size / n_embd（LM embedding 宽）。
+ * 配置可能是 config.json，也可能来自 GGUF 元数据。*/
 static int cfg_e_lm(const char *dir) {
-  char path[1024];
-  snprintf(path, sizeof(path), "%s/config.json", dir);
-  FILE *f = NULL;
-  fopen_s(&f, path, "rb");
-  if (!f) return 0;
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  char *buf = (char *)sgl_xmalloc((size_t)sz + 1);
-  if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); sgl_xfree(buf); return 0; }
-  buf[sz] = 0;
-  fclose(f);
-  sgl_json *j = sgl_json_parse(buf, (size_t)sz);
+  size_t sz = 0;
+  char *buf = sgl_config_read_text(dir, &sz);
+  if (!buf) return 0;
+  sgl_json *j = sgl_json_parse(buf, sz);
   sgl_xfree(buf);
   if (!j) return 0;
   int e = sgl_json_get_int(j, "hidden_size", sgl_json_get_int(j, "n_embd", 0));

@@ -1,4 +1,4 @@
-﻿/* sgl cuda_cli.c - standalone CUDA inference CLI (MSVC build, links sgl_cuda)
+/* sgl cuda_cli.c - standalone CUDA inference CLI (MSVC build, links sgl_cuda)
  * usage: cuda_cli.exe <model_dir> "<prompt>" [max_new] [temperature] */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
@@ -9,6 +9,7 @@
 #include "sgl/alloc.h"
 #include "sgl/bpe.h"
 #include "sgl/cuda.h"
+#include "sgl/gguf.h"
 #include "sgl/gpt2.h"
 #include "sgl/json.h"
 #include "sgl/llama.h"
@@ -20,21 +21,13 @@ static double now_sec(void) {
   return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* t4: config.json "model_type" sniff (gpt2 vs llama-family default) */
+/* t4: "model_type" sniff (gpt2 vs llama-family default)；配置可来自 config.json 或 GGUF 元数据 */
 static int model_is_gpt2(const char *dir) {
-  char p[1024];
-  snprintf(p, sizeof(p), "%s/config.json", dir);
-  FILE *f = fopen(p, "rb");
-  if (!f) return 0;
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  char *buf = (char *)malloc((size_t)sz + 1);
-  if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); free(buf); return 0; }
-  fclose(f);
-  buf[sz] = 0;
-  sgl_json *j = sgl_json_parse(buf, (size_t)sz);
-  free(buf);
+  size_t sz = 0;
+  char *buf = sgl_config_read_text(dir, &sz);
+  if (!buf) return 0;
+  sgl_json *j = sgl_json_parse(buf, sz);
+  sgl_xfree(buf);
   if (!j) return 0;
   const char *mt = sgl_json_get_str(j, "model_type", "");
   int g = strcmp(mt, "gpt2") == 0;

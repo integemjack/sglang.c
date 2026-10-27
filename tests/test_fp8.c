@@ -1,4 +1,4 @@
-﻿/* test_fp8 — P1：safetensors 里的 FP8（F8_E4M3 / F8_E5M2）载入后解成 f32。
+/* test_fp8 — P1：safetensors 里的 FP8（F8_E4M3 / F8_E5M2）载入后解成 f32。
  * 手搓两个 shard：一个 E4M3 张量、一个 E5M2 张量，逐字节写入已知位模式，
  * 和 IEEE 定义的手算值比（含 subnormal / ±0 / 最大值 / NaN）。*/
 #include <stdio.h>
@@ -130,10 +130,58 @@ int main(void) {
     sgl_st_close(c5);
   }
 
+  /* F16 次正规数：值 = frac * 2^-24。这条曾是真 bug（直接 frac<<13 会变成
+   * f32 的次正规，差 2^-125），由 GGUF 的量化块 d 撞上才暴露。*/
+  struct {
+    unsigned short h;
+    float want;
+    const char *name;
+  } f16[] = {
+      {0x0000, 0.0f, "+0"},
+      {0x8000, -0.0f, "-0"},
+      {0x3C00, 1.0f, "1.0"},
+      {0xBC00, -1.0f, "-1.0"},
+      {0x0001, 5.9604644775390625e-08f, "min subnormal 2^-24"},
+      {0x8001, -5.9604644775390625e-08f, "-min subnormal"},
+      {0x8398, -5.4836273193359375e-05f, "subnormal -5.4836e-05 (量化块 d 量级)"},
+      {0x03FF, 6.097555160522461e-05f, "max subnormal"},
+      {0x0400, 6.103515625e-05f, "min normal 2^-14"},
+      {0x7BFF, 65504.0f, "max 65504"},
+  };
+  int n16 = (int)(sizeof(f16) / sizeof(f16[0]));
+  unsigned char b16[64];
+  for (int i = 0; i < n16; i++) {
+    b16[2 * i] = (unsigned char)(f16[i].h & 0xFF);
+    b16[2 * i + 1] = (unsigned char)(f16[i].h >> 8);
+  }
+  char p16[256];
+  snprintf(p16, sizeof(p16), "%s/f16.safetensors", dir);
+  write_st(p16, "F16", b16, n16, 2); /* F16：每元素 2 字节 */
+
+  sgl_st_ctx *c16 = sgl_st_open(p16);
+  check(c16 != NULL, "open f16 shard");
+  if (c16) {
+    sgl_tensor t = sgl_st_get(c16, "t", 1, (int64_t[]){n16});
+    check(t.data != NULL, "f16 tensor load");
+    if (t.data) {
+      for (int i = 0; i < n16; i++) {
+        float got = t.data[i];
+        int same = (got == f16[i].want) ||
+                   (f16[i].want == 0.0f && got == 0.0f); /* ±0 视为相等 */
+        if (!same) {
+          printf("FAIL: f16 %s: got %.9g want %.9g\n", f16[i].name, (double)got,
+                 (double)f16[i].want);
+          fails++;
+        }
+      }
+    }
+    sgl_st_close(c16);
+  }
+
   if (fails) {
     printf("test_fp8: %d failure(s)\n", fails);
     return 1;
   }
-  printf("test_fp8: all OK (%d e4m3 + %d e5m2 patterns)\n", n4, n5);
+  printf("test_fp8: all OK (%d e4m3 + %d e5m2 + %d f16 patterns)\n", n4, n5, n16);
   return 0;
 }

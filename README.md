@@ -170,6 +170,8 @@ needed cross-compilation from an arm64 host plus Rosetta to run the tests, and I
 | **Output parsers** | `srt/parser/` | ✅ P2: reasoning split (DeepSeek-R1 / Qwen3 markers) + `<tool_call>` extraction → OpenAI `tool_calls` / `reasoning_content` |
 | **DeepSeek MLA attention** | `srt/models/deepseek_v2.py` | ✅ P0-5 (kernel): absorbed (W_UK/W_UV) MLA with decoupled RoPE, compressed KV (`kv_lora+qk_rope` per position); vs numpy reference max rel 1.2e-06 (`test_mla`) |
 | **DeepSeek-V2/V3 full backend** | `srt/models/deepseek_v2.py` | ✅ P0-6: end-to-end model (embed → MLA → dense/SwiGLU **MoE with shared experts**, V2 `softmax`+`greedy` and V3 `sigmoid`+`group_limited_greedy`+`e_score_correction_bias`+`routed_scaling_factor`, 3-D fused expert layout) wired into `sgl_model_load` as backend `deepseek`. **Cross-checked against transformers' own `DeepseekV2ForCausalLM`** (not just a hand-written numpy ref): logits 2.5e-07 max abs on a plain config, 3.0e-07 with YaRN; compressed-KV / incremental / chunked paths bit-identical (`test_deepseek_hf`, `test_deepseek` 402 checks) |
+| **GGUF weights** (llama.cpp format) | `model_loader/gguf_loader.py` | ✅ P0: container v2/v3 + 12 quantization types (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/**all K-quants**/Q8_K/**IQ4_NL**/F16/BF16/F32), GGUF→HF tensor-name mapping, HF-style `config.json` synthesized from GGUF metadata, **and q/k_proj head-unpermute** (llama.cpp's convert permutes them for its interleaved RoPE; our forward is HF's rotate_half). Verified against three real bartowski files (Q4_K_M / Q2_K / Q3_K_M): 96 tensors byte-identical to an independent numpy implementation (`tests/gguf_ref_dequant.py`), and 10 tensors within quantization error of the original safetensors (Q8_0 0.7%, Q6_K 1.9%, Q5_0 4.2–5.4%, Q4_K 7.5%) |
+| **GGUF built-in tokenizer** | `tokenizer/` | ✅ P0: `tokenizer.ggml.tokens/merges/token_type` → vocab/merges/special tokens, so a directory containing **only a `.gguf`** works end to end (`sglc --model <dir>`; verified on Q4_K_M and Q2_K: "The capital of France is Paris.") |
 | **YaRN RoPE (+ mscale)** | `modeling_rope_utils._compute_yarn_parameters` | ✅ P1: frequency table matches HF to 1.5e-07 over 6 configs (`test_yarn`). llama path multiplies cos/sin by HF's `attention_factor` and matches `LlamaForCausalLM` logits to 1.5e-07 (`test_llama_yarn`); DeepSeek follows its own convention (`softmax_scale *= mscale²`, mscale from `mscale_all_dim`) and matches HF to 3.0e-07. Reads both `rope_scaling` (old) and `rope_parameters` (transformers 5.x) |
 
 **Not covered:** tensor parallelism; GPU data parallel (the CPU build's `--dp` replicas are real processes-in-one
@@ -180,7 +182,9 @@ due to disk/VRAM); GPU-side sliding window; the CUDA path for Qwen3-Next and for
 host memory, so offload has nothing to gain there); W4A16 / GPTQ / AWQ; DeepSeek's grouped-MoE routing is
 validated against the official formula rather than HF (transformers 5.20's `DeepseekV2` router does not
 implement `scoring_func`/`norm_topk_prob`/`e_score_correction_bias`, so it agrees only to ~3e-04 there);
-GGUF / legacy `.bin` checkpoints; `/update_weights_from_disk` on the CUDA engine (returns 501 — weights live in
+legacy `.bin` checkpoints (GGUF is supported now, see the matrix above); AWQ / GPTQ / compressed-tensors / MXFP4-NVFP4 checkpoints;
+IQ2_XXS/IQ2_XS/IQ3_XXS/IQ3_S/IQ4_XS (codebook-based IQ types beyond IQ4_NL);
+`/update_weights_from_disk` on the CUDA engine (returns 501 — weights live in
 VRAM, restart instead); embeddings/rerank only exist on the CPU engine.
 
 ## Build from source

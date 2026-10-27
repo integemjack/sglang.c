@@ -32,3 +32,6 @@ models/tiny-llama-hf/
 # Python 缂撳瓨
 __pycache__/
 *.pyc
+
+# test_fp8 现场生成的临时 shard
+sgl_fp8_tmp/

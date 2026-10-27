@@ -64,6 +64,8 @@
 | 服务面：`/ready` `/v1/models` `/get_server_info` `/metrics` `/flush_cache` `/abort_request` `/update_weights_from_disk` | `http.c`、`cuda_http.c` | GPU 侧 `/update_weights_from_disk` 明确 501，不假装成功 |
 | 数据并行副本 `--dp N`（单进程内 N 份 KV 池 + radix，按负载路由） | `scheduler.c` | `test_dp` |
 | 长 prompt 提前 400（不再给含糊 500） | `cuda_http.c` | `afa3269` |
+| **GGUF 权重**（Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K/IQ4_NL/F16/BF16/F32） | `gguf.c`：容器解析 + 反量化 + GGUF→HF 名字映射 + 从元数据合成 config | 对真实 bartowski Q4_K_M / Q2_K / Q3_K_M 与 `tests/gguf_ref_dequant.py`（numpy 独立实现）逐元素比，96 张量 **rel_rms = 0**；端到端生成正确 |
+| **GGUF 内嵌 tokenizer** | `bpe.c`：`sgl_tokenizer_load_gguf`（`tokenizer.ggml.tokens/merges/token_type`） | 只有一个 `.gguf` 的目录能直接跑：词表 49152 / merges 48900 / 17 个特殊 token，与同模型 `tokenizer.json` 编出同一 token 序列 |
 
 ---
 
@@ -71,13 +73,16 @@
 
 ### A. 模型与权重 —— 挡住「能不能跑」
 
-**A1 权重格式（P0，成本最低、解锁最多）**
+**A1 权重格式（进行中：GGUF 已完成，AWQ/GPTQ 仍未做）**
 
-缺：GGUF（含 K-quant）、AWQ、GPTQ、compressed-tensors、W4A16、MXFP4/NVFP4、legacy `.bin`、HF Hub 直连下载与权重缓存。
-影响：上游 `layers/quantization/` 111 个文件对应十余种量化方案，C 版只有 W8A16（CPU）/ W8A8 dp4a+IMMA（CUDA）
-和 fp8 权重解包。绝大多数人手上现成的量化模型加载即失败。
-补法：GGUF / AWQ / GPTQ 只需**只读解码**（load 时 dequant 成 f16/f32，复用现有 GEMM），
-不动 kernel，是投入产出比最高的一项。
+已做（本轮）：**GGUF 全链路** —— 容器解析（v2/v3）、12 种量化类型的反量化（含 K-quant 全部 + IQ4_NL）、
+GGUF→HF 名字映射、从 GGUF 元数据合成 HF 风格 config、从 `tokenizer.ggml.*` 建 tokenizer。
+于是「只下载一个 `.gguf`」的目录可以直接 `sglc --model <dir>` 跑通（实测 Q4_K_M 与 Q2_K 都生成正确文本）。
+
+仍缺：**AWQ / GPTQ**（qweight/qzeros/scales 解包）、compressed-tensors、W4A16、MXFP4/NVFP4、
+legacy `.bin`、HF Hub 直连下载与权重缓存。
+影响：上游 `layers/quantization/` 111 个文件对应十余种量化方案，C 版现在有 GGUF + W8A16/W8A8 + fp8 权重解包。
+补法：AWQ/GPTQ 同样是**只读解码**（load 时 dequant 成 f32），复用现有 GEMM，不动 kernel。
 
 **A2 GPU 只覆盖 llama 系（P0）**
 
@@ -178,7 +183,7 @@ GPU 服务是固定 `MAX_CONC 8` 的**整段租约**：段长 = `SGL_CUDA_CTX / 
 
 | 序 | 事项 | 为什么排这里 | 量级 |
 | --- | --- | --- | --- |
-| 1 | GGUF + AWQ/GPTQ 读取（load 时 dequant） | 纯加载侧改动，不动 kernel，直接解锁市面上大多数现成权重 | S–M |
+| 1 | ~~GGUF~~ **AWQ/GPTQ 读取**（load 时 dequant） | 纯加载侧改动，不动 kernel，直接解锁市面上大多数现成权重。GGUF 已完成（含 K-quant/IQ4_NL/内嵌 tokenizer） | S–M |
 | 2 | GPU 补 MoE + DeepSeek MLA kernel | 把 CPU 侧已验证的两套前向搬到 GPU，GPU 服务可用模型从 1 类变 3 类 | L |
 | 3 | GPU 页级 radix + 动态并发（去掉 8 段租约） | 解除并发上限与段长耦合，长 prompt + 高并发下的利用率 | M–L |
 | 4 | `/v1/tokenize` `/v1/detokenize` `/v1/responses` `/v1/messages` | 让 OpenAI/Anthropic SDK 能直连；分词端点还便于对拍 | S |

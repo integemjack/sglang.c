@@ -1,4 +1,4 @@
-﻿/* sgl llama implementation: RoPE/RMSNorm/SwiGLU/GQA + paged KV pool
+/* sgl llama implementation: RoPE/RMSNorm/SwiGLU/GQA + paged KV pool
  * (llama / tinyllama / qwen2 family; qwen2 adds qkv bias + qk-norm).
  * KV pool: LIFO free list + per-page refcount; optional int8 KV (SGL_KV8=1);
  * optional int8 weights W8A16 (SGL_W8=1); draft mode (SGL_DRAFT_LAYERS=N). */
@@ -17,6 +17,7 @@
 
 #include "sgl/port.h"
 #include "sgl/alloc.h"
+#include "sgl/gguf.h"
 #include "sgl/json.h"
 #include "sgl/log.h"
 #include "sgl/ops.h"
@@ -136,22 +137,15 @@ static int lora_merge_all(sgl_llama *m, const char *dir) {
 }
 
 sgl_llama *sgl_llama_load(const char *dir) {
-  char *cpath = path_join_(dir, "config.json");
-  FILE *f = NULL;
-  if (fopen_s(&f, cpath, "rb") != 0 || !f) {
-    /* MinGW path */
-    f = fopen(cpath, "rb");
+  /* 配置来源：<dir>/config.json；没有的话从 <dir>/*.gguf 的元数据合成一份
+   * （GGUF 单文件下载通常不带 config.json）。*/
+  size_t sz = 0;
+  char *buf = sgl_config_read_text(dir, &sz);
+  if (!buf) {
+    SGL_ERROR("llama: no config.json and no GGUF metadata in %s", dir);
+    return NULL;
   }
-  sgl_xfree(cpath);
-  if (!f) { SGL_ERROR("llama: cannot open config.json in %s", dir); return NULL; }
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  char *buf = (char *)sgl_xmalloc((size_t)sz + 1);
-  if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); sgl_xfree(buf); return NULL; }
-  fclose(f);
-  buf[sz] = 0;
-  sgl_json *cfg = sgl_json_parse(buf, (size_t)sz);
+  sgl_json *cfg = sgl_json_parse(buf, sz);
   sgl_xfree(buf);
   if (!cfg) return NULL;
 

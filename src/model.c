@@ -1,4 +1,4 @@
-﻿/* sgl model 实现：gpt2 / llama 后端分发 */
+/* sgl model 实现：gpt2 / llama 后端分发 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/model.h"
 
@@ -7,6 +7,7 @@
 
 #include "sgl/alloc.h"
 #include "sgl/deepseek.h"
+#include "sgl/gguf.h"
 #include "sgl/gpt2.h"
 #include "sgl/json.h"
 #include "sgl/llama.h"
@@ -17,21 +18,14 @@ struct sgl_model {
   void *impl;
 };
 
-/* 读 config.json 判型：DeepSeek（MLA+MoE）→ 2，llama 用 hidden_size → 1，gpt2 用 n_embd → 0 */
+/* 读配置判型：DeepSeek（MLA+MoE）→ 2，llama 用 hidden_size → 1，gpt2 用 n_embd → 0。
+ * 配置来自 config.json 或 GGUF 元数据（后者常见于只下载了一个 .gguf 的目录）。*/
 static int detect_kind(const char *dir) {
   if (sgl_deepseek_detect(dir) == 1) return 2;
-  char path[1024];
-  snprintf(path, sizeof(path), "%s/config.json", dir);
-  FILE *f = fopen(path, "rb");
-  if (!f) return -1;
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  char *buf = (char *)sgl_xmalloc((size_t)sz + 1);
-  if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); sgl_xfree(buf); return -1; }
-  fclose(f);
-  buf[sz] = 0;
-  sgl_json *j = sgl_json_parse(buf, (size_t)sz);
+  size_t sz = 0;
+  char *buf = sgl_config_read_text(dir, &sz);
+  if (!buf) return -1;
+  sgl_json *j = sgl_json_parse(buf, sz);
   sgl_xfree(buf);
   if (!j) return -1;
   int kind = -1;
