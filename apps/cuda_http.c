@@ -172,6 +172,7 @@ typedef struct {
   volatile int stop;
   char gpu_err[256];  /* G5: why the GPU engine is unavailable (degraded mode) */
   int degraded;       /* G5: 1 = serving without GPU; every generate gets 503 */
+  int last_prompt_tokens; /* P1: 最近一次因单段容量被拒的 prompt token 数（给错误文案用）*/
 } engine;
 
 static engine E;
@@ -440,6 +441,16 @@ static int submit2(const char *text, int max_new, const sgl_sampling_params *sp,
   if (E.n_active + E.n_waitq >= 128) { LeaveCriticalSection(&E.lock); sgl_xfree(img_feats); return -1; }
   request *r = req_new(text, max_new, sp);
   if (!r) { LeaveCriticalSection(&E.lock); sgl_xfree(img_feats); return -1; }
+  /* P1: 单段容量检查——prompt 比一个 KV 段还长时永远算不出来，以前会让请求进 R_FAIL，
+   * 调用方只看到 “generation failed”。这里提前拒掉，并让 route 给明确提示。*/
+  if (E.seg_len > 0 && r->n_prompt + n_img > E.seg_len) {
+    int need = r->n_prompt + n_img;
+    LeaveCriticalSection(&E.lock);
+    sgl_xfree(img_feats);
+    req_free(r);
+    E.last_prompt_tokens = need;
+    return -2;
+  }
   r->img_feats = img_feats;
   r->n_img = n_img;
   r->id = ++E.next_id;
@@ -1074,6 +1085,16 @@ static char *build_chatml(const sgl_json *j, char **img_url_out) {
   return s;
 }
 
+/* P1: 单段容量不足的明确提示（以前只会看到 "generation failed"）*/
+static const char *seg_full_msg(void) {
+  static char msg[256];
+  snprintf(msg, sizeof(msg),
+           "prompt is %d tokens but one KV segment holds %d (SGL_CUDA_CTX / concurrency): "
+           "raise SGL_CUDA_CTX or lower SGL_HTTP_CONC",
+           E.last_prompt_tokens, E.seg_len);
+  return msg;
+}
+
 /* P0-3: OpenAI / sglang 采样参数（与 CPU 版同一套语义）*/
 static void parse_sampling(const sgl_json *j, sgl_sampling_params *sp) {
   sp->temperature = (float)sgl_json_get_num(j, "temperature", 0.0);
@@ -1351,6 +1372,10 @@ static int route(SOCKET fd, const http_req *req) {
       int id2 = submit2(prompt, max_new, &sp, feats, n_img);
       free(prompt);
       sgl_json_free(j);
+      if (id2 == -2) {
+        respond_error(fd, 400, seg_full_msg());
+        return 0;
+      }
       if (id2 < 0) { respond_error(fd, 503, "server busy"); return 0; }
       return finish_request(fd, id2, is_stream, 1, 0);
     }
@@ -1378,6 +1403,11 @@ static int route(SOCKET fd, const http_req *req) {
 
   int id = submit2(prompt, max_new, &sp, NULL, 0);
   free(prompt);
+  if (id == -2) {
+    sgl_grammar_free(gram);
+    respond_error(fd, 400, seg_full_msg());
+    return 0;
+  }
   if (id < 0) {
     sgl_grammar_free(gram);
     respond_error(fd, 503, "prompt too long (>64KB) or server busy");

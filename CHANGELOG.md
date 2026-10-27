@@ -22,6 +22,9 @@
   编码读中文注释导致代码段漂移）。
 - 验证：CPU **39/39**、MSVC+CUDA **38/38**；GPU 服务在 RTX 2060 上实测 `/v1/chat/completions`
  （模板 / grammar / logprobs / tools）、`/metrics`、`/flush_cache`、`/abort_request` 全部正常。
+- **额外修：单段容量不足的报错**。`SGL_CUDA_CTX=1024` 下带 tools 的 prompt（175 tokens）比一个 KV 段
+ （128）长，以前只得到含糊的 500 `generation failed`；现在提前拒掉并返 **400**：
+ `prompt is 175 tokens but one KV segment holds 128 (SGL_CUDA_CTX / concurrency): raise SGL_CUDA_CTX or lower SGL_HTTP_CONC`。
 
 ## [Unreleased] — YaRN / 交错 RoPE / 对 HF 逐位对齐（2026-10-27 第二轮）
 
