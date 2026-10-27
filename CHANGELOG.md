@@ -2,6 +2,27 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — GPU 服务对齐 CPU：模板 / 约束解码 / logprobs / 监控（2026-10-27 第三轮）
+
+发现 `apps/cuda_http.c` 是 CPU `src/http.c` 的**独立实现**，前面几轮做的 Jinja 模板、约束解码、logprobs、
+解析器、监控端点全靠 CPU 引擎，GPU 服务里全没有（`--serve` 走 GPU 时这些能力直接缺失）。本轮补齐并实测：
+
+- **P0-2 Jinja 模板进 GPU 引擎**：`build_chatml()` 优先用模型的 `chat_template`，`chat_template_kwargs`
+  与 `tools` 用 `json_dump_into()` 序列化后传进模板。实测同一请求 CPU/GPU 两边 `prompt_tokens` 都是 **175**
+  （带 tools 的 Qwen2.5 模板），逐字节一致。
+- **P1 约束解码进 GPU 引擎**：采样前用 `sgl_grammar_mask()` 把非法 token 的 logits 置 `-inf`，
+  完整合法即停。实测 `response_format: json_schema` 输出 `{"name":"John Doe","age":30}`。
+- **P0-3 采样面 + logprobs**：`min_p` / repetition·frequency·presence penalty / `ignore_eos` /
+  `stop_token_ids` / `logprobs`（GPU 侧之前只有 temperature/top_p）。
+- **P2 解析器**：`reasoning_content` 与 `<tool_call>` → OpenAI `tool_calls`（`finish_reason: tool_calls`）。
+- **P1 服务面**：`GET /v1/models /ready /get_server_info /ping /metrics`，`POST /flush_cache /abort_request`
+  （`/update_weights_from_disk` 在 GPU 引擎上明确返 **501**，不假装成功）；响应体 `model` 字段取模型目录名。
+- **诊断设施**：`SGL_CUDA_TRACE=1` 把 `sgl_cuda_from_llama` 的上传步骤逐层打印（这台机器上帮
+  定位了一个“上传时段错误”的假象：真因是 `edit_file` 剥掉了 `.cu` 的 UTF-8 BOM，nvcc 按本地
+  编码读中文注释导致代码段漂移）。
+- 验证：CPU **39/39**、MSVC+CUDA **38/38**；GPU 服务在 RTX 2060 上实测 `/v1/chat/completions`
+ （模板 / grammar / logprobs / tools）、`/metrics`、`/flush_cache`、`/abort_request` 全部正常。
+
 ## [Unreleased] — YaRN / 交错 RoPE / 对 HF 逐位对齐（2026-10-27 第二轮）
 
 起点是给 DeepSeek 后端找金标准：用 transformers 5.20 自己的 `DeepseekV2ForCausalLM`

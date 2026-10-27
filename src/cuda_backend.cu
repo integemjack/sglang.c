@@ -1308,6 +1308,22 @@ static void w8_free_layers(sgl_w8w *arr, int L) {
     gemm_nt_any(g, A, Wf, Wh, bias, C, M, N, K);                                   \
   } while (0)
 
+/* P1 诊断：SGL_CUDA_TRACE=1 时把上传每步打一行，定位「上传时进程崩」到底停在哪次 dev_copy。
+ * （Windows + WDDM 下驱动内部段错误拿不到我们的栈，只能看走到哪。）*/
+static int cuda_trace_on(void) {
+  static int on = -1;
+  if (on < 0) on = getenv("SGL_CUDA_TRACE") ? 1 : 0;
+  return on;
+}
+#define CT(...)                        \
+  do {                                 \
+    if (cuda_trace_on()) {             \
+      printf("[ct] " __VA_ARGS__);      \
+      printf("\n");                    \
+      fflush(stdout);                  \
+    }                                  \
+  } while (0)
+
 sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
   const sgl_llama *m = (const sgl_llama *)llama_model;
   if (!m) return NULL;
@@ -1340,7 +1356,9 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
 
   if (g->use_fp16) {
     /* t1 fp16 upload: weights as __half, fp32 activations everywhere else */
+    CT("upload wte (fp16) V=%d E=%d", m->vocab, m->n_embd);
     g->wte_h = dev_copy_h(m->wte.data, (size_t)m->vocab * m->n_embd);
+    CT("upload final_norm");
     g->final_norm = dev_copy(m->final_norm.data, (size_t)m->n_embd);
     /* tied embeddings: the half lm_head aliases the half embed table */
     if (m->lm_head.data == m->wte.data) {
@@ -1350,7 +1368,10 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
     }
     if (!g->wte_h || !g->final_norm || !g->lm_head_h) goto fail;
   } else {
+    CT("upload wte (fp32) V=%d E=%d n=%lld", m->vocab, m->n_embd,
+       (long long)((size_t)m->vocab * m->n_embd));
     g->wte = dev_copy(m->wte.data, (size_t)m->vocab * m->n_embd);
+    CT("upload final_norm");
     g->final_norm = dev_copy(m->final_norm.data, (size_t)m->n_embd);
     /* tied embeddings: lm_head aliases wte on the device too (saves V*E*4B,
      * e.g. 545MB for Qwen2.5-0.5B) */
@@ -1440,6 +1461,7 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
     g->uw[l] = dev_copy(L->up_w.data, (size_t)g->I * g->E);
     g->dw[l] = dev_copy(L->down_w.data, (size_t)g->E * g->I);
     if (!g->ln1[l] || !g->qw[l] || !g->gw[l] || !g->dw[l]) goto fail;
+    CT("layer %d/%d uploaded", l + 1, g->L);
   }
 
   {
@@ -1449,6 +1471,7 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
     g->freqs = dev_copy(f, (size_t)(g->D / 2));
     free(f);
   }
+  CT("cublasCreate");
   if (cublasCreate(&g->blas) != CUBLAS_STATUS_SUCCESS) {
     fprintf(stderr, "cublasCreate failed\n");
     goto fail;
@@ -1476,6 +1499,7 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
   /* activation workspace is growable now (sgl_cuda_reserve): only the KV
    * pool scales with ctx, long prompts don't need ctx-sized activations */
   if (!g->kc || !g->vc) goto fail;
+  CT("kv alloc done L=%d ctx=%zu KD=%d", g->L, ctx, g->KD);
   if (g->use_fp16) printf("[cuda] fp16 weights ON (SGL_CUDA_FP16=1)\n");
   return g;
 

@@ -161,7 +161,8 @@ needed cross-compilation from an arm64 host plus Rosetta to run the tests, and I
 | **Jinja chat templates** | HF `apply_chat_template` | ✅ P0-2: Jinja2 subset engine (`src/jinja.c`); byte-identical to Python jinja2 3.1.6 on Qwen2.5 / Qwen3 / TinyLlama templates, incl. `tools` and `namespace`/slice/`is defined` |
 | **Full sampling surface** | `sampling/` | ✅ P0-3: `top_k/top_p/min_p/temperature/seed/ignore_eos/stop_token_ids/repetition·frequency·presence penalty/logprobs`, `prompt`/`input_ids` as token arrays |
 | **Chunked prefill + preemption** | `scheduler.py` | ✅ P0-4: prefill sliced by `SGL_PREFILL_CHUNK` (default 512) so decode is not blocked by long prompts; KV-pool exhaustion preempts the least-progressed request and recomputes it |
-| **Constrained decoding** | `srt/constrained` (xgrammar/outlines) | ✅ P1: JSON Schema + regex → byte-level automaton, token masking during sampling (`src/grammar.c`, `test_grammar` 213 assertions); `response_format: json_schema/json_object/regex` |
+| **Constrained decoding** | `srt/constrained` (xgrammar/outlines) | ✅ P1: JSON Schema + regex → byte-level automaton, token masking during sampling (`src/grammar.c`, `test_grammar` 213 assertions); `response_format: json_schema/json_object/regex`. **Works on both engines** — the CUDA service path masks logits the same way (verified on a real GPU: `{"name":"John Doe","age":30}` from a json_schema request) |
+| **Chat template / sampling / parsing on GPU** | `entrypoints/` | ✅ P0-2/P0-3/P2 wired into `apps/cuda_http.c` too: Jinja template renders identical to the CPU engine (same request → 175 prompt tokens on both), `min_p`/penalties/`ignore_eos`/`stop_token_ids`/`logprobs`, plus reasoning/tool_call parsing and `/v1/models` `/get_server_info` `/metrics` `/flush_cache` `/abort_request` |
 | **Service surface** | `entrypoints/http_server.py` | ✅ P1: `/health` `/ready` `/v1/models` `/get_server_info` `/metrics` (Prometheus) `/flush_cache` `/abort_request` `/v1/embeddings` `/v1/rerank` `/v1/score` `/update_weights_from_disk` |
 | **Data parallel replicas** | `--dp-size` | ✅ P1: `--dp N` loads N full replicas (independent KV pools + radix caches), routes by least-loaded (`test_dp`) |
 | **Weight hot reload** | `/update_weights_from_disk` | ✅ P1: reloads a model dir into an instance (or all base replicas), 409 when the instance has in-flight requests (`test_reload`, plus HTTP coverage) |
@@ -179,7 +180,8 @@ due to disk/VRAM); GPU-side sliding window; the CUDA path for Qwen3-Next and for
 host memory, so offload has nothing to gain there); W4A16 / GPTQ / AWQ; DeepSeek's grouped-MoE routing is
 validated against the official formula rather than HF (transformers 5.20's `DeepseekV2` router does not
 implement `scoring_func`/`norm_topk_prob`/`e_score_correction_bias`, so it agrees only to ~3e-04 there);
-GGUF / legacy `.bin` checkpoints.
+GGUF / legacy `.bin` checkpoints; `/update_weights_from_disk` on the CUDA engine (returns 501 — weights live in
+VRAM, restart instead); embeddings/rerank only exist on the CPU engine.
 
 ## Build from source
 
