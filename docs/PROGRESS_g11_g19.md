@@ -189,6 +189,56 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 至此 **TODO_PROMPTS v0.4 的 G11–G19 全部完成**（只剩可选项未做：G12 的 7B LM 端到端
   因磁盘不够、G13 的 CUDA 路径、G15 的跳段共享——都有实测依据说明无意义/不可能）。
 
+## Clang 构建 + spec.c 真 bug（第 15 轮，2026-10-27）
+
+macOS job 跑不了（无 macOS），但能做一件同等价值的事：**用 Clang 构建整个项目**。
+`CMAKE_C_COMPILER_ID == Clang` 正是 macOS job 走的分支（Apple Clang 也是 CLANG），而且
+Clang 不装 libomp 时走的是**非 OpenMP 单线程 fallback**——这条组合在 x86 上从未验过
+（之前只有 GCC+OpenMP 和 MSVC 无 OpenMP）。
+
+### 结果（ubuntu:24.04 容器，clang 18 + Ninja，`-DCMAKE_C_COMPILER=clang`）
+
+| 项 | 结果 |
+|---|---|
+| configure | `OpenMP not available with Clang, single-threaded fallback`（如预期） |
+| build | **65/65 全过，0 error**（`-march=x86-64-v2`、`__attribute__((target("avx2,fma")))`、`__builtin_cpu_supports` 在 Clang 下都成立） |
+| ctest | **24/24 通过**；`test_llava` 真跑（`[llava] CLIP patch feats vs numpy maxerr = 4.77e-07`） |
+| G19 gate | **counts: fam=4 fam_ran=4 llava=1 → PASS** |
+
+SKIP 的全是 fresh clone 本该缺的夹具（qwen05/tinyllama/clip-vit-*/lora/g12-mlp），与 CI 一致。
+
+### Clang 的警告抓到一条 GCC 没报的**真 bug**（已修）
+
+```
+/work/src/spec.c:61:7: warning: variable 'dl' is used uninitialized whenever 'if' condition is true
+                        [-Wsometimes-uninitialized]   （tl / vl 同样三条）
+```
+
+`src/spec.c` 的 `sgl_spec_generate()` 里，`dl/tl/vl` 原本声明在 `sgl_llama_pages_alloc()`
+**之后**，而 pages_alloc 失败会 `goto fail`，`fail:` 里又会 `sgl_xfree(dl/tl/vl)` ——
+**释放三个未初始化的指针**（堆损坏 / 崩溃）。触发条件是「KV 池耗尽」，是现实路径而不是
+理论路径。GCC 的 `-Wall -Wextra` 不报这个，MSVC 也不报，所以一直没被发现。
+
+修法：把三个指针提到任何 `goto fail` 之前并初始化为 `NULL`（`sgl_xfree` 对 NULL 安全：
+POSIX 版判空、MSVC 的 `_aligned_free(NULL)` 也是 no-op）；顺手把「主机内存不足」与
+「页表分配失败」分开处理，并在 malloc 失败时不再走 `pages_unref`（那条路页表没填过）。
+
+**验证**：
+- MSVC/MinGW 本地：`cmake --build build` 0 error；`test_spec`（用 `../models/tinyllama`
+  + `../models/llama-160m`）→ `spec: drafted=60 accepted=8（13%）`、`[spec==greedy ✓]`、
+  `test_spec: all OK`；全量 `ctest` **26/26**。
+- Clang：把修好的 `spec.c` 拷进容器重编 → **`-Wsometimes-uninitialized` 计数 = 0**，
+  且再跑完整 `ctest` 仍 **24/24 通过**（116s）。
+
+顺带核过同类模式：`src/cuda_spec.c` 的 `dl/tl/vl` 都在第一个 `goto done` 之前赋值，
+`if (!seq || !dl || !tl || !vl) goto done;` 也做了判空，**没有同样的问题**。
+
+### 仍未验证
+
+`macos-arm64` / `macos-x64`（无 macOS；x64 还要 `CMAKE_OSX_ARCHITECTURES=x86_64` 交叉编译
++ Rosetta）。本轮把 Clang 前端与无 OpenMP 配置都验过了，剩下未覆盖的只有 Apple 平台
+特有的东西（Apple ld、libSystem、`-mmacosx-version-min` 等运行时/链接器差异）。
+
 ## linux-arm64 矩阵项实跑（第 14 轮，2026-10-27）
 
 上一轮我判定「arm64 跑不了」，**这个判断也不对**：Docker Desktop 带 qemu binfmt，

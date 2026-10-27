@@ -4,7 +4,19 @@
 
 ## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G12/G13/G14/G15/G16/G17/G18/G19
 
-### 基础设施（G19 补记）
+### 修复
+- **`src/spec.c` 释放未初始化指针（真实 UB，由 Clang 发现）**：`sgl_spec_generate()` 里
+  `dl/tl/vl` 原本声明在 `sgl_llama_pages_alloc()` 之后，而分配失败会 `goto fail`，
+  `fail:` 里又 `sgl_xfree` 这三个指针 —— 触发条件是「KV 池耗尽」。Clang 的
+  `-Wsometimes-uninitialized` 抓到（GCC 与 MSVC 都不报）。已把三个指针提到第一个
+  `goto fail` 之前并初始化为 NULL，并把「主机内存不足」与「页表分配失败」分开处理
+  （malloc 失败时不再走 `pages_unref`）。验证：`-Wsometimes-uninitialized` 计数 0；
+  `test_spec`（真实 tinyllama+llama-160m）接受率 13%、`spec==greedy ✓`、all OK；
+  MSVC `ctest` 26/26；Clang `ctest` 24/24。
+- **用 Clang 构建整个项目**（`CMAKE_C_COMPILER_ID == Clang` 是 macOS job 的分支，
+  且走**非 OpenMP 单线程 fallback**；这组合在 x86 上从未验过）：65/65 编译、
+  **ctest 24/24**、G19 gate `fam=4 fam_ran=4 llava=1` PASS。`-march=x86-64-v2`、
+  `__attribute__((target("avx2,fma")))`、`__builtin_cpu_supports` 在 Clang 下均成立。
 - **`linux-arm64` 矩阵项也真跑了**（Docker Desktop 带 qemu binfmt，`--platform linux/arm64`
   能起 aarch64 容器）：arm64 上 `__SSE2__`/AVX2 全不成立、`ops.c` 退到**标量**内积，
   等于 CPU 数值路径换了一套代码。实测：**65/65 编译链接成功、`ctest` 24/24 通过、

@@ -58,15 +58,34 @@ int sgl_spec_generate(sgl_llama *target, sgl_llama *draft,
 
   int *tp = (int *)sgl_xmalloc(sizeof(int) * (size_t)cap);
   int *dp = (int *)sgl_xmalloc(sizeof(int) * (size_t)cap);
+  int V = target->vocab;
+  /* 这三个必须在可能 goto fail 的代码**之前**声明并初始化为 NULL：
+   * 旧写法把它们声明在 pages_alloc 之后，于是“KV 池耗尽”那条路上 fail: 里会
+   * sgl_xfree() 三个未初始化的指针（未定义行为 / 堆损坏）。Clang 的
+   * -Wsometimes-uninitialized 抓住的就是这个（GCC 没报）。sgl_xfree 对 NULL 安全
+   * （POSIX 版判空；MSVC 的 _aligned_free(NULL) 也是 no-op）。*/
+  float *dl = NULL;
+  float *tl = NULL;
+  float *vl = NULL;
+  if (!tp || !dp) { /* 主机内存不足：页表根本没填，不能走 pages_unref */
+    SGL_ERROR("spec: out of host memory (page tables)");
+    sgl_xfree(seq);
+    sgl_xfree(tp);
+    sgl_xfree(dp);
+    return -1;
+  }
   if (sgl_llama_pages_alloc(target, tp, cap) != 0 ||
       sgl_llama_pages_alloc(draft, dp, cap) != 0) {
     SGL_ERROR("spec: pool exhausted");
     goto fail;
   }
-  int V = target->vocab;
-  float *dl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
-  float *tl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
-  float *vl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V * (size_t)K); /* 批量 verify：[K][V] */
+  dl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+  tl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+  vl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V * (size_t)K); /* 批量 verify：[K][V] */
+  if (!dl || !tl || !vl) {
+    SGL_ERROR("spec: out of host memory");
+    goto fail;
+  }
   int produced = 0, n_accepts = 0, n_drafted = 0;
 
   if (kv_catch_up(target, seq, n_prompt, &t_kv, tp, tl) != 0) goto fail;
