@@ -5,6 +5,16 @@
 ## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G12/G13/G14/G15/G16/G17/G18/G19
 
 ### 基础设施（G19 补记）
+- **`linux-arm64` 矩阵项也真跑了**（Docker Desktop 带 qemu binfmt，`--platform linux/arm64`
+  能起 aarch64 容器）：arm64 上 `__SSE2__`/AVX2 全不成立、`ops.c` 退到**标量**内积，
+  等于 CPU 数值路径换了一套代码。实测：**65/65 编译链接成功、`ctest` 24/24 通过、
+  gate counts 4/4/1 PASS**（摘要 `docs/g_arm64_ctest.txt`；qemu 下耗时不可与原生比）。
+  过程中一次假失败是我自己的复刻脚本不对（只生成 2 个族、其余靠 `cp -a` 拷到了 G13 前的
+  旧夹具），按 workflow 补齐 5 个族后全绿——详见 `docs/PROGRESS_g11_g19.md`。
+- **本地陷阱提醒**（CI 不受影响）：`sglang-c/models/qwen3next-rand` 是 G13 前的旧夹具
+  （q_proj `[64,64]`，而真模型 `../models/qwen3next-rand` 是 `[128,64]`）。已被 .gitignore，
+  干净检出/CI 都没有；但只拿 `./models` 本地构建会以「layer 3 weights missing / 形状不符」
+  假红，用 `tests/gen_random_qwen3next.py --out models/qwen3next-rand` 重生即可。
 - **在 Docker(Ubuntu 24.04) 里把 `linux-x64` 矩阵项真跑了一遍**（之前只验过 msvc 与
   msvc-cuda；我当时写的「本机无 Linux 环境」不准确）：生成 5 个随机族 → Ninja 配置编译 →
   `ctest -V` **24/24 通过**（含 `test_family_*` 4 项与 `test_llava`）→ 抽出 workflow 的

@@ -189,6 +189,50 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 至此 **TODO_PROMPTS v0.4 的 G11–G19 全部完成**（只剩可选项未做：G12 的 7B LM 端到端
   因磁盘不够、G13 的 CUDA 路径、G15 的跳段共享——都有实测依据说明无意义/不可能）。
 
+## linux-arm64 矩阵项实跑（第 14 轮，2026-10-27）
+
+上一轮我判定「arm64 跑不了」，**这个判断也不对**：Docker Desktop 带 qemu binfmt，
+`--platform linux/arm64` 能跑 aarch64 容器（`uname -m` → `aarch64`）。于是把 CI 里
+`linux-arm64` 那一项也用 ubuntu:24.04 + qemu 模拟跑了。
+
+这一项值得单独验：arm64 上 `__SSE2__`/AVX2 全部不成立，`src/ops.c` 会退到**标量**内积路径，
+`src/dot_avx2_msvc.c` 只对 MSVC 生效——也就是说 CPU 数值路径与 x86 是**两套不同代码**。
+
+### 结果（qemu 模拟，耗时不可与原生相比）
+
+| 步骤 | 结果 |
+|---|---|
+| `apt-get install build-essential cmake ninja-build ...` | OK；GCC 报 `OpenMP: enabled (compiler-driven)`（arm64 上 GNU 同样开） |
+| 生成 5 个随机族 + `ref_llava.py` | 全部成功，`proj_checksum 1.072851`（与 x86 逐字节一致） |
+| `cmake -G Ninja` + `cmake --build build -j` | **65/65 全部编译链接成功（BUILD_OK_ARM64）** |
+| `ctest -V --timeout 1800` | **100% tests passed, 0 failed out of 24** |
+| G19 gate（`bash -e -o pipefail`） | **counts: fam=4 fam_ran=4 llava=1 → ARM64_GATE_PASS** |
+
+摘要留档：`docs/g_arm64_ctest.txt`。24 项里 `test_family_{mistral,gemma,gemma2,qwen3next}`
+分别 11.40 / 11.27 / 11.11 / 51.84s（qemu 下），全 Passed。
+
+### 过程中的一次「假失败」（我自己的脚本问题，已排除）
+
+第一遍有 2 项失败：`test_lin_seq` 与 `test_family_qwen3next`，报
+`tensor 'model.layers.3.self_attn.q_proj.weight' shape[0]=64 != expected 128`。
+
+查明是**我的复刻脚本不对**，不是产品问题：workflow 会生成**全部 5 个族**，我为了省 qemu 时间
+只生成了 2 个，其余靠 `cp -a /srcro/.` 从仓库工作目录拷——而 `sglang-c/models/qwen3next-rand`
+是 **G13 之前的旧夹具**（q_proj 宽 64），新代码按 `2*q_dim`（=128）读，于是报形状不符。
+按 workflow 补齐 5 个生成后重跑：**24/24 全过**。
+
+顺带记一个**本地陷阱**（CI 不受影响）：`sglang-c/models/` 里还留着 G13 之前的
+`qwen3next-rand`（q_proj `[64,64]`，真模型在 `../models/qwen3next-rand` 是 `[128,64]`）。
+它已被 `.gitignore` 忽略，所以干净检出/CI 都没有；但如果有人只拿 `./models` 当模型目录
+本地构建，`test_family_qwen3next`/`test_lin_seq` 会以「layer 3 weights missing / 形状不符」
+的形式假红。用 `tests/gen_random_qwen3next.py --out models/qwen3next-rand` 重生即可。
+
+### 仍未验证
+
+- `macos-arm64` / `macos-x64`：Windows 上没有 macOS，无法等价复现（`macos-x64` 还牵扯
+  `-DCMAKE_OSX_ARCHITECTURES=x86_64` 交叉编译 + Rosetta 转译）。
+- `release` job：需 push tag，属对外发布，未做。
+
 ## Linux job 实跑（第 13 轮，2026-10-27）
 
 之前我写「本机没有 Linux 环境」——**不准确**。WSL 里只有 `docker-desktop`（非通用发行版），但 Docker 可用（linux/amd64 29.6.2），于是能用 Ubuntu 24.04 容器把
