@@ -253,6 +253,22 @@ mlx.core（默认 Metal GPU）上**，只借用 numpy 读 safetensors 和落 `.n
 `macos-x64`（Intel / Rosetta 交叉编译）：这台 iMac 是 arm64，用
 `CMAKE_OSX_ARCHITECTURES=x86_64` 可以交叉编译，但那需要额外一轮；`release` job 仍需 push tag。
 
+### 留在 iMac 上的东西（下轮可直接复用）
+
+- `~/tools/cmake/CMake.app/...`、`~/tools/ninja`、`~/tools/venv`（含 **mlx 0.29.3**）
+- `~/sglang-work/sglang-c`：已构建的树（`build/bin/` 里 24 个测试可执行），
+  含 `models/gpt2`（523MB）与 5 个随机族；磁盘剩余由 6.3GB 降到 **3.6GB**
+  （不再需要时直接删 `~/sglang-work` 即可回收）
+- 网络：HF 可达（2.1s）；PyPI 直连太慢，**用清华镜像**才装得上 mlx
+
+### 本轮未完成
+
+- **ASan + UBSan 跑全量测试**：起点是找内存/UB 问题（上一轮 Clang 警告刚抓到过一个真 bug）。
+  在 Docker 里已构建成功（clang + `-fsanitize=address,undefined`）、跑到 11/24 时 Docker
+  守护进程失去响应（同时把本机 C: 撑到 **0 字节**），容器被清掉，**未重跑**。
+  接着做的方式：`-DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"` 构建后
+  `ASAN_OPTIONS=detect_leaks=0 ctest -V`，再 grep `ERROR: AddressSanitizer` / `runtime error:`。
+
 macOS job 跑不了（无 macOS），但能做一件同等价值的事：**用 Clang 构建整个项目**。
 `CMAKE_C_COMPILER_ID == Clang` 正是 macOS job 走的分支（Apple Clang 也是 CLANG），而且
 Clang 不装 libomp 时走的是**非 OpenMP 单线程 fallback**——这条组合在 x86 上从未验过
