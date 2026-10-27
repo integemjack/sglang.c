@@ -261,7 +261,9 @@ jobs:
           [ "$code" -eq 1 ] || { echo "::error::sglc usage smoke failed ($code)"; exit 1; }
 
       - name: Package (Linux/macOS CPU)
-        if: startsWith(matrix.flavor, 'cpu')
+        # 用 gen 而不是 flavor 判断：windows-x64 的 flavor 也是 cpu，用 flavor 会
+        # 在 Windows 上用 Git Bash 额外打一个 tar.gz（既重复又和 zip 内容一样）。
+        if: matrix.gen == 'ninja' || matrix.gen == 'ninja-mlx'
         shell: bash
         run: |
           mkdir -p dist
