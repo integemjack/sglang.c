@@ -73,6 +73,7 @@ int main(int argc, char **argv) {
   const char *dir = argc > 1 ? argv[1] : getenv("SGL_TEST_LLAVA");
   if (!dir || !*dir) dir = "models/llava-rand";
   const char *ref = argc > 2 ? argv[2] : "ref_llava.json";
+  (void)ref; /* G12 起比对的是目录里的 _ref_{feats,proj,imgemb}.npy，这个参数只为兼容旧调用 */
 
   /* CI / fresh clone 里没有随机多模态模型（gen_random_llava.py 生成，不入库）：
    * 缺模型就 SKIP，别把「模型没生成」变成「测试失败」——t9/t10 时代 CI 就
@@ -149,7 +150,7 @@ int main(int argc, char **argv) {
         double d = fabs((double)feats[i] - rf[i]);
         if (d > e) e = d;
       }
-      printf("[llava] CLIP patch feats vs numpy: maxerr = %.3g\n", e);
+      printf("[llava] CLIP patch feats vs ref(_ref_feats.npy; numpy 或 MLX): maxerr = %.3g\n", e);
       CHECK(e < 2e-4, "feats diverge: %g", e);
       free(rf);
     }
@@ -166,7 +167,7 @@ int main(int argc, char **argv) {
         double d = fabs((double)emb[i] - ri[i]);
         if (d > e) e = d;
       }
-      printf("[llava] image_embeds(pooled->visual_projection) vs numpy: maxerr = %.3g\n", e);
+      printf("[llava] image_embeds(pooled->visual_projection) vs ref: maxerr = %.3g\n", e);
       CHECK(e < 2e-4, "image_embeds diverge: %g", e);
       free(ri);
     }
@@ -194,7 +195,7 @@ int main(int argc, char **argv) {
     double e = fabs((double)proj_c[i] - rproj[i]);
     if (e > maxerr) maxerr = e;
   }
-  printf("[llava] CLIP+projector(%s) vs numpy: maxerr = %.3g over %d x %d\n",
+  printf("[llava] CLIP+projector(%s) vs ref(_ref_proj.npy; numpy 或 MLX): maxerr = %.3g over %d x %d\n",
          w2.data ? "2-layer MLP" : "1-layer linear", maxerr, NP, LM_E);
   CHECK(maxerr < 2e-4, "llava numerics diverge: %g", maxerr);
 

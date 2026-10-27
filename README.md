@@ -12,9 +12,14 @@
 
 | 包 | 内容 |
 |---|---|
-| `linux-x64 / linux-arm64 / macos-arm64 / macos-x64` | `sglc`（CPU，OpenMP 多线程） |
-| `windows-x64` | `sglc.exe`（CPU，MSVC /MT 静态） |
+| `linux-x64 / linux-arm64` | `sglc`（CPU，GNU 编译器下开 OpenMP 多线程） |
+| `macos-arm64 / macos-x64` | `sglc`（CPU，**单线程**：AppleClang 无 `-fopenmp`，CI 不装 libomp） |
+| `windows-x64` | `sglc.exe`（CPU，MSVC /MT 静态，单线程） |
 | `windows-x64-cuda` | `sglc.exe` + `cuda_cli.exe` + `cuda_http.exe`（RTX 显卡加速，sm_75+；需驱动，附带 cublas64 DLL） |
+
+构建矩阵的实测状态（哪一项是怎么验的）：`docs/PROGRESS_g11_g19.md` —— linux-x64 / linux-arm64 /
+windows-msvc / windows-msvc-cuda 均已实跑；**macos-arm64 已在真机 iMac（macOS 27.0.1 / AppleClang 21）
+上编译并 ctest 24/24 通过**（`docs/g_macos_arm64.txt`）；macos-x64 仍未直接验证。
 
 ## 能力一览
 

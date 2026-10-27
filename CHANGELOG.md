@@ -223,6 +223,19 @@
   VRAM 0.000 MB/min，PASS，且如实打出「无 ERROR/FATAL 行」。
 
 ### 基础设施
+- **`macos-arm64` 已在真机 iMac 上实跑**（macOS 27.0.1 / AppleClang 21.0.0 / arm64 8 核；
+  cmake 3.31.6 + ninja 1.13.1 用官方预编译二进制装在 `~/tools`，**不需 sudo/Homebrew**）：
+  按 workflow 的步骤生成 5 族 → Ninja 配置编译（**66 个目标全成功**）→ `ctest` **24/24 通过**
+  → G19 gate `fam=4 fam_ran=4 llava=1` **PASS**。摘要 `docs/g_macos_arm64.txt`。
+  顺带核实：AppleClang 无 `-fopenmp`，走的是 CMakeLists 的单线程 fallback 分支；
+  README 里「macOS = OpenMP 多线程」已改正。
+- **Mac 上用 MLX 做数值参考**（新增 `tests/ref_llava_mlx.py`）：与 `ref_llava.py` 数学等价、
+  实现独立，计算全在 `mlx.core`（Metal GPU）上，只借 numpy 读 safetensors / 写 `.npy`。
+  覆盖写 `_ref_*.npy` 后，`test_llava` **一行未改**就变成「C 实现 vs MLX」：
+  CLIP patch feats maxerr **4.77e-07**、两层 projector **1.49e-08**（阈值 2e-4）；
+  MLX 与 numpy 两个参考彼此 **rel 2.6e-07 / 3.1e-07**；换成 MLX 参考后全量 ctest 仍 **24/24**。
+- `test_llava` 的输出文案改成 `vs ref(_ref_*.npy; numpy 或 MLX)`（原来写死 `vs numpy`）；
+  顺手消掉一个 Clang 可见的未使用变量警告。
 - **G19 CI 真跑模型族与多模态**：`gen_random_{mistral,gemma,qwen3next}.py` 加
   `--out/--tokenizer`（`gen_random_gemma.py` 另有 `--variant dynamic` 出 gemma2），
   CI 里生成 mistral/gemma/gemma2/qwen3next/llava 五套随机模型 + 跑 `ref_llava.py`，

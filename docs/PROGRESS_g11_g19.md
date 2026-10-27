@@ -189,7 +189,69 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 至此 **TODO_PROMPTS v0.4 的 G11–G19 全部完成**（只剩可选项未做：G12 的 7B LM 端到端
   因磁盘不够、G13 的 CUDA 路径、G15 的跳段共享——都有实测依据说明无意义/不可能）。
 
-## Clang 构建 + spec.c 真 bug（第 15 轮，2026-10-27）
+## macOS arm64 真机 + MLX（第 16 轮，2026-10-27）
+
+用户提供了一台 iMac（`192.168.20.14`，用户 `wangchao`）。上一轮我写的「macOS 只能静态审查」
+**因此作废**：这一轮在真机上把 `macos-arm64` 矩阵项跑通了，并按用户要求用 **MLX** 做数值参考。
+
+### 环境（真机，非模拟）
+
+| 项 | 值 |
+|---|---|
+| 系统 / 架构 | macOS 27.0.1 / arm64（8 核） |
+| 编译器 | Apple clang 21.0.0 (clang-2100.3.34.2) |
+| cmake / ninja | 3.31.6 / 1.13.1（官方预编译二进制，装在 `~/tools`，**没装 Homebrew、不需要 sudo**） |
+| OpenMP | **不可用**（AppleClang 无 `-fopenmp`）→ 走单线程 fallback，正是 CMakeLists 里的 else 分支 |
+| MLX | 0.29.3，`mx.default_device()` = `Device(gpu, 0)`（Metal） |
+| python | 3.9.6（venv），numpy 2.0.2、tokenizers 0.22.2 |
+
+### 结果
+
+| 步骤 | 结果 |
+|---|---|
+| 解包 + 按 workflow 下载 gpt2(523MB) / qwen3-06 tokenizer | OK |
+| 生成 5 个随机族 + `ref_llava.py` | 全部成功，`proj_checksum 1.072851`（与 x86 逐字节一致） |
+| `cmake -G Ninja` + `cmake --build build` | **66 个目标全部编译链接成功** |
+| `ctest -V --timeout 1800` | **24/24 通过**（`test_radix` 14.4s、`test_scheduler` 4.1s） |
+| G19 gate（同一套判据） | **counts: fam=4 fam_ran=4 llava=1 → MACOS_GATE_PASS** |
+
+摘要留档：`docs/g_macos_arm64.txt`。
+
+### MLX 作为数值参考（用户要求「测试在 mac 使用 mlx」）
+
+新增 `tests/ref_llava_mlx.py`：与 `ref_llava.py` 数学等价、实现独立，**计算全部在
+mlx.core（默认 Metal GPU）上**，只借用 numpy 读 safetensors 和落 `.npy`。它覆盖写
+`models/llava-rand/_ref_{proj,feats,imgemb}.npy`，于是 `test_llava` 的比对对象就从 numpy
+换成了 MLX（测试本身一行没改）。
+
+| 对照 | 数值 |
+|---|---|
+| MLX(Metal) vs numpy 参考（proj） | maxerr **1.49e-08**，max\|ref\|=0.057 → **rel 2.60e-07** |
+| MLX vs numpy 参考（feats） | maxerr **9.54e-07**，max\|ref\|=3.12 → **rel 3.06e-07** |
+| **C 实现 vs MLX 参考**（CLIP patch feats） | maxerr **4.77e-07** |
+| **C 实现 vs MLX 参考**（两层 MLP projector） | maxerr **1.49e-08** over 16×64 |
+| 换成 MLX 参考后重跑全量 ctest | 仍 **24/24**，`test_llava: all OK` |
+
+结论：三个独立实现（C fp32 CPU、numpy fp32/f64、**MLX Metal fp32**）在这一层的相互差
+都在 1e-7 量级，远低于测试阈值 2e-4。
+
+### 期间修/发现的三件事
+
+1. **`test_llava` 的输出文案过期**：三处写的是 `vs numpy`，但参考文件可能来自 MLX。
+   已改成 `vs ref(_ref_*.npy; numpy 或 MLX)`。
+2. **`test_llava.c` 一个 Clang 可见的未使用变量**（`ref`，G12 后比对改为读 `.npy`）：
+   加 `(void)ref;` 并注明参数只为兼容旧调用。
+3. **一次「假失败」是我自己的脚本造成的**：第一次解包时 `git archive` 的 tar 没有顶层目录，
+   我 `tar -C ~/sglang-work` 把仓库解到了 `~/sglang-work/` 根上，于是遗留了
+   `~/sglang-work/models/gpt2/`（只有 config、没有权重）。CMake 的
+   `if(EXISTS ../models/gpt2)` 因此成立，ctest 的 `SGL_TEST_MODEL` 指向那个空目录，
+   `test_radix` 报 `sched init failed` 而红。删掉遗留目录重新 configure 后 **24/24 全绿**。
+   教训：CMake 那个「优先 ../models」的分支对**残缺目录**是敏感的。
+
+### 仍未直接验证
+
+`macos-x64`（Intel / Rosetta 交叉编译）：这台 iMac 是 arm64，用
+`CMAKE_OSX_ARCHITECTURES=x86_64` 可以交叉编译，但那需要额外一轮；`release` job 仍需 push tag。
 
 macOS job 跑不了（无 macOS），但能做一件同等价值的事：**用 Clang 构建整个项目**。
 `CMAKE_C_COMPILER_ID == Clang` 正是 macOS job 走的分支（Apple Clang 也是 CLANG），而且
