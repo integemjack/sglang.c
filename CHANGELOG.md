@@ -18,6 +18,21 @@
   没有实现（只有 macOS 数值参考脚本），`--device mlx` 会明确提示后回落。
   `--w8` 在 GPU 路径映射到 `SGL_CUDA_W8`（不能同时开 `SGL_W8`，否则上传源已被 int8 化）。
 - 多 LoRA 路由只在 CPU 引擎里：`--lora` + auto 时自动用 CPU，显式 `--device cuda` 报错。
+- **Windows：cuBLAS 改成 delay-load**（`/DELAYLOAD:cublas*64_*.dll`）。sglc 把 GPU 引擎链进来
+  之后，它会硬 import `cublas64_13.dll`，于是“没装 CUDA toolkit / 没有显卡驱动”的机器上连
+  `sglc` 看用法都起不来（`0xC0000135` = STATUS_DLL_NOT_FOUND）；CI 托管 runner 没驱动，
+  `windows-x64-cuda` 与 `windows-arm64-cuda` 的 smoke 就是这么红的。现在：
+  - 链接时 delay-load，启动时不碰 cublas（`dumpbin /dependents` 里它只出现在
+    “delay load dependencies”）；
+  - `sglc` 起服务前先用 `LoadLibraryA()` 预检一次（DLL 名由 CMake 注入
+    `SGL_CUBLAS_DLL`，因为名带 toolkit 版本号），加载不了就直接走 CPU 引擎，
+    一次 CUDA API 都不调（cudart 是静态的，光看显存探不出来，真崩会崩在 worker 线程
+    第一次 GEMM，主线程 SEH 包不住）；
+  - 显存探测本身也包了 `__try/__except`（delay-load 失败是结构化异常）。
+  `cuda_cli` / `cuda_http` 保持硬导入——它们本来就是 GPU 专用程序。
+- 验收：带驱动：`--serve` → `device: cuda`，`/health` 报 `"gpu":true`、`/generate` 正常；
+  把 CUDA 的 bin 从 PATH 里去掉：`device: cublas64_13.dll 加载不了 → cpu`，`http.c` 引擎
+  起服务且 `/generate` 正常；无参 `sglc` 在两种情况下都 exit 1。
 - 验收：MSVC/CUDA 构建 `sglc --serve`（auto，RTX 2060）→ `/health` 报 `"gpu":true`、
   `/generate` 正常；`--device cpu` → http.c 引擎 `/health` + `/generate` 正常；
   MinGW 构建 `sglc --serve` 正常；两套构建 ctest 全绿（MinGW 26/26、MSVC-CUDA 25/25）。

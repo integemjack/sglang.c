@@ -1,4 +1,4 @@
-﻿/* sglc — sglang-c 推理 CLI（对应 sglang 的 python -m sglang.launch_server 单机路径）*/
+/* sglc — sglang-c 推理 CLI（对应 sglang 的 python -m sglang.launch_server 单机路径）*/
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
@@ -182,6 +182,59 @@ static int sched_add_loras(sgl_scheduler *sc, const char *model_dir,
   return 0;
 }
 
+/* 探 CUDA 前先自检一次 cuBLAS 能不能加载。
+ *
+ * 为什么单独这一步：Windows 的 sglc 把 cublas 编成了 delay-load，而 cudart 是静态库，
+ * 所以“有驱动”≠“能算”——只装驱动、没装 CUDA toolkit 的机器上 sgl_cuda_avail_vram_mb()
+ * 照样能拿到显存数（cudart 自己的 nvcuda 直调），但第一次 GEMM 去加载 cublas64_*.dll
+ * 时失败，崩的是 worker 线程，主线程的 SEH 包不住。这里先用 LoadLibrary 探一下，
+ * 加载不了就直接走 CPU，完全不碰 CUDA。
+ * 名字由 CMake 注入（SGL_CUBLAS_DLL），因为 DLL 名带 toolkit 版本号（cublas64_13.dll）。*/
+#ifndef SGL_CUBLAS_DLL
+#define SGL_CUBLAS_DLL ""
+#endif
+
+#if defined(_WIN32) && defined(SGL_EMBED_CUDA_HTTP)
+#include <windows.h> /* HMODULE / LoadLibraryA / EXCEPTION_EXECUTE_HANDLER（SEH 宏在 winnt.h 里）*/
+static int sglc_cublas_loadable(void) {
+  if (!SGL_CUBLAS_DLL[0]) return 1; /* 没注入具体名字：交给下面的 SEH 探测兜底 */
+  static int cached = -1;
+  if (cached >= 0) return cached;
+  HMODULE h = LoadLibraryA(SGL_CUBLAS_DLL);
+  cached = h ? 1 : 0;
+  /* 成功就不卸载：delay-load 随后会在已加载的模块上解析，少一次加载开销 */
+  return cached;
+}
+#else
+static int sglc_cublas_loadable(void) { return 1; }
+#endif
+
+/* 探一下能不能用 CUDA：返回 0 = 调到了 API（*mb_out 为可用显存，负数表示无卡），
+ * 非 0 = 连调用都没走到。
+ *
+ * 为什么不能直接调 sgl_cuda_avail_vram_mb()：Windows 的 sglc 把 cublas 编成了
+ * delay-load（见 CMakeLists 里 /DELAYLOAD 那段），第一次碰 CUDA API 才去加载
+ * cublas64_*.dll；机器上没有 NVIDIA 驱动或没装 cuBLAS 时，加载失败会被 delay-load
+ * 的默认处理变成一次结构化异常（VcppException(ERROR_MOD_NOT_FOUND)）。不兜住的话
+ * 进程就带着 0xC0000135 死掉，“没卡就用 CPU”这条路径根本走不到。
+ * __try/__except 在纯 C 函数里可用（不能和 C++ 对象展开混用，这里没有）。*/
+#if defined(_MSC_VER) && defined(SGL_EMBED_CUDA_HTTP)
+static int sglc_probe_cuda_vram(long *mb_out) {
+  __try {
+    *mb_out = sgl_cuda_avail_vram_mb();
+    return 0;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    *mb_out = -1;
+    return -1;
+  }
+}
+#elif defined(SGL_EMBED_CUDA_HTTP)
+static int sglc_probe_cuda_vram(long *mb_out) {
+  *mb_out = sgl_cuda_avail_vram_mb();
+  return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
   const char *model_dir = NULL, *prompt = "The meaning of life is";
   const char *host = "127.0.0.1";
@@ -264,9 +317,20 @@ int main(int argc, char **argv) {
     else if (dev_auto)
       SGL_INFO("device: 选择次序 cuda → mlx（未编入）→ cpu");
 #ifdef SGL_EMBED_CUDA_HTTP
+    if (dev_cuda && !sglc_cublas_loadable()) {
+      if (!dev_auto) {
+        fprintf(stderr, "[device] --device cuda：%s 加载不了（没装 CUDA toolkit 或显卡驱动）\n",
+                SGL_CUBLAS_DLL[0] ? SGL_CUBLAS_DLL : "cuBLAS");
+        return 2;
+      }
+      SGL_INFO("device: %s 加载不了（没装 CUDA toolkit 或显卡驱动）→ cpu",
+               SGL_CUBLAS_DLL[0] ? SGL_CUBLAS_DLL : "cuBLAS");
+      dev_cuda = 0;
+    }
     if (dev_cuda) {
-      long free_mb = sgl_cuda_avail_vram_mb(); /* 无显卡/无驱动 → 负数 */
-      if (free_mb > 0) {
+      long free_mb = -1;
+      int probed = sglc_probe_cuda_vram(&free_mb); /* 无显卡/无驱动/加载不了 cuBLAS → 负数 */
+      if (probed == 0 && free_mb > 0) {
         if (n_loras > 0) {
           /* GPU 引擎（cuda_http）只有单实例；多 LoRA 路由在 CPU 调度器里 */
           fprintf(stderr, "[device] --lora 多实例路由只有 CPU 引擎支持；改用 cpu 引擎\n");
@@ -278,11 +342,18 @@ int main(int argc, char **argv) {
         }
       } else {
         if (!dev_auto) {
-          fprintf(stderr, "[device] --device cuda：没有可用的 CUDA 设备/驱动（avail_vram=%ld MB）\n",
-                  free_mb);
+          if (probed != 0)
+            fprintf(stderr,
+                    "[device] --device cuda：cuBLAS/CUDA 运行时加载不了（无驱动或没装 DLL）\n");
+          else
+            fprintf(stderr, "[device] --device cuda：没有可用的 CUDA 设备/驱动（avail_vram=%ld MB）\n",
+                    free_mb);
           return 2;
         }
-        SGL_INFO("device: cuda 不可用（avail_vram=%ld MB）→ cpu", free_mb);
+        if (probed != 0)
+          SGL_INFO("device: cuBLAS/CUDA 运行时加载不了（无驱动或没装 DLL）→ cpu");
+        else
+          SGL_INFO("device: cuda 不可用（avail_vram=%ld MB）→ cpu", free_mb);
       }
     }
 #else

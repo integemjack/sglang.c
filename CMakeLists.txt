@@ -363,6 +363,33 @@ if(SGL_CUDA)
       target_compile_options(${t} PRIVATE /O2 /utf-8)
       target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     endforeach()
+    # sglc 里的 CUDA 是**可选**后端（--device auto 探测不到就回落 CPU），所以 cublas 必须是
+    # delay-load：否则 import table 里硬挂着 cublas64_*.dll，机器上没有 NVIDIA 驱动/没装
+    # cuBLAS 时连 `sglc` 看用法都起不来（0xC0000135 = STATUS_DLL_NOT_FOUND，CI 托管
+    # runner 没驱动，windows-x64-cuda / windows-arm64-cuda 的 smoke 就是这么红的）。
+    # cuda_cli / cuda_http 保持正常导入：它们本来就是 GPU 专用程序。
+    file(GLOB SGL_WIN_CUBLAS_DLLS
+         "${CUDA_TOOLKIT_DIR}/bin/cublas*64_*.dll"
+         "${CUDA_TOOLKIT_DIR}/bin/${SGL_WIN_CUDA_ARCH_DIR}/cublas*64_*.dll")
+    if(SGL_WIN_CUBLAS_DLLS)
+      foreach(_dll ${SGL_WIN_CUBLAS_DLLS})
+        get_filename_component(_dllname "${_dll}" NAME)
+        target_link_options(sglc PRIVATE "/DELAYLOAD:${_dllname}")
+        # 主库名（cublas64_*.dll，不带 Lt）：sglc 启动时用它做一次 LoadLibrary 预检，
+        # 加载不了就直接回落 CPU，不去碰任何 CUDA API
+        if(_dllname MATCHES "^cublas64_")
+          set(SGL_SGLC_CUBLAS_DLL "${_dllname}")
+        endif()
+        message(STATUS "sglc: delay-load ${_dllname}")
+      endforeach()
+      if(SGL_SGLC_CUBLAS_DLL)
+        target_compile_definitions(sglc PRIVATE SGL_CUBLAS_DLL="${SGL_SGLC_CUBLAS_DLL}")
+        message(STATUS "sglc: CUDA precheck on ${SGL_SGLC_CUBLAS_DLL}")
+      endif()
+      target_link_libraries(sglc PRIVATE delayimp)
+    else()
+      message(WARNING "sglc: no cublas*64_*.dll under ${CUDA_TOOLKIT_DIR}/bin — sglc keeps the hard import")
+    endif()
   else()
     # Linux/macOS：Toolkit 的 lib64（老包是 lib）里取静态 cudart + cublas；
     # nvcc 的 host 代码是 C++，静态 cudart 需要 libstdc++；cudart 自己还要 pthread/dl/rt。
