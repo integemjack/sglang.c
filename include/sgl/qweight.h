@@ -32,6 +32,7 @@
 #ifndef SGL_QWEIGHT_H
 #define SGL_QWEIGHT_H
 
+#include <stddef.h> /* size_t：GCC/Linux 不会从别的头文件间接带进来 */
 #include <stdint.h>
 
 typedef enum {
