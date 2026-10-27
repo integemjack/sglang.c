@@ -1,4 +1,4 @@
-﻿/* G12 验收（真实权重，分段对照）：真实 CLIP-L/14-336（openai/clip-vit-large-patch14-336）
+/* G12 验收（真实权重，分段对照）：真实 CLIP-L/14-336（openai/clip-vit-large-patch14-336）
  * + 真实 llava-1.5 的 mm_projector（mlp2x_gelu）→ 与 HF transformers 的 CPU 参考逐层对照。
  *
  * 为什么是「分段」：llava-1.5-7b 的 LM 是 fp16 13.5GB，本机剩余磁盘放不下（见
@@ -20,6 +20,7 @@
 
 #include "sgl/alloc.h"
 #include "sgl/image.h"
+#include "sgl/port.h" /* fopen_s on POSIX（MSVC 有原生实现）*/
 
 static int FAILURES = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { FAILURES++; printf("FAIL %s:%d: ", __FILE__, __LINE__); \

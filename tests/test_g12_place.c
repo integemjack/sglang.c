@@ -1,4 +1,4 @@
-﻿/* G12 验收：`<image>` 占位符位置插入 visual token（而不是接在 prompt 末尾）。
+/* G12 验收：`<image>` 占位符位置插入 visual token（而不是接在 prompt 末尾）。
  *
  * 三条断言（全部要求逐位相等 / 必须不同）：
  *  1) 正确性：prompt = A + <image> + B（A/B 是文本 token），插 2 张图的视觉 token 后，
@@ -25,6 +25,7 @@
 #include "sgl/image.h"
 #include "sgl/llama.h"
 #include "sgl/model.h"
+#include "sgl/port.h" /* fopen_s on POSIX（MSVC 有原生实现）*/
 #include "sgl/scheduler.h"
 
 static int FAILURES = 0;

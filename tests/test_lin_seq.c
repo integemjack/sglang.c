@@ -1,4 +1,4 @@
-﻿/* G13 验收：linear_attention 的递归状态按「序列」归属，而不是按首个 KV 页。
+/* G13 验收：linear_attention 的递归状态按「序列」归属，而不是按首个 KV 页。
  *
  * 场景（radix 前缀共享）：两条序列的页表前 k 个位置指向**【同一批物理页】**（共享
  * 已算好的前缀 KV），只有后缀页各归各的。旧实现用 slot_idx[0] 当状态归属键，两条
@@ -22,6 +22,7 @@
 
 #include "sgl/alloc.h"
 #include "sgl/llama.h"
+#include "sgl/port.h" /* fopen_s on POSIX（MSVC 有原生实现）*/
 
 static int FAILURES = 0;
 #define NP 8 /* 共享前缀长度（= 共享页数） */

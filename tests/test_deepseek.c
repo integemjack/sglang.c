@@ -26,6 +26,7 @@
 #include "sgl/deepseek.h"
 #include "sgl/json.h"
 #include "sgl/log.h"
+#include "sgl/port.h" /* fopen_s on POSIX（MSVC 有原生实现）*/
 
 static int g_fail = 0;
 static int g_checks = 0;

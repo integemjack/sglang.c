@@ -1,4 +1,4 @@
-﻿/* test_mla.c — DeepSeek 系 MLA（吸收式）数值正确性，对照 numpy 参考
+/* test_mla.c — DeepSeek 系 MLA（吸收式）数值正确性，对照 numpy 参考
  * 参考由 tests/gen_random_mla.py 生成（非吸收式，按 HF modeling_deepseek_v2.py 公式），
  * 参考与 C 不共享任何代码路径（权重走 safetensors、参考走 numpy）。
  *
@@ -20,6 +20,7 @@
 #include "sgl/alloc.h"
 #include "sgl/json.h"
 #include "sgl/mla.h"
+#include "sgl/port.h" /* fopen_s on POSIX（MSVC 有原生实现）*/
 
 static int FAILURES = 0;
 #define CHECK(cond, ...) \
