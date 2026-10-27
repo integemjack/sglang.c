@@ -417,38 +417,6 @@ jobs:
         with:
           arch: arm64
 
-      # 调试用：nvcc 报的是“The system cannot find the path specified.”（没说缺哪个文件）。
-      # 这里把 cl.exe 位置、目录内容、以及几种 ccbin 变体（含 -allow-unsupported-compiler）
-      # 各跑一次 -v 编译，把 nvcc 实际调用的子命令打到日志里。不阻塞，失败不影响后续步骤。
-      - name: Diagnose nvcc + MSVC (arm64)
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $cl = (Get-Command cl.exe -ErrorAction SilentlyContinue).Source
-          Write-Host "cl.exe : $cl"
-          if (-not $cl) { Write-Host "cl.exe not on PATH"; exit 0 }
-          $ccbin = Split-Path $cl
-          Write-Host "ccbin  : $ccbin"
-          Get-ChildItem $ccbin -Filter 'cl.exe' | Select-Object FullName,Length | Out-Host
-          Get-ChildItem $ccbin -Filter 'c1*.dll' | Select-Object Name | Out-Host
-          Write-Host '--- cl.exe banner ---'
-          & $cl 2>&1 | Select-Object -First 3 | Out-Host
-          Write-Host '--- nvcc banner ---'
-          & nvcc --version 2>&1 | Out-Host
-          $variants = [ordered]@{
-            plain       = @('-ccbin', $ccbin)
-            unsupported = @('-ccbin', $ccbin, '-allow-unsupported-compiler')
-            nodefault   = @('-ccbin', $ccbin, '-Xcompiler', '/arm64')
-          }
-          foreach ($k in $variants.Keys) {
-            Write-Host "=== variant: $k ==="
-            $nvargs = @('-c', 'src/cuda_backend.cu', '-Iinclude', '-arch=sm_120',
-                        '-o', "$env:RUNNER_TEMP\diag_$k.obj", '-v') + $variants[$k]
-            & nvcc @nvargs 2>&1 | Select-Object -Last 30 | Out-Host
-            Write-Host "[diag] $k exit=$LASTEXITCODE"
-          }
-          exit 0
-
       - name: Configure (MSVC + CUDA, arm64)
         shell: pwsh
         run: |

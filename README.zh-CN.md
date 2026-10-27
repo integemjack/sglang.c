@@ -51,6 +51,8 @@ bash sglang-c/quickstart.sh
 `macos-arm64`、`macos-arm64-mlx`、`windows-x64`、`windows-x64-cuda`，外加独立的 `windows-arm64-cuda` job
 （GitHub 的 arm64 Windows runner）。每次 push 全量构建并打包；CUDA 与 arm64 项在无 GPU 的 runner 上跑不起来，
 只做 smoke（产物存在 + `ldd`/`dumpbin` 架构与依赖 + `sglc` usage 退出码），实际推理留给真机。
+v0.4.0 时 9 个目标全绿（run
+[40456249230](https://github.com/integemjack/sglang.c/actions/runs/40456249230)）。
 
 真机实测过的项与验法：`docs/PROGRESS_g11_g19.md`。linux-x64 / linux-arm64 / windows-x64 /
 windows-msvc-cuda 均已实跑；**macos-arm64 已在真机 iMac（macOS 27.0.1 / AppleClang 21）上编译并

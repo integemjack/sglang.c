@@ -127,7 +127,9 @@ Build matrix (`.github/workflows/build.yml`): `linux-x64`, `linux-arm64`, `linux
 `macos-arm64`, `macos-arm64-mlx`, `windows-x64`, `windows-x64-cuda`, plus a separate `windows-arm64-cuda` job
 on GitHub's arm64 Windows runner. Every push builds and packages all of them; the CUDA and arm64 entries
 cannot run on the GPU-less runners, so they are smoke-checked instead (binaries present, `ldd`/`dumpbin`
-architecture and dependencies, `sglc` usage exit code) and left to be run on real hardware.
+architecture and dependencies, `sglc` usage exit code) and left to be run on real hardware. All nine targets
+are green as of v0.4.0 (run
+[40456249230](https://github.com/integemjack/sglang.c/actions/runs/40456249230)).
 
 What was verified on real hardware and how: [docs/PROGRESS_g11_g19.md](docs/PROGRESS_g11_g19.md).
 `linux-x64`, `linux-arm64`, `windows-x64` and `windows-x64-cuda` have all been run for real; **macos-arm64

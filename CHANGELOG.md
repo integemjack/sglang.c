@@ -2,7 +2,11 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G12/G13/G14/G15/G16/G17/G18/G19
+## [v0.4.0] — 2026-10-27 「G11–G19 收尾 + 跨平台打包」
+
+本版把 TODO_PROMPTS v0.4 的缺口（G11–G19）收尾，并把构建/打包矩阵从「x64 为主」扩到
+9 个目标（含 Linux x64/arm64 的 CUDA、macOS MLX、Windows on Arm CUDA），详见下方
+「打包矩阵」一节与 [ROADMAP.md](ROADMAP.md)。
 
 ### 打包矩阵（2026-10-27）
 - **CUDA 后端不再只限 Windows**：`CMakeLists.txt` 的 CUDA 段拆成 MSVC / 非 MSVC 两支
