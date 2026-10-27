@@ -367,14 +367,13 @@ if(SGL_CUDA)
                  HINTS "${CUDA_TOOLKIT_DIR}/lib64" "${CUDA_TOOLKIT_DIR}/lib" /usr/local/cuda/lib64)
     find_library(SGL_CUBLAS_LIB NAMES cublas
                  HINTS "${CUDA_TOOLKIT_DIR}/lib64" "${CUDA_TOOLKIT_DIR}/lib" /usr/local/cuda/lib64)
-    find_library(SGL_STDCXX_LIB NAMES stdc++)
     if(NOT SGL_CUDART_STATIC OR NOT SGL_CUBLAS_LIB)
       message(FATAL_ERROR "CUDA runtime/cublas not found under ${CUDA_TOOLKIT_DIR} (lib64/lib)")
     endif()
-    set(SGL_CUDA_RUNTIME_LIBS ${SGL_CUDART_STATIC} ${SGL_CUBLAS_LIB} pthread dl rt m)
-    if(SGL_STDCXX_LIB)
-      list(APPEND SGL_CUDA_RUNTIME_LIBS ${SGL_STDCXX_LIB})
-    endif()
+    # nvcc 生成的 host 代码是 C++（device stub 里有 __cxa_guard_* 等），链接时必须有
+    # libstdc++。用 -lstdc++ 而不是 find_library：后者在某些镜像上找不到，漏到链接期
+    # 才报 "undefined reference to __cxa_guard_acquire"。
+    set(SGL_CUDA_RUNTIME_LIBS ${SGL_CUDART_STATIC} ${SGL_CUBLAS_LIB} stdc++ pthread dl rt m)
     message(STATUS "CUDA link libs: ${SGL_CUDA_RUNTIME_LIBS}")
     foreach(t cuda_test cuda_cli long_vcpu cuda_perf cuda_http)
       target_link_libraries(${t} PRIVATE ${SGL_CUDA_RUNTIME_LIBS})

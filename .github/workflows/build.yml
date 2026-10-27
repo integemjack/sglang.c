@@ -393,6 +393,16 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "CUDA silent install failed ($($p.ExitCode))" }
           $cuda = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4'
           if (-not (Test-Path "$cuda\bin\nvcc.exe")) { throw "nvcc not installed under $cuda" }
+          # nvcc 13.4 的 woA 预览版有个引号 bug：CICC_PATH 含空格时它拼出来的命令是
+          #   ""C:\Program Files\...\cicc" ...
+          # cmd 看到的是「空串 + C:\Program」→ The system cannot find the path specified.
+          # （实测三种 ccbin 变体都卡在同一行，见 Diagnose 步骤的日志）。整个目录搬到
+          # 无空格路径即可：同盘 rename 是瞬时的，nvcc 内部全用自身相对路径。
+          $moved = 'C:\cuda134'
+          if (-not (Test-Path "$moved\bin\nvcc.exe")) {
+            Move-Item -Path $cuda -Destination $moved -Force
+          }
+          $cuda = $moved
           "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "$cuda\bin"       | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           Get-ChildItem "$cuda\lib" -Directory | Select-Object Name   # 期望看到 arm64
