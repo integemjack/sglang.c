@@ -183,57 +183,116 @@ else()
   set_tests_properties(test_g12_place PROPERTIES ENVIRONMENT "SGL_TEST_G12=")
 endif()
 
-# ---- CUDA 后端（SGL_CUDA=ON，需 MSVC + CUDA 工具链；与 MinGW 构建共存于独立目录）----
-option(SGL_CUDA "Build CUDA backend (needs VS + nvcc)" OFF)
+# ---- CUDA 后端（SGL_CUDA=ON，需 CUDA 工具链；Windows = MSVC host，Linux = GCC host）----
+# 两个平台共用同一份 nvcc 命令行骨架，差异只收在下面 if(MSVC)/else 两个分支里：
+#   Windows：-ccbin 指向 VS 的 Hostx64/x64，产物 .obj，链 Toolkit 的 lib/x64/*.lib，cuda_http 链 ws2_32
+#   Linux  ：nvcc 自己找 g++（PATH 里必须有），产物 .o（-Xcompiler -fPIC），链 lib64 的静态 cudart + cublas
+option(SGL_CUDA "Build CUDA backend (needs CUDA toolkit; MSVC host compiler on Windows)" OFF)
 if(SGL_CUDA)
   # 注：MSBuild 的 CUDA 集成在此环境不稳（宿主环境差异导致 nvcc 阶段失败），
-  # 改用自定义命令直接驱动 nvcc（参数已验证），产物 obj 链入静态库。
-  # 工具链路径参数化（CI runner 版本不同）：CUDA 取 CUDA_PATH env 或 glob 最新 v*；
-  # MSVC 宿主 glob VS2022 的 BuildTools/Community/Professional 任一 SKU。
-  set(CUDA_TOOLKIT_DIR "$ENV{CUDA_PATH}")
-  if(NOT CUDA_TOOLKIT_DIR)
+  # 改用自定义命令直接驱动 nvcc（参数已验证），产物 obj/o 链入静态库。
+  # toolkit 定位三选：CUDA_PATH / CUDA_HOME env -> 平台默认目录（Windows glob 最新 v*；
+  # Linux/macOS /usr/local/cuda）-> nvcc 在 PATH 里时从它的路径反推。
+  set(CUDA_TOOLKIT_DIR "")
+  if(DEFINED ENV{CUDA_PATH} AND EXISTS "$ENV{CUDA_PATH}")
+    set(CUDA_TOOLKIT_DIR "$ENV{CUDA_PATH}")
+  elseif(DEFINED ENV{CUDA_HOME} AND EXISTS "$ENV{CUDA_HOME}")
+    set(CUDA_TOOLKIT_DIR "$ENV{CUDA_HOME}")
+  elseif(WIN32)
     file(GLOB CUDA_TOOLKIT_DIRS "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*")
     if(CUDA_TOOLKIT_DIRS)
       list(SORT CUDA_TOOLKIT_DIRS)
       list(REVERSE CUDA_TOOLKIT_DIRS)
       list(GET CUDA_TOOLKIT_DIRS 0 CUDA_TOOLKIT_DIR)
     endif()
+  elseif(EXISTS "/usr/local/cuda")
+    set(CUDA_TOOLKIT_DIR "/usr/local/cuda")
   endif()
+  # find_program 找不到 HINTS 里的会继续搜 PATH（nvcc 在 PATH 时也能用）
   find_program(NVCC_EXE nvcc HINTS "${CUDA_TOOLKIT_DIR}/bin")
   if(NOT NVCC_EXE)
     message(FATAL_ERROR "nvcc not found (set CUDA_PATH or install CUDA toolkit)")
   endif()
-  file(GLOB MSVC_HOST_BINS
-       "C:/Program Files (x86)/Microsoft Visual Studio/*/BuildTools/VC/Tools/MSVC/*/bin/Hostx64/x64"
-       "C:/Program Files/Microsoft Visual Studio/*/BuildTools/VC/Tools/MSVC/*/bin/Hostx64/x64"
-       "C:/Program Files/Microsoft Visual Studio/*/Community/VC/Tools/MSVC/*/bin/Hostx64/x64"
-       "C:/Program Files/Microsoft Visual Studio/*/Professional/VC/Tools/MSVC/*/bin/Hostx64/x64"
-       "C:/Program Files/Microsoft Visual Studio/*/Enterprise/VC/Tools/MSVC/*/bin/Hostx64/x64")
-  if(MSVC_HOST_BINS)
-    list(SORT MSVC_HOST_BINS)
-    list(REVERSE MSVC_HOST_BINS)
-    list(GET MSVC_HOST_BINS 0 MSVC_CCBIN)
-  else()
-    message(FATAL_ERROR "MSVC host for nvcc (-ccbin) not found")
+  if(NOT CUDA_TOOLKIT_DIR)
+    # 从 nvcc 路径反推 toolkit 根（<root>/bin/nvcc）
+    get_filename_component(_nvcc_bin "${NVCC_EXE}" DIRECTORY)
+    get_filename_component(CUDA_TOOLKIT_DIR "${_nvcc_bin}" DIRECTORY)
   endif()
+  # 一个或多个 SM 架构（分号分隔）：GPU 包默认单架 75；Windows on Arm 等需要
+  # 「新卡为主、保持 x64 对齐」的场景可以传 75;120，每个架构各生成一段 cubin。
+  set(SGL_CUDA_ARCH "75" CACHE STRING "CUDA SM architecture(s), e.g. 75 or 75;120")
   message(STATUS "CUDA toolkit: ${CUDA_TOOLKIT_DIR}")
-  message(STATUS "nvcc host: ${MSVC_CCBIN}")
-  set(SGL_CUDA_OBJ ${CMAKE_CURRENT_BINARY_DIR}/cuda_backend.obj)
+  message(STATUS "nvcc: ${NVCC_EXE} (arch sm_${SGL_CUDA_ARCH})")
+  if(MSVC)
+    # nvcc 的 host 编译器目录：直接用当前 C 编译器所在目录，自动适配
+    # Hostx64/x64（x64 宿主）与 Hostarm64/arm64（Windows on Arm —— CUDA 13.4 起
+    # 才有 arm64 版 nvcc）。只有拿不到 CMAKE_C_COMPILER 目录时才退回 glob 搜。
+    get_filename_component(_cl_dir "${CMAKE_C_COMPILER}" DIRECTORY)
+    if(EXISTS "${_cl_dir}/cl.exe" OR EXISTS "${_cl_dir}/cl")
+      set(MSVC_CCBIN "${_cl_dir}")
+    else()
+      file(GLOB MSVC_HOST_BINS
+           "C:/Program Files (x86)/Microsoft Visual Studio/*/BuildTools/VC/Tools/MSVC/*/bin/Host*/x64"
+           "C:/Program Files/Microsoft Visual Studio/*/BuildTools/VC/Tools/MSVC/*/bin/Host*/x64"
+           "C:/Program Files/Microsoft Visual Studio/*/Community/VC/Tools/MSVC/*/bin/Host*/x64"
+           "C:/Program Files/Microsoft Visual Studio/*/Professional/VC/Tools/MSVC/*/bin/Host*/x64"
+           "C:/Program Files/Microsoft Visual Studio/*/Enterprise/VC/Tools/MSVC/*/bin/Host*/x64"
+           "C:/Program Files (x86)/Microsoft Visual Studio/*/BuildTools/VC/Tools/MSVC/*/bin/Host*/arm64"
+           "C:/Program Files/Microsoft Visual Studio/*/BuildTools/VC/Tools/MSVC/*/bin/Host*/arm64"
+           "C:/Program Files/Microsoft Visual Studio/*/Community/VC/Tools/MSVC/*/bin/Host*/arm64"
+           "C:/Program Files/Microsoft Visual Studio/*/Professional/VC/Tools/MSVC/*/bin/Host*/arm64"
+           "C:/Program Files/Microsoft Visual Studio/*/Enterprise/VC/Tools/MSVC/*/bin/Host*/arm64")
+      if(MSVC_HOST_BINS)
+        list(SORT MSVC_HOST_BINS)
+        list(REVERSE MSVC_HOST_BINS)
+        list(GET MSVC_HOST_BINS 0 MSVC_CCBIN)
+      else()
+        message(FATAL_ERROR "MSVC host for nvcc (-ccbin) not found")
+      endif()
+    endif()
+    message(STATUS "nvcc host: ${MSVC_CCBIN}")
+    set(SGL_CUDA_OBJ ${CMAKE_CURRENT_BINARY_DIR}/cuda_backend.obj)
+    set(SGL_NVCC_HOST_FLAGS -ccbin "${MSVC_CCBIN}")
+    set(SGL_NVCC_ARCH_FLAGS "")
+    foreach(_a ${SGL_CUDA_ARCH})
+      list(APPEND SGL_NVCC_ARCH_FLAGS
+           --generate-code=arch=compute_${_a},code=sm_${_a})
+    endforeach()
+    set(SGL_NVCC_EXTRA_FLAGS "")
+  else()
+    # 非 MSVC：host 编译器由 nvcc 自己在 PATH 里找 g++/clang++；产物 .o 要 -fPIC
+    #（Ubuntu 的 gcc 默认 -fPIE，PIC 目标同样能链进 PIE 可执行文件）。
+    # 额外嵌一份 PTX：sm_75 的 cubin 不能直接跑在 sm_80+ 上，驱动可 JIT 这份 PTX。
+    set(SGL_CUDA_OBJ ${CMAKE_CURRENT_BINARY_DIR}/cuda_backend.o)
+    set(SGL_NVCC_HOST_FLAGS "")
+    set(SGL_NVCC_ARCH_FLAGS "")
+    foreach(_a ${SGL_CUDA_ARCH})
+      list(APPEND SGL_NVCC_ARCH_FLAGS
+           --generate-code=arch=compute_${_a},code=sm_${_a},code=compute_${_a})
+    endforeach()
+    set(SGL_NVCC_EXTRA_FLAGS -Xcompiler -fPIC)
+  endif()
   add_custom_command(
     OUTPUT ${SGL_CUDA_OBJ}
     COMMAND ${NVCC_EXE} -c ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_backend.cu
             -I${CMAKE_CURRENT_SOURCE_DIR}/include
-            -ccbin "${MSVC_CCBIN}"
-            --generate-code=arch=compute_75,code=sm_75 -O2 -o ${SGL_CUDA_OBJ}
-    DEPENDS src/cuda_backend.cu
-    COMMENT "nvcc cuda_backend.cu (sm_75)"
+            ${SGL_NVCC_HOST_FLAGS}
+            ${SGL_NVCC_ARCH_FLAGS}
+            ${SGL_NVCC_EXTRA_FLAGS}
+            -O2 -o ${SGL_CUDA_OBJ}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_backend.cu
+    COMMENT "nvcc cuda_backend.cu (sm_${SGL_CUDA_ARCH})"
     VERBATIM)
   set(SGL_CORE_SRC
       src/alloc.c src/log.c src/json.c src/tensor.c src/safetensors.c
       src/bpe.c src/ops.c src/quant.c src/llama.c src/gpt2.c src/sampling.c src/clip.c
       src/image.c # G11: PNG/JPEG 解码 + CLIP 预处理（cuda_http 现在收真实图片）
-      src/dot_avx2_msvc.c # G18: MSVC 的 AVX2 内积（单独 /arch:AVX2 编译 + CPUID 分派）
       src/cuda_spec.c) # G7: GPU 侧投机解码（纯 host C，调 sgl_cuda_* API）
+  if(MSVC)
+    # dot_avx2_msvc.c 只服务 MSVC（需要 /arch:AVX2 + <intrin.h>）：GCC/Clang 的 AVX2 内积
+    # 在 ops.c 用函数级 target("avx2,fma") 实现，两处都编会撞符号（sgl_dot_f32_avx2 重复定义）
+    list(APPEND SGL_CORE_SRC src/dot_avx2_msvc.c) # G18: MSVC 的 AVX2 内积（单独 /arch:AVX2 编译 + CPUID 分派）
+  endif()
   add_library(sgl_cuda STATIC ${SGL_CORE_SRC} ${SGL_CUDA_OBJ})
   # dot_avx2_msvc.c 单独开 /arch:AVX2（MSVC 没有函数级 target 属性）
   if(MSVC)
@@ -245,6 +304,22 @@ if(SGL_CUDA)
     # /utf-8 只给 C 源（nvcc 不认该旗标；.cu 已纯 ASCII，头文件带 BOM）
     target_compile_options(sgl_cuda PUBLIC /O2 "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>")
     target_compile_definitions(sgl_cuda PUBLIC _CRT_SECURE_NO_WARNINGS)
+  else()
+    # 与 CPU 库 sgl 保持同一套选项（-Wall/-Wextra 来自上面的全局 add_compile_options）
+    target_compile_options(sgl_cuda PUBLIC -O2)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+      if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+        target_compile_options(sgl_cuda PUBLIC -funroll-loops)
+      else()
+        target_compile_options(sgl_cuda PUBLIC -march=x86-64-v2 -funroll-loops)
+      endif()
+    endif()
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+      # 与 sgl 一致：OpenMP 走编译器驱动（否则 ops.c 的 #pragma omp 在 sgl_cuda 里被忽略，
+      # 且 -Wall 会报 -Wunknown-pragmas）
+      target_compile_options(sgl_cuda PUBLIC -fopenmp)
+      target_link_options(sgl_cuda INTERFACE -fopenmp)
+    endif()
   endif()
   add_executable(cuda_test tests/cuda_test.c)
   target_link_libraries(cuda_test PRIVATE sgl_cuda)
@@ -255,15 +330,53 @@ if(SGL_CUDA)
   add_executable(cuda_perf tests/cuda_perf.c)  # G1/G2/G3 perf A/B (no assertions)
   target_link_libraries(cuda_perf PRIVATE sgl_cuda)
   add_executable(cuda_http apps/cuda_http.c)
-  target_link_libraries(cuda_http PRIVATE sgl_cuda ws2_32)
+  if(WIN32)
+    target_link_libraries(cuda_http PRIVATE sgl_cuda ws2_32) # winsock
+  else()
+    target_link_libraries(cuda_http PRIVATE sgl_cuda) # POSIX socket 在 libc
+  endif()
   if(MSVC)
+    # Windows 的 CUDA 库在 lib\<arch>\（x64 / arm64）下；Windows on Arm 用 arm64 子目录，
+    # 找不到时退回 lib 根（个别安装器版本会把 .lib 直接放 lib\）。
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|arm64|aarch64")
+      set(SGL_WIN_CUDA_ARCH_DIR "arm64")
+    else()
+      set(SGL_WIN_CUDA_ARCH_DIR "x64")
+    endif()
+    if(EXISTS "${CUDA_TOOLKIT_DIR}/lib/${SGL_WIN_CUDA_ARCH_DIR}/cublas.lib")
+      set(SGL_WIN_CUDA_LIBDIR "${CUDA_TOOLKIT_DIR}/lib/${SGL_WIN_CUDA_ARCH_DIR}")
+    elseif(EXISTS "${CUDA_TOOLKIT_DIR}/lib/cublas.lib")
+      set(SGL_WIN_CUDA_LIBDIR "${CUDA_TOOLKIT_DIR}/lib")
+    else()
+      message(FATAL_ERROR "cublas.lib not found under ${CUDA_TOOLKIT_DIR}/lib (arch ${SGL_WIN_CUDA_ARCH_DIR})")
+    endif()
+    message(STATUS "CUDA libs: ${SGL_WIN_CUDA_LIBDIR}")
     foreach(t cuda_test cuda_cli long_vcpu cuda_perf cuda_http)
       target_link_libraries(${t} PRIVATE
-          "${CUDA_TOOLKIT_DIR}/lib/x64/cudart_static.lib"
-          "${CUDA_TOOLKIT_DIR}/lib/x64/cublas.lib")
+          "${SGL_WIN_CUDA_LIBDIR}/cudart_static.lib"
+          "${SGL_WIN_CUDA_LIBDIR}/cublas.lib")
       target_compile_options(${t} PRIVATE /O2 /utf-8)
       target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     endforeach()
+  else()
+    # Linux/macOS：Toolkit 的 lib64（老包是 lib）里取静态 cudart + cublas；
+    # nvcc 的 host 代码是 C++，静态 cudart 需要 libstdc++；cudart 自己还要 pthread/dl/rt。
+    find_library(SGL_CUDART_STATIC NAMES libcudart_static.a cudart_static
+                 HINTS "${CUDA_TOOLKIT_DIR}/lib64" "${CUDA_TOOLKIT_DIR}/lib" /usr/local/cuda/lib64)
+    find_library(SGL_CUBLAS_LIB NAMES cublas
+                 HINTS "${CUDA_TOOLKIT_DIR}/lib64" "${CUDA_TOOLKIT_DIR}/lib" /usr/local/cuda/lib64)
+    find_library(SGL_STDCXX_LIB NAMES stdc++)
+    if(NOT SGL_CUDART_STATIC OR NOT SGL_CUBLAS_LIB)
+      message(FATAL_ERROR "CUDA runtime/cublas not found under ${CUDA_TOOLKIT_DIR} (lib64/lib)")
+    endif()
+    set(SGL_CUDA_RUNTIME_LIBS ${SGL_CUDART_STATIC} ${SGL_CUBLAS_LIB} pthread dl rt m)
+    if(SGL_STDCXX_LIB)
+      list(APPEND SGL_CUDA_RUNTIME_LIBS ${SGL_STDCXX_LIB})
+    endif()
+    message(STATUS "CUDA link libs: ${SGL_CUDA_RUNTIME_LIBS}")
+    foreach(t cuda_test cuda_cli long_vcpu cuda_perf cuda_http)
+      target_link_libraries(${t} PRIVATE ${SGL_CUDA_RUNTIME_LIBS})
+    endforeach()
   endif()
-  message(STATUS "CUDA backend: enabled (sm_75)")
+  message(STATUS "CUDA backend: enabled (sm_${SGL_CUDA_ARCH})")
 endif()

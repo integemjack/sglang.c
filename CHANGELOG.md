@@ -4,6 +4,32 @@
 
 ## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G12/G13/G14/G15/G16/G17/G18/G19
 
+### 打包矩阵（2026-10-27）
+- **CUDA 后端不再只限 Windows**：`CMakeLists.txt` 的 CUDA 段拆成 MSVC / 非 MSVC 两支
+  （toolkit 三选定位、`.o` vs `.obj`、`-fPIC`、静态 cudart + 动态 cublas + pthread/dl/rt/m）。
+  `apps/cuda_http.c` 加 POSIX 分支（winsock→BSD socket、临界区/条件变量→pthread、
+  `GetTickCount64`→`CLOCK_MONOTONIC`、`SO_*TIMEO`→`timeval`、SIGPIPE 处理），Windows
+  编译路径保持原样。新矩阵：`linux-x64-cuda`、`linux-arm64-cuda`。
+- **`windows-arm64-cuda`（preview）**：GitHub 托管 `windows-11-arm` runner + CUDA 13.4.0
+  Developer Preview（目前唯一带 Windows-on-Arm 主机工具的 CUDA，只有预览安装器）。
+  nvcc host 编译器改为直接取 `CMAKE_C_COMPILER` 所在目录（自适应 `Hostx64/x64` →
+  `Hostarm64/arm64`），CUDA 库目录按架构取 `lib/x64` / `lib/arm64`；`SGL_CUDA_ARCH` 支持
+  列表（arm64 包同时出 sm_75 与 sm_120 cubin）。runner 无 GPU，只验产物 + `dumpbin` 架构。
+- **`macos-arm64-mlx`**：数值参考改由 `mlx.core`（Metal）生成，`test_llava` 一行不改就变成
+  「C 实现 vs MLX」；gate 用 `grep 'MLX('` 卡住 —— 拿不到 Metal 时直接失败而不是悄悄退化成
+  numpy。包内附 `tools/ref_llava_mlx.py`。
+- **删除 `macos-x64`**：需要从 arm64 宿主交叉编译 + Rosetta 跑测试，而 Intel runner 已退场。
+
+### 修复（上述改造中撞到并修掉的）
+- **`include/sgl/port.h` 的 `fopen_s` 垫片返回语义错误**：原写法 `(*(pf) = fopen(...))`
+  返回 `FILE*`，于是 POSIX 侧**打开成功返回非 0**，所有 `if (fopen_s(&f,…) != 0 || !f)`
+  都把成功当失败（`llama.c` 靠紧随其后的 `fopen` 兵底才没暴露，测试则可能静默 SKIP）。
+  改为 `sgl_fopen_s()`：总是写 `*pf`，返回 0/非 0（与 MSVC 一致）。
+- **`tests/cuda_test.c` 没 include `sgl/port.h`**：`fopen_s` 在 Linux 下未定义。
+- **`SGL_THREAD_SIG` 调用处多了 `static`**（宏里已含）：MSVC 报 `error C2159: 指定了
+  一个以上的存储类`，Windows 构建直接红。已删两处。
+- **`SGL_SEND_FLAGS` 在无 `MSG_NOSIGNAL` 的平台（macOS）** 退回 0，不再硬引用。
+
 ### 修复
 - **`src/spec.c` 释放未初始化指针（真实 UB，由 Clang 发现）**：`sgl_spec_generate()` 里
   `dl/tl/vl` 原本声明在 `sgl_llama_pages_alloc()` 之后，而分配失败会 `goto fail`，

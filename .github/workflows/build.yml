@@ -10,6 +10,13 @@ on:
 permissions:
   contents: write
 
+# 矩阵字段说明
+#   gen      : ninja      Linux/macOS 纯 CPU（GCC/Clang + Ninja）
+#              ninja-mlx  同上，但数值参考改由 mlx.core(Metal) 生成
+#              ninja-cuda Linux + nvcc（apt 装 toolkit，构建不跑）
+#              msvc       Windows 纯 CPU（MSVC + Ninja）
+#              msvc-cuda  Windows x64 + nvcc（构建 + 打包，runner 无 GPU 不跑）
+#   flavor   : cpu / cpu-mlx / cuda —— 决定跑哪些步骤（模型夹具、测试、smoke、打包）
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -18,15 +25,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x64,        os: ubuntu-latest,    gen: ninja }
-          - { name: linux-arm64,      os: ubuntu-24.04-arm, gen: ninja }
-          - { name: macos-arm64,      os: macos-latest,     gen: ninja }
-          - { name: macos-x64,        os: macos-14,         gen: ninja-x64 }
-        # macos-x64 不再用 macos-13（最后的 Intel 镜像，2026-10 容量枯竭：连续三轮
-        # 排队 30-60 分钟+从未起跑）：改 macos-14（arm64）交叉编译 x86_64 产物，
-        # runner 的 Rosetta 2 透明转译跑测试
-          - { name: windows-x64,      os: windows-latest,   gen: msvc }
-          - { name: windows-x64-cuda, os: windows-latest,   gen: msvc-cuda }
+          - { name: linux-x64,          os: ubuntu-latest,    gen: ninja,      flavor: cpu }
+          - { name: linux-arm64,        os: ubuntu-24.04-arm, gen: ninja,      flavor: cpu }
+          - { name: linux-x64-cuda,     os: ubuntu-latest,    gen: ninja-cuda, flavor: cuda, cuda_repo: x86_64 }
+          - { name: linux-arm64-cuda,   os: ubuntu-24.04-arm, gen: ninja-cuda, flavor: cuda, cuda_repo: sbsa }
+          - { name: macos-arm64,        os: macos-latest,     gen: ninja,      flavor: cpu }
+        # macOS 只出 arm64：macos-x64 需要在 arm64 宿主上交叉编译 + Rosetta 跑测试，
+        # Intel 宿主已退场，这条矩阵项 2026-10-27 删除。MLX 包额外用 mlx.core(Metal)
+        # 生成数值参考（C 实现 vs MLX），并把参考脚本一起打进包。
+          - { name: macos-arm64-mlx,    os: macos-latest,     gen: ninja-mlx,  flavor: cpu-mlx }
+          - { name: windows-x64,        os: windows-latest,   gen: msvc,       flavor: cpu }
+          - { name: windows-x64-cuda,   os: windows-latest,   gen: msvc-cuda,  flavor: cuda }
         # windows-latest 自 2026-06 起预装 VS2026（18\），不用 VS 生成器：
         # msvc-dev-cmd 自动发现已装 VS 激活 cl 环境 + Ninja 生成器，未来镜像换代免疫
 
@@ -34,17 +43,46 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install toolchain (Linux/macOS)
-        if: matrix.gen == 'ninja' || matrix.gen == 'ninja-x64'
+        if: startsWith(matrix.gen, 'ninja')
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install ninja
           else
-            sudo apt-get update && sudo apt-get install -y ninja-build
+            sudo apt-get update
+            sudo apt-get install -y ninja-build build-essential curl
           fi
+
+      # runtime 里没有 GPU，NVCC 只需要 nvcc/cublas/cudart 的头和库；用 NVIDIA 官方
+      # apt 源（x86_64 与 arm64-sbsa 各有自己的仓库路径），版本与 Windows 侧对齐 13.3。
+      - name: Install CUDA toolkit (Linux, apt)
+        if: matrix.gen == 'ninja-cuda'
+        run: |
+          set -euo pipefail
+          repo="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${{ matrix.cuda_repo }}"
+          curl -fsSL -o /tmp/cuda-keyring.deb "$repo/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          sudo apt-get update
+          # 先打印可用版本：以后 NVIDIA 撤掉某个小版本时，失败信息里直接能看到还剩哪些
+          # （head 提前退出会让 apt-cache 吃 SIGPIPE → pipefail 误判失败，加 || true）
+          apt-cache policy cuda-toolkit-13-3 2>/dev/null | head -5 || true
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-13-3
+          # toolkit 包不一定创建 /usr/local/cuda 符号链接（--no-install-recommends 时尤其如此），
+          # 两种布局都探测一次，得到真实的 CUDA_ROOT
+          if [ -x /usr/local/cuda/bin/nvcc ]; then
+            CUDA_ROOT=/usr/local/cuda
+          else
+            CUDA_ROOT=$(dirname "$(dirname "$(ls -1 /usr/local/cuda-13.*/bin/nvcc 2>/dev/null | head -1 || true)")")
+          fi
+          echo "CUDA_ROOT=$CUDA_ROOT"
+          test -x "$CUDA_ROOT/bin/nvcc" || { echo "::error::nvcc not found after install"; exit 1; }
+          echo "CUDA_PATH=$CUDA_ROOT" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=$CUDA_ROOT" >> "$GITHUB_ENV"
+          echo "$CUDA_ROOT/bin" >> "$GITHUB_PATH"
+          "$CUDA_ROOT/bin/nvcc" --version
 
       # tests 的 gpt2 真实权重（~520MB）不入库，CI 按需下载；tokenizer/config 已在仓库
       - name: Download GPT-2 weights
-        if: matrix.gen != 'msvc-cuda'
+        if: matrix.flavor != 'cuda'
         shell: bash
         run: |
           mkdir -p models/gpt2
@@ -58,7 +96,7 @@ jobs:
       # tests/_ref_*.json 一一对应；tokenizer 只下 Qwen3-0.6B 的 4 个小文件（~16MB，
       # 不下真实权重），与 _ref_*.json 里的 ids 同源（换成 gpt2 tokenizer 会让 ids 对不上）。
       - name: Generate random model family (Linux/macOS)
-        if: matrix.gen == 'ninja' || matrix.gen == 'ninja-x64'
+        if: startsWith(matrix.flavor, 'cpu')
         shell: bash
         run: |
           python3 -m pip install --quiet --break-system-packages numpy \
@@ -76,29 +114,47 @@ jobs:
           python3 tests/ref_llava.py models/llava-rand tests/_ref_llava.json
           ls -d models/*-rand
 
-      - name: Configure (Ninja)
-        if: matrix.gen == 'ninja' || matrix.gen == 'ninja-x64'
+      # MLX 包：数值参考改由 mlx.core（Metal GPU）生成，覆盖掉上一步的 numpy 参考。
+      # test_llava 本身一行不改，比对的就变成「C 实现 vs MLX」。参考脚本会打印
+      # `MLX(Device(gpu, 0))`，用 grep 卡住——镜像换代导致 mlx 拿不到 Metal（回落到 CPU）
+      # 时这一步直接失败，而不是静静地退化成一次 numpy 等价测试。
+      - name: Generate LLaVA reference with MLX (macOS Metal)
+        if: matrix.gen == 'ninja-mlx'
+        shell: bash
         run: |
-          if [ "${{ matrix.gen }}" = "ninja-x64" ]; then
-            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_C_FLAGS=-march=x86-64-v2
-          else
-            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          fi
+          set -o pipefail
+          python3 -m pip install --quiet --break-system-packages mlx \
+            || python3 -m pip install --quiet --user mlx
+          python3 -c "import mlx.core as mx; print('mlx default_device:', mx.default_device())"
+          python3 tests/ref_llava_mlx.py models/llava-rand tests/_ref_llava_mlx.json 2>&1 | tee mlx_ref.log
+          grep -q 'MLX(' mlx_ref.log || { echo "::error::MLX reference did not run on Metal"; exit 1; }
+          ls -la models/llava-rand/_ref_*.npy
 
-      - name: Build (Ninja)
-        if: matrix.gen == 'ninja' || matrix.gen == 'ninja-x64'
+      - name: Configure (Ninja, CPU)
+        if: startsWith(matrix.flavor, 'cpu')
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (Ninja, CPU)
+        if: startsWith(matrix.flavor, 'cpu')
+        run: cmake --build build -j
+
+      - name: Configure (Ninja, CUDA)
+        if: matrix.gen == 'ninja-cuda'
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSGL_CUDA=ON
+
+      - name: Build (Ninja, CUDA)
+        if: matrix.gen == 'ninja-cuda'
         run: cmake --build build -j
 
       - name: Setup MSVC
-        if: matrix.gen == 'msvc' || matrix.gen == 'msvc-cuda'
+        if: startsWith(matrix.gen, 'msvc')
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
       # runner 不预装 CUDA toolkit；装全量（含 cublas/cudart 库与 DLL）
       # Jimver 会设 CUDA_PATH 并把 CUDA_PATH/bin 加进 PATH，命中 CMakeLists 的自动发现
-      - name: Install CUDA toolkit
+      - name: Install CUDA toolkit (Windows)
         if: matrix.gen == 'msvc-cuda'
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
@@ -122,7 +178,7 @@ jobs:
           Get-ChildItem -Directory models/*-rand | Select-Object Name
 
       - name: Configure (MSVC)
-        if: matrix.gen == 'msvc' || matrix.gen == 'msvc-cuda'
+        if: startsWith(matrix.gen, 'msvc')
         shell: pwsh
         run: |
           $cuda = if ("${{ matrix.gen }}" -eq "msvc-cuda") { "-DSGL_CUDA=ON" } else { "" }
@@ -130,11 +186,11 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded $cuda
 
       - name: Build (MSVC)
-        if: matrix.gen == 'msvc' || matrix.gen == 'msvc-cuda'
+        if: startsWith(matrix.gen, 'msvc')
         run: cmake --build build --parallel
 
       - name: Test (CPU builds)
-        if: matrix.gen != 'msvc-cuda'
+        if: startsWith(matrix.flavor, 'cpu')
         shell: bash
         run: |
           set -o pipefail
@@ -159,11 +215,15 @@ jobs:
           if [ "$fam_ran" -lt 4 ]; then echo "::error::test_family_* 只有 $fam_ran 个 Passed（应为 mistral/gemma/gemma2/qwen3next 4 个）"; exit 1; fi
           if [ "$fam" -lt 4 ]; then echo "::error::模型族只跑了 $fam 个（应为 4 个）"; exit 1; fi
           if [ "$llava" -lt 1 ]; then echo "::error::test_llava 没真跑（缺 models/llava-rand 或它在 SKIP）"; exit 1; fi
+          if [ "${{ matrix.gen }}" = "ninja-mlx" ]; then
+            grep -q 'MLX(' mlx_ref.log || { echo "::error::MLX 参考日志缺失"; exit 1; }
+            echo "MLX reference in use: $(grep 'MLX(' mlx_ref.log | tail -1)"
+          fi
 
       # CI runner 无 NVIDIA 驱动：cuda_cli/cuda_http 动态链 cublas（→nvcuda.dll）启动即
       # 0xC0000135，无法在无 GPU runner 上运行 —— 只验证产物存在；可加载 smoke 用同
       # job 构建的纯 CPU sglc（usage 分支 exit 1，不链任何 CUDA 库）
-      - name: Smoke (CUDA build)
+      - name: Smoke (Windows CUDA build)
         if: matrix.gen == 'msvc-cuda'
         shell: pwsh
         run: |
@@ -176,13 +236,85 @@ jobs:
           # Actions 的 pwsh wrapper 在脚本尾 exit $LASTEXITCODE（usage 留下的 1）；显式清零
           exit 0
 
-      - name: Package (Linux/macOS)
-        if: matrix.gen == 'ninja' || matrix.gen == 'ninja-x64'
+      # Linux 没有 GPU：能验的是「二进制产出了、动态依赖在 runner 上全都能解析」——
+      # ldd 里有 "not found" 就失败（cuda_cli/cuda_http 会依赖 cublas 的 .so，见打包步骤）
+      - name: Smoke (Linux CUDA build)
+        if: matrix.gen == 'ninja-cuda'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in build/bin/cuda_cli build/bin/cuda_http build/bin/cuda_test build/bin/sglc; do
+            test -x "$f" || { echo "::error::missing $f"; exit 1; }
+            echo "--- $f"; file "$f"
+          done
+          export LD_LIBRARY_PATH="$CUDA_ROOT/lib64:${LD_LIBRARY_PATH:-}"
+          if ldd build/bin/cuda_cli | grep -q "not found"; then
+            echo "::error::unresolved shared libraries in cuda_cli"; ldd build/bin/cuda_cli; exit 1
+          fi
+          ldd build/bin/cuda_cli | grep -Ei "cublas|cudart|libc" || true
+          # sglc 是纯 CPU 产物，能真跑：usage 分支应当 exit 1
+          set +e
+          ./build/bin/sglc >/dev/null 2>&1
+          code=$?
+          set -e
+          echo "sglc usage exit code: $code"
+          [ "$code" -eq 1 ] || { echo "::error::sglc usage smoke failed ($code)"; exit 1; }
+
+      - name: Package (Linux/macOS CPU)
+        if: startsWith(matrix.flavor, 'cpu')
         shell: bash
         run: |
           mkdir -p dist
           cp build/bin/sglc dist/
           cp README.md ROADMAP.md dist/
+          if [ "${{ matrix.gen }}" = "ninja-mlx" ]; then
+            # MLX 包额外带上「用 Metal 跑数值参考」的工具，同款 Mac 上可以自己重跑
+            mkdir -p dist/tools
+            cp tests/ref_llava_mlx.py dist/tools/
+            cat > dist/tools/README-mlx.md <<'EOF'
+          # MLX numeric reference
+
+          `ref_llava_mlx.py` recomputes the LLaVA CLIP + projector reference with
+          `mlx.core` on the Metal GPU, overwrites `_ref_{feats,proj,imgemb}.npy` in the
+          model directory and thereby turns `test_llava` into "C implementation vs MLX".
+
+          ```bash
+          pip install mlx numpy
+          python tools/ref_llava_mlx.py models/llava-rand ref_llava_mlx.json
+          ctest --test-dir build -R llava -V
+          ```
+          EOF
+          fi
+          tar czf "sglang-c-${{ matrix.name }}.tar.gz" -C dist .
+          ls -la sglang-c-*.tar.gz
+
+      # cublas 在 Linux 侧是动态链接：把 .so 一起打进包（运行时免装 CUDA toolkit），
+      # 与 Windows 包带 DLL 的做法一致；符号链接指向的真实文件也一并拷进去
+      - name: Package (Linux CUDA)
+        if: matrix.gen == 'ninja-cuda'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/lib
+          cp build/bin/sglc build/bin/cuda_cli build/bin/cuda_http build/bin/cuda_test dist/
+          cp README.md ROADMAP.md dist/
+          cp -P "$CUDA_ROOT"/lib64/libcublas.so* "$CUDA_ROOT"/lib64/libcublasLt.so* dist/lib/
+          cp -P "$CUDA_ROOT"/lib64/libcudart.so* dist/lib/ 2>/dev/null || true
+          cat > dist/README-run.md <<'EOF'
+          # sglang-c (CUDA build, Linux)
+
+          Binaries are built with CUDA 13.3 for compute capability 7.5 and later.
+          `cublas` is linked dynamically, so export the bundled lib directory first:
+
+          ```bash
+          export LD_LIBRARY_PATH="$PWD/lib:$LD_LIBRARY_PATH"
+          ./cuda_http models/qwen05 30000     # needs an NVIDIA GPU + driver
+          ./cuda_cli  models/qwen05 "Hello" 32 0
+          ```
+
+          A GPU and a matching NVIDIA driver are required at runtime; CI only builds and
+          checks the shared-library dependencies (`ldd`).
+          EOF
           tar czf "sglang-c-${{ matrix.name }}.tar.gz" -C dist .
           ls -la sglang-c-*.tar.gz
 
@@ -222,9 +354,127 @@ jobs:
           path: sglang-c-*
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # windows-arm64-cuda：单独一个 job（不走矩阵），因为要用 arm64 的 MSVC 和
+  # 只有预览版的 CUDA。事实依据（2026-10-27 实测/核实）：
+  #   - GitHub 托管 arm64 Windows runner：windows-11-arm（public repo 免费）
+  #   - CUDA 13.4 是第一个支持 Windows on Arm 的版本，但目前只有 13.4.0 的
+  #     Developer Preview 本地安装器（无 network 版、无 13.4.1/13.4.2 arm64 包）
+  #   - Jimver/cuda-toolkit 没有 arm64 链接表 → 自己下 3.57GiB 安装器 + `-s` 只装
+  #     nvcc/cudart/crt/cublas 子包（放在 $RUNNER_TEMP 并在装完后删掉）
+  # runner 没有 GPU：只验产物存在 + 架构是 ARM64（dumpbin）+ 纯 CPU 的 sglc 能跑。
+  # 产物是 **preview**：arm64 Windows 目前的 GPU 是 Blackwell，arm64 包的 cubin
+  # 同时编 sm_75 与 sm_120（见 CMakeLists 里的 SGL_CUDA_ARCHS）。
+  # ---------------------------------------------------------------------------
+  windows-arm64-cuda:
+    name: windows-arm64-cuda
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disk / host info
+        shell: pwsh
+        run: |
+          Get-PSDrive C | Select-Object Used,Free
+          Write-Host "OS architecture: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+          if ((Get-PSDrive C).Free -lt 8GB) { throw "not enough free disk on runner: $((Get-PSDrive C).Free/1GB) GB" }
+
+      - name: Install CUDA 13.4 (Windows arm64 preview) - nvcc/cudart/cublas only
+        shell: pwsh
+        run: |
+          $url = 'https://packages.nvidia.com/prerelease/cuda/13.4.0/local_installers/cuda_13.4.0_windows_arm64.exe'
+          $exe = "$env:RUNNER_TEMP\cuda_arm64.exe"
+          curl.exe -L --retry 5 --retry-all-errors -C - -o $exe $url
+          if (-not (Test-Path $exe)) { throw "installer download failed" }
+          if ((Get-Item $exe).Length -lt 3GB) { throw "installer download truncated: $((Get-Item $exe).Length) bytes" }
+          # -s = silent；只装编译/链接必需的子包（全装要多花几 GB）
+          $p = Start-Process -FilePath $exe -Wait -PassThru -NoNewWindow -ArgumentList @(
+            '-s', 'nvcc_13.4', 'crt_13.4', 'cudart_13.4', 'cublas_13.4', 'cublas_dev_13.4')
+          if ($p.ExitCode -ne 0) { throw "CUDA silent install failed ($($p.ExitCode))" }
+          $cuda = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4'
+          if (-not (Test-Path "$cuda\bin\nvcc.exe")) { throw "nvcc not installed under $cuda" }
+          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$cuda\bin"       | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Get-ChildItem "$cuda\lib" -Directory | Select-Object Name   # 期望看到 arm64
+          & "$cuda\bin\nvcc.exe" -V
+          if ($LASTEXITCODE -ne 0) { throw "nvcc -V failed" }
+          Remove-Item $exe -Force
+          Get-PSDrive C | Select-Object Used,Free
+
+      - name: Setup MSVC (arm64 native)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Configure (MSVC + CUDA, arm64)
+        shell: pwsh
+        run: |
+          # 两个架构：sm_75 与 x64 包保持对齐，sm_120 才是 WoA 上实际存在的卡
+          # （分号在 pwsh 里是语句分隔符，所以 -D 里必须加引号）
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DSGL_CUDA=ON "-DSGL_CUDA_ARCH=75;120"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+
+      - name: Build (MSVC + CUDA, arm64)
+        shell: pwsh
+        run: |
+          cmake --build build --parallel
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Smoke (no GPU on runner)
+        shell: pwsh
+        run: |
+          Get-Item build/bin/cuda_cli.exe, build/bin/cuda_http.exe, build/bin/sglc.exe | Out-Null
+          # 架构必须是 ARM64（dumpbin 是 MSVC 自带，machine 列为 AA64）
+          $dump = & dumpbin /headers build/bin/cuda_cli.exe | Select-String 'machine \('
+          Write-Host $dump
+          if ("$dump" -notmatch 'AA64|ARM64') { throw "cuda_cli.exe is not ARM64: $dump" }
+          # 纯 CPU 的 sglc：usage 分支 exit 1，证明能加载（CUDA exe 无驱动会 0xC0000135，不跑）
+          & "build/bin/sglc.exe" | Out-Null
+          $code = $LASTEXITCODE
+          Write-Host "sglc usage exit code: $code"
+          if ($code -ne 1) { throw "sglc usage smoke failed ($code)" }
+          Write-Host "smoke OK (ARM64 exes present, sglc usage exit 1)"
+          exit 0
+
+      - name: Package (Windows arm64 CUDA)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/bin/sglc.exe, build/bin/cuda_cli.exe, build/bin/cuda_http.exe dist/
+          # arm64 的 DLL 在 bin\arm64\（对应 x64 的 bin\x64\）；递归找，缺一即失败
+          $dlls = @(Get-ChildItem "$env:CUDA_PATH" -Recurse -File -Include "cublas64_*.dll", "cublasLt64_*.dll")
+          Write-Host "found $($dlls.Count) cublas DLLs under $env:CUDA_PATH"
+          if ($dlls.Count -lt 2) { throw "expected cublas64 + cublasLt64 under $env:CUDA_PATH, found $($dlls.Count)" }
+          $dlls | Copy-Item -Destination dist/
+          Copy-Item README.md, ROADMAP.md dist/
+          @'
+          # sglang-c (Windows on Arm, CUDA) - PREVIEW
+
+          Built on GitHub's arm64 Windows runner with the CUDA 13.4.0 **Developer Preview**
+          toolkit, the first CUDA release that ships Windows-on-Arm host tools.
+
+          * Target GPUs: Blackwell-class Windows-on-Arm machines (e.g. RTX Spark, driver 616.41+).
+            The binaries carry sm_75 and sm_120 cubins; sm_75 is kept for parity with the x64
+            package but no arm64 Windows GPU exposes it.
+          * Runtime needs an NVIDIA driver; the bundled cublas DLLs sit next to the exes.
+          * The preview toolkit is opt-in only per NVIDIA: treat this package as experimental.
+          '@ | Out-File -FilePath dist/README-arm64-preview.md -Encoding utf8
+          tar -a -c -f "sglang-c-windows-arm64-cuda.zip" -C dist .
+          Get-ChildItem "sglang-c-windows-arm64-cuda.zip" |
+            ForEach-Object { "$($_.Name) $([Math]::Round($_.Length/1MB,1))MB" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-cuda
+          path: sglang-c-windows-arm64-cuda.zip
+          if-no-files-found: error
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, windows-arm64-cuda]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

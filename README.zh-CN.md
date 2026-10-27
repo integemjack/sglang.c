@@ -40,13 +40,22 @@ bash sglang-c/quickstart.sh
 | 包 | 内容 |
 |---|---|
 | `linux-x64 / linux-arm64` | `sglc`（CPU，GNU 编译器下开 OpenMP 多线程） |
-| `macos-arm64 / macos-x64` | `sglc`（CPU，**单线程**：AppleClang 无 `-fopenmp`，CI 不装 libomp） |
+| `linux-x64-cuda / linux-arm64-cuda` | `sglc` + `cuda_cli` + `cuda_http`（附 `libcublas*.so`）；运行时需 NVIDIA 显卡与驱动 |
+| `macos-arm64` | `sglc`（CPU，**单线程**：AppleClang 无 `-fopenmp`，CI 不装 libomp） |
+| `macos-arm64-mlx` | 同上，另附 `tools/ref_llava_mlx.py`：数值参考改用 `mlx.core`（Metal GPU）重算，`test_llava` 变成「C 实现 vs MLX」 |
 | `windows-x64` | `sglc.exe`（CPU，MSVC /MT 静态，单线程） |
-| `windows-x64-cuda` | `sglc.exe` + `cuda_cli.exe` + `cuda_http.exe`（RTX 显卡加速，sm_75+；需驱动，附带 cublas64 DLL） |
+| `windows-x64-cuda` | `sglc.exe` + `cuda_cli.exe` + `cuda_http.exe`（RTX 显卡加速，sm_75+；需驱动，附带 cublas DLL） |
+| `windows-arm64-cuda` | **preview**：Windows on Arm 版，用 CUDA 13.4.0 Developer Preview 工具链构建（同时含 sm_75/sm_120 cubin，面向 RTX Spark 这类 Blackwell 级 WoA 机器，驱动 616.41+） |
 
-构建矩阵的实测状态（哪一项是怎么验的）：`docs/PROGRESS_g11_g19.md` —— linux-x64 / linux-arm64 /
-windows-msvc / windows-msvc-cuda 均已实跑；**macos-arm64 已在真机 iMac（macOS 27.0.1 / AppleClang 21）
-上编译并 ctest 24/24 通过**（`docs/g_macos_arm64.txt`）；macos-x64 仍未直接验证。
+构建矩阵（`.github/workflows/build.yml`）：`linux-x64`、`linux-arm64`、`linux-x64-cuda`、`linux-arm64-cuda`、
+`macos-arm64`、`macos-arm64-mlx`、`windows-x64`、`windows-x64-cuda`，外加独立的 `windows-arm64-cuda` job
+（GitHub 的 arm64 Windows runner）。每次 push 全量构建并打包；CUDA 与 arm64 项在无 GPU 的 runner 上跑不起来，
+只做 smoke（产物存在 + `ldd`/`dumpbin` 架构与依赖 + `sglc` usage 退出码），实际推理留给真机。
+
+真机实测过的项与验法：`docs/PROGRESS_g11_g19.md`。linux-x64 / linux-arm64 / windows-x64 /
+windows-msvc-cuda 均已实跑；**macos-arm64 已在真机 iMac（macOS 27.0.1 / AppleClang 21）上编译并
+ctest 24/24 通过**（`docs/g_macos_arm64.txt`）。`macos-x64`（Intel）已于 **2026-10-27 删除**：需要从
+arm64 宿主交叉编译 + Rosetta 跑测试，而 Intel runner 已退场。
 
 ## 能力一览
 
@@ -96,7 +105,8 @@ curl localhost:30000/v1/chat/completions -d '{"messages":[{"role":"user","conten
 | 组件 | 版本 | 说明 |
 |---|---|---|
 | Windows CPU 栈 | WinLibs GCC **16.2**（winget `BrechtSanders.WinLibs.POSIX.UCRT`）| CMake ≥ 3.20 + Ninja；产物静态链接不依赖运行库 DLL |
-| CUDA 栈 | VS2022 Build Tools（MSVC 14.44）+ CUDA Toolkit **13.3** | sm_75+（RTX 20 系起）；与 MinGW 栈共存于独立 build 目录 |
+| CUDA 栈（x64） | VS2022 Build Tools（MSVC 14.44）+ CUDA Toolkit **13.3** | sm_75+（RTX 20 系起）；Windows x64 与 Linux（x64 / arm64-sbsa）都用 13.3 |
+| CUDA 栈（Windows on Arm） | arm64 MSVC + CUDA Toolkit **13.4.0 Developer Preview** | 第一个带 Windows-on-Arm 主机工具的 CUDA；目前只有 preview 安装器，所以 arm64 包是实验性产物 |
 | 可选 OpenBLAS | **0.3.29 x64.zip**（Release 页） | 注意不是 `x64_64`（那是 64 位 int ABI，动态调用会静默读出垃圾值）；解压到 `third_party/openblas` 后 `-DSGL_OPENBLAS=ON` |
 | 源码编码 | UTF-8 **带 BOM** | MSVC/nvcc 按 GBK 读无 BOM 的中文注释会吞结构体声明；CMake configure 阶段有自检警告 |
 | 测试模型 | `models/` 目录 | 真实权重：gpt2 / tinyllama / qwen05 / qwen3-06 / llama-160m；随机生成（tests/gen_random_*.py）：mistral-rand / gemma-rand / llava-rand |

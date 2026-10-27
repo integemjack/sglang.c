@@ -1,4 +1,4 @@
-﻿/* test_cuda.c — CUDA 后端验证（需 SGL_CUDA=ON 构建；无 CUDA 构建时不存在）
+/* test_cuda.c — CUDA 后端验证（需 SGL_CUDA=ON 构建；无 CUDA 构建时不存在）
  * 1. 上传 Qwen2.5-0.5B 权重到 GPU（fp32 ≈2GB）
  * 2. 同 prompt 的 logits 与 CPU 版对照（< 2e-3，fp32 归约顺序差异）
  * 3. greedy 16 步与 CPU 逐 token 对照
@@ -16,6 +16,7 @@
 #include "sgl/cuda.h"
 #include "sgl/cuda_spec.h"
 #include "sgl/gpt2.h"
+#include "sgl/port.h" /* fopen_s 等 MSVC/C11-K 垫片（Linux 构建需要）*/
 #include "sgl/image.h" /* G12: sgl_projector（mm_projector 单层/两层）*/
 #include "sgl/json.h"
 #include "sgl/llama.h"

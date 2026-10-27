@@ -116,14 +116,24 @@ publishes them automatically):
 | Package | Contents |
 | --- | --- |
 | `linux-x64` / `linux-arm64` | `sglc` (CPU; OpenMP multithreading when built with GNU compilers) |
-| `macos-arm64` / `macos-x64` | `sglc` (CPU, **single-threaded**: AppleClang has no `-fopenmp` and CI does not install libomp) |
+| `linux-x64-cuda` / `linux-arm64-cuda` | `sglc` + `cuda_cli` + `cuda_http` (+ the bundled `libcublas*.so`); needs an NVIDIA GPU and driver at runtime |
+| `macos-arm64` | `sglc` (CPU, **single-threaded**: AppleClang has no `-fopenmp` and CI does not install libomp) |
+| `macos-arm64-mlx` | same binary plus `tools/ref_llava_mlx.py`: the LLaVA numeric reference recomputed with `mlx.core` on the Metal GPU (`test_llava` then compares C against MLX) |
 | `windows-x64` | `sglc.exe` (CPU, MSVC `/MT` static, single-threaded) |
 | `windows-x64-cuda` | `sglc.exe` + `cuda_cli.exe` + `cuda_http.exe` (RTX acceleration, sm_75+; needs a driver, ships the cuBLAS DLLs) |
+| `windows-arm64-cuda` | **preview**: Windows on Arm build made with the CUDA 13.4.0 *Developer Preview* toolkit (sm_75 + sm_120 cubins, aimed at Blackwell-class Windows-on-Arm machines such as RTX Spark with driver 616.41+) |
 
-Build-matrix status (what was actually verified and how): [docs/PROGRESS_g11_g19.md](docs/PROGRESS_g11_g19.md).
-`linux-x64`, `linux-arm64`, `windows-msvc` and `windows-msvc-cuda` have all been run for real; **macos-arm64
-was compiled on real hardware (iMac, macOS 27.0.1 / AppleClang 21) and passed ctest 24/24**
-([docs/g_macos_arm64.txt](docs/g_macos_arm64.txt)); macos-x64 has not been verified directly yet.
+Build matrix (`.github/workflows/build.yml`): `linux-x64`, `linux-arm64`, `linux-x64-cuda`, `linux-arm64-cuda`,
+`macos-arm64`, `macos-arm64-mlx`, `windows-x64`, `windows-x64-cuda`, plus a separate `windows-arm64-cuda` job
+on GitHub's arm64 Windows runner. Every push builds and packages all of them; the CUDA and arm64 entries
+cannot run on the GPU-less runners, so they are smoke-checked instead (binaries present, `ldd`/`dumpbin`
+architecture and dependencies, `sglc` usage exit code) and left to be run on real hardware.
+
+What was verified on real hardware and how: [docs/PROGRESS_g11_g19.md](docs/PROGRESS_g11_g19.md).
+`linux-x64`, `linux-arm64`, `windows-x64` and `windows-x64-cuda` have all been run for real; **macos-arm64
+was compiled on an iMac (macOS 27.0.1 / AppleClang 21) and passed ctest 24/24**
+([docs/g_macos_arm64.txt](docs/g_macos_arm64.txt)). `macos-x64` (Intel) was **dropped on 2026-10-27**: it
+needed cross-compilation from an arm64 host plus Rosetta to run the tests, and Intel runners are gone.
 
 ## Feature matrix
 
@@ -303,7 +313,8 @@ Highlights from the optimization log (details and logs in [CHANGELOG.md](CHANGEL
 | Component | Version | Notes |
 | --- | --- | --- |
 | Windows CPU stack | WinLibs GCC **16.2** (`winget install BrechtSanders.WinLibs.POSIX.UCRT`) | CMake ≥ 3.20 + Ninja; artifacts are statically linked |
-| CUDA stack | VS2022 Build Tools (MSVC 14.44) + CUDA Toolkit **13.3** | sm_75+ (RTX 20 series and newer); coexists with the MinGW build in a separate build dir |
+| CUDA stack (x64) | VS2022 Build Tools (MSVC 14.44) + CUDA Toolkit **13.3** | sm_75+ (RTX 20 series and newer); Windows x64 and Linux (x64/arm64-sbsa) both build with 13.3 |
+| CUDA stack (Windows on Arm) | arm64 MSVC + CUDA Toolkit **13.4.0 Developer Preview** | the first CUDA release with Windows-on-Arm host tools; only a preview installer exists, so the arm64 package is experimental |
 | Optional OpenBLAS | **0.3.29 x64.zip** | see the warning above about `x64` vs `x64_64`; `-DSGL_OPENBLAS=ON` |
 | Source encoding | UTF-8 **with BOM** | MSVC/nvcc read BOM-less files as GBK and swallow struct declarations after Chinese comments; CMake warns during configure |
 | Test models | `models/` | real weights: gpt2 / tinyllama / qwen05 / qwen3-06 / llama-160m; generated: mistral-rand / gemma-rand / llava-rand |

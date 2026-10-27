@@ -1,4 +1,4 @@
-﻿/* sgl cuda_http.c - GPU HTTP inference server (MSVC build, links sgl_cuda)
+/* sgl cuda_http.c - GPU HTTP inference server (MSVC build, links sgl_cuda)
  * endpoints: GET /health, POST /generate, POST /v1/completions,
  *            POST /v1/chat/completions (chatml template; stream via SSE)
  * engine: KV-segment scheduler on GPU - each request gets a segment of
@@ -12,9 +12,84 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
+/* POSIX（Linux/macOS）：winsock -> BSD socket，Win32 同步原语 -> pthread。
+ * 下面所有平台差异都收在 #else 分文里，Windows 编译路径一字不改。 */
+#include "sgl/port.h" /* fopen_s / _strnicmp / strcpy_s 垫片 */
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+/* ---- winsock -> POSIX 符号映射 ---- */
+#define SOCKET int
+#define INVALID_SOCKET (-1)
+#define closesocket(s) close(s)
+#define WSAGetLastError() (errno)
+#define WSAEWOULDBLOCK EAGAIN
+#define WSAENOBUFS ENOBUFS
+#define WSAEINTR EINTR
+#define WSAECONNABORTED ECONNABORTED
+#define WSAEMFILE EMFILE
+#define _strdup strdup
+#ifdef MSG_NOSIGNAL
+#define SGL_SEND_FLAGS MSG_NOSIGNAL /* 客户端先断开时 send 得 EPIPE，而不是 SIGPIPE 杀进程 */
+#else
+#define SGL_SEND_FLAGS 0 /* macOS 等没有 MSG_NOSIGNAL（靠 SO_NOSIGPIPE / signal）*/
+#endif
+
+/* ---- Win32 临界区 / 条件变量 -> pthread ---- */
+#define CRITICAL_SECTION pthread_mutex_t
+#define InitializeCriticalSection(m) pthread_mutex_init((m), NULL)
+#define EnterCriticalSection(m) pthread_mutex_lock(m)
+#define LeaveCriticalSection(m) pthread_mutex_unlock(m)
+#define CONDITION_VARIABLE pthread_cond_t
+#define InitializeConditionVariable(c) pthread_cond_init((c), NULL)
+#define WakeConditionVariable(c) pthread_cond_signal(c)
+#define WakeAllConditionVariable(c) pthread_cond_broadcast(c)
+/* SleepConditionVariableCS 等价：ms 超时（相对时间 -> CLOCK_REALTIME 绝对时间）;
+ * 与 Win32 一样：等待期间释放锁，醒来重新持锁。 */
+static int sgl_sleep_cs(pthread_cond_t *cv, pthread_mutex_t *cs, int ms) {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_sec += ms / 1000;
+  ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+  if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
+  return pthread_cond_timedwait(cv, cs, &ts);
+}
+#define SleepConditionVariableCS(cv, cs, ms) sgl_sleep_cs((cv), (cs), (ms))
+static void sgl_sleep_ms(int ms) {
+  struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+  nanosleep(&ts, NULL);
+}
+#define Sleep(ms) sgl_sleep_ms(ms)
+/* GetTickCount64：单调毫秒（Windows 上是开机毫秒，只用于打时间戳/造种子） */
+static unsigned long long sgl_tick_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (unsigned long long)ts.tv_sec * 1000ULL + (unsigned long long)(ts.tv_nsec / 1000000L);
+}
+#define GetTickCount64() sgl_tick_ms()
+/* 线程入口签名：Win32 = DWORD WINAPI f(LPVOID)，POSIX = void *f(void *) */
+#define SGL_THREAD_SIG(name) static void *name(void *arg)
+#define SGL_THREAD_RETURN return NULL
+#endif
+
+#ifdef _WIN32
+#define SGL_SEND_FLAGS 0 /* winsock 无 MSG_NOSIGNAL */
+#define SGL_THREAD_SIG(name) static DWORD WINAPI name(LPVOID arg)
+#define SGL_THREAD_RETURN return 0
+#endif
 
 #include "sgl/alloc.h"
 #include "sgl/bpe.h"
@@ -26,8 +101,6 @@
 #include "sgl/ops.h"
 #include "sgl/safetensors.h"
 #include "sgl/sampling.h"
-
-#pragma comment(lib, "ws2_32.lib")
 
 #define MAX_CONC 8
 #define MAX_NEW_CAP 512
@@ -340,8 +413,8 @@ static char *decode_gen(request *r) {
 
 /* ---------------- worker: prefill + batched decode ---------------- */
 
-static DWORD WINAPI worker(LPVOID unused) {
-  (void)unused;
+SGL_THREAD_SIG(worker) {
+  (void)arg;
   float *batch_logits = (float *)malloc(sizeof(float) * (size_t)MAX_CONC * E.vocab);
   for (;;) {
     EnterCriticalSection(&E.lock);
@@ -524,7 +597,7 @@ static DWORD WINAPI worker(LPVOID unused) {
     LeaveCriticalSection(&E.lock);
   }
   free(batch_logits);
-  return 0;
+  SGL_THREAD_RETURN;
 }
 
 /* ---------------- http plumbing ---------------- */
@@ -605,7 +678,7 @@ static int send_all(SOCKET fd, const char *buf, int len) {
   int off = 0;
   int tries = 0;
   while (off < len) {
-    int n = send(fd, buf + off, len - off, 0);
+    int n = send(fd, buf + off, len - off, SGL_SEND_FLAGS);
     if (n > 0) { off += n; tries = 0; continue; }
     int e = WSAGetLastError();
     if (e == WSAEWOULDBLOCK || e == WSAENOBUFS || e == WSAEINTR) {
@@ -972,16 +1045,26 @@ static int trace_on(void) {
   return on;
 }
 
-static DWORD WINAPI conn_thread(LPVOID arg) {
+SGL_THREAD_SIG(conn_thread) {
   conn_ctx *c = (conn_ctx *)arg;
   http_req req;
   /* t5 robustness: a stalled client (or a winsock internal hiccup seen under
    * burst load) could park recv() forever and leak the thread. Cap it. */
+#ifdef _WIN32
   DWORD rto = 30000;
   setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rto, sizeof(rto));
   DWORD sto = 5000; /* t5: a blocked send() must not park the thread forever */
   setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&sto, sizeof(sto));
   setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&(int){1}, sizeof(int));
+#else
+  /* POSIX：SO_RCVTIMEO/SO_SNDTIMEO 收的是 struct timeval（不是 DWORD 毫秒）*/
+  struct timeval rto = {30, 0};
+  setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto));
+  struct timeval sto = {5, 0};
+  setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &sto, sizeof(sto));
+  int nd = 1;
+  setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+#endif
   if (trace_on()) fprintf(stderr, "[trace] conn enter fd=%llu t=%llu\n", (unsigned long long)c->fd,
                          (unsigned long long)GetTickCount64());
   if (read_request(c->fd, &req) == 0) {
@@ -994,7 +1077,7 @@ static DWORD WINAPI conn_thread(LPVOID arg) {
                          (unsigned long long)GetTickCount64());
   closesocket(c->fd);
   free(c);
-  return 0;
+  SGL_THREAD_RETURN;
 }
 
 int main(int argc, char **argv) {
@@ -1005,8 +1088,12 @@ int main(int argc, char **argv) {
   const char *dir = argv[1];
   int port = argc > 2 ? atoi(argv[2]) : 30001;
 
+#ifdef _WIN32
   WSADATA wsa;
   WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+  signal(SIGPIPE, SIG_IGN); /* 连接到已关闭的连接上 send()：不要因 SIGPIPE 被杀 */
+#endif
 
   memset(&E, 0, sizeof(E));
   InitializeCriticalSection(&E.lock);
@@ -1152,14 +1239,29 @@ int main(int argc, char **argv) {
          E.seg_len, ACTIVE_CONC, E.eos, E.degraded ? " [DEGRADED]" : "");
   fflush(stdout);
 
+#ifdef _WIN32
   HANDLE w = CreateThread(NULL, 0, worker, NULL, 0, NULL);
+#else
+  pthread_t w;
+  pthread_create(&w, NULL, worker, NULL);
+#endif
 
   SOCKET lst = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (lst == INVALID_SOCKET) {
+    fprintf(stderr, "socket failed: %d\n", WSAGetLastError());
+    return 2;
+  }
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
-  addr.sin_port = htons((u_short)port);
+  addr.sin_port = htons((unsigned short)port);
+#ifdef _WIN32
   addr.sin_addr.S_un.S_addr = inet_addr("127.0.0.1");
+#else
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  /* 重启服务时不被 TIME_WAIT 卡住（Windows 的 SO_REUSEADDR 语义不同，不动它）*/
+  setsockopt(lst, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+#endif
   if (bind(lst, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
     fprintf(stderr, "bind failed: %d\n", WSAGetLastError());
     return 2;
@@ -1182,13 +1284,24 @@ int main(int argc, char **argv) {
     ctx->fd = c;
     if (trace_on()) fprintf(stderr, "[trace] accept fd=%llu t=%llu\n", (unsigned long long)c,
                            (unsigned long long)GetTickCount64());
+#ifdef _WIN32
     HANDLE t = CreateThread(NULL, 0, conn_thread, ctx, 0, NULL);
     if (t) CloseHandle(t);
     else fprintf(stderr, "[http] CreateThread failed (fd=%llu, wsa=%d)\n",
                  (unsigned long long)c, WSAGetLastError());
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, conn_thread, ctx) == 0) pthread_detach(t);
+    else fprintf(stderr, "[http] pthread_create failed (fd=%llu, errno=%d)\n",
+                 (unsigned long long)c, errno);
+#endif
   }
   E.stop = 1;
   WakeAllConditionVariable(&E.cv_work);
+#ifdef _WIN32
   WaitForSingleObject(w, INFINITE);
+#else
+  pthread_join(w, NULL);
+#endif
   return 0;
 }
