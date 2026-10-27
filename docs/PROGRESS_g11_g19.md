@@ -189,6 +189,71 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
 - 至此 **TODO_PROMPTS v0.4 的 G11–G19 全部完成**（只剩可选项未做：G12 的 7B LM 端到端
   因磁盘不够、G13 的 CUDA 路径、G15 的跳段共享——都有实测依据说明无意义/不可能）。
 
+## Linux job 实跑（第 13 轮，2026-10-27）
+
+之前我写「本机没有 Linux 环境」——**不准确**。WSL 里只有 `docker-desktop`（非通用发行版），但 Docker 可用（linux/amd64 29.6.2），于是能用 Ubuntu 24.04 容器把
+`linux-x64` 矩阵项真跑一遍。
+
+做法：容器里 `apt-get install build-essential cmake ninja-build python3 python3-pip`，
+源码从只读挂载复制到 `/work`，**逐字**执行 workflow 的生成步 → 配置 → 编译 → Test 步 → gate。
+只有两处替代：`models/gpt2/model.safetensors`（520MB）与 `models/qwen3-06` 的 4 个 tokenizer
+文件改用本机同名文件的软链（CI 是 `curl` HuggingFace，内容相同）。
+
+### 结果
+
+| 项 | 结果 |
+|---|---|
+| 生成 5 个随机族 + `ref_llava.py` | 全部成功（与 msvc 那条输出逐字一致，proj_checksum 1.072851） |
+| `cmake -G Ninja` + `cmake --build build -j` | BUILD_OK |
+| `ctest --test-dir build -V --timeout 900` | **100% tests passed, 0 failed out of 24**（176s） |
+| G19 gate | **counts: fam=4 fam_ran=4 llava=1 → LINUX GATE: PASS** |
+
+24 项里有 `test_family_{mistral,gemma,gemma2,qwen3next}` 与 `test_llava`，说明模型族与
+多模态在 Linux 上也真跑了（不是 SKIP）。`test_llama: all OK` 出现 4 次。
+
+### 又抓到一个我自己引入的 gate bug（已修）
+
+第 10 轮我把 `|| true` 改成 `|| echo 0`，本意是防「日志缺失 → 变量空 → `[ \"\" -lt 4 ]` 报错
+→ if 当假 → 静默通过」。但**这个改法在「无匹配」这个更常见的情形下反而坏了**：
+`grep -c` 无匹配时会**先打印 `0` 再返回 1**，于是 `|| echo 0` 又追加一个 `0`，变量成了两行的
+`\"0\
+0\"` → `[ \"0\
+0\" -lt 4 ]` 报 integer 错 → `if` 当假 → **gate 静默通过**。
+也就是说：**某个 family 测试真回归的时候，gate 恰好拦不住** —— 正是它存在的意义。
+
+修法（`.github/workflows/build.yml` 147-157）：
+
+- 计数改成 `grep -c ... | head -1 || true`（`head -1` 保证只取一个数字，多行被截断）；
+- 补 `${var:-0}` 兜空；
+- 再加一道 `case \"$fam$fam_ran$llava\" in *[!0-9]*) exit 1 ;;` 的非数字硬失败，
+  任何意外（多行/空/乱码）都只能让 gate 变严、不能变宽。
+
+验证（在容器里、**用 GitHub Actions 真实的 `bash -e -o pipefail` 旗标**）：
+
+| 情形 | 期望 | 实测 |
+|---|---|---|
+| A 正常（4 族 Passed + 4 条 all-OK + llava OK） | 0 | **exit 0**（不会假红） |
+| B 一个族回归（3 个 Passed、无 all-OK 行） | 1 | **exit 1** |
+| C 日志不存在 | 1 | **exit 1** |
+| D 日志里是非数字内容 | 1 | **exit 1** |
+
+### 一个没能复现的现象（如实记录，不当结论）
+
+用 `docker run --rm` 跑整套时，PowerShell 终端报过一次 `退出码 1`，但输出里 gate 明确是
+`LINUX GATE: PASS`。改用常驻容器 + `docker exec` 复跑同一份脚本（并在脚本里逐步打印
+`ctest|tee pipeline rc=$?`），得到 **rc=0、脚本自然退出 0**。所以：
+
+- 能用工具确认的是：**gate 在通过时返回 0，脚本自然退出码 0**；
+- `--rm` 那次报的 1 无法复现，怀疑是我自己的 PowerShell 包装层（`Tee-Object` 管道）在
+  容器退出后取到的状态，但**没有证据，所以不写成 CI 的问题**。
+
+### 仍未验证的
+
+- `linux-arm64`、`macos-arm64`、`macos-x64` 三个矩阵项：本机没有 arm64 容器/macOS，
+  跑不了（`macos-x64` 走的是 `-DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_C_FLAGS=-march=x86-64-v2`
+  交叉编译 + Rosetta，Windows 上无法等价复现）。
+- `release` job：要 push tag，属对外发布，未做。
+
 ## msvc-cuda 矩阵项的断言本机复核（第 12 轮，2026-10-27）
 
 前两轮只跑了 workflow 的 `msvc` job，`msvc-cuda` 那条从未验证。它在无 GPU 的 runner
@@ -203,9 +268,10 @@ malloc 缓冲经常是从前一个 POST 请求回收来的，len 之后残留着
    退出码为 1。本机（VS 生成器，产物在 `bin\Release\`）三个 exe 均存在，
    `sglc.exe` 无参退出码 **= 1**，usage 文本确实打到 stderr（首行是 `usage: ... --model <dir>`）。
 
-未验证的只剩：`ninja` / `ninja-x64` 两条 **Linux** job（本机无 Linux 环境；但它们的
-验收 gate 已在第 10 轮用 msvc 产物跑过同一套 bash 命令），以及真正打 tag 时的 `release`
-job（需 push tag，属对外发布，未做）。
+未验证的只剩：`linux-arm64` / `macos-arm64` / `macos-x64` 三个矩阵项（本机没有 arm64
+容器与 macOS），以及真正打 tag 时的 `release` job（需 push tag，属对外发布，未做）。
+~~[已推翻] `linux-x64` 当时写的是「本机无 Linux 环境」~~ → **第 13 轮用 Docker(Ubuntu 24.04)
+真跑了 `linux-x64`：24/24 通过、gate PASS**，见上一节。
 
 ## README 对账（第 11 轮，2026-10-27）
 

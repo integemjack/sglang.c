@@ -144,11 +144,17 @@ jobs:
           # 判据全部用 **ASCII 标记**（test_llama / test_llava 成功时都打 "all OK"），
           # 不去 grep 输出里的中文——那串字面量能不能按 UTF-8 落盘取决于工具链的
           # /utf-8（CMakeLists 现在给了，但换个编译器就可能变成系统代码页）。
-          # 注意用 `|| echo 0` 而不是 `|| true`：ctest.log 不存在时 grep 什么也不输出，
-          # 变量为空会让 `[ "$fam" -lt 4 ]` 报 integer 错并被 if 当成假 —— 判据静默失效。
-          fam=$(grep -c 'test_llama: all OK' ctest.log 2>/dev/null || echo 0)
-          fam_ran=$(grep -cE 'test_family_(mistral|gemma|gemma2|qwen3next).*Passed' ctest.log 2>/dev/null || echo 0)
-          llava=$(grep -c 'test_llava: all OK' ctest.log 2>/dev/null || echo 0)
+          # 计数用 `| head -1`：grep -c 无匹配时会**先打印 0 再返回 1**，若再 `|| echo 0`
+          # 就会得到两行的 "0\n0"，`[ "0\n0" -lt 4 ]` 报 integer 错、被 if 当成假 ——
+          # gate 反而会静默通过（测试真回归时拦不住，正是它要防的情况）。
+          # 最后再加一道非数字硬失败，任何意外（多行/空/乱码）都不能让 gate 变宽。
+          fam=$(grep -c 'test_llama: all OK' ctest.log 2>/dev/null | head -1 || true)
+          fam_ran=$(grep -cE 'test_family_(mistral|gemma|gemma2|qwen3next).*Passed' ctest.log 2>/dev/null | head -1 || true)
+          llava=$(grep -c 'test_llava: all OK' ctest.log 2>/dev/null | head -1 || true)
+          fam=${fam:-0}; fam_ran=${fam_ran:-0}; llava=${llava:-0}
+          case "$fam$fam_ran$llava" in
+            *[!0-9]*) echo "::error::计数不是数字（fam='$fam' fam_ran='$fam_ran' llava='$llava'）"; exit 1 ;;
+          esac
           echo "family runs that finished all-OK: $fam, test_family_* Passed: $fam_ran, test_llava all-OK: $llava"
           if [ "$fam_ran" -lt 4 ]; then echo "::error::test_family_* 只有 $fam_ran 个 Passed（应为 mistral/gemma/gemma2/qwen3next 4 个）"; exit 1; fi
           if [ "$fam" -lt 4 ]; then echo "::error::模型族只跑了 $fam 个（应为 4 个）"; exit 1; fi

@@ -5,6 +5,16 @@
 ## [Unreleased] — TODO_PROMPTS v0.4 的缺口 G11/G12/G13/G14/G15/G16/G17/G18/G19
 
 ### 基础设施（G19 补记）
+- **在 Docker(Ubuntu 24.04) 里把 `linux-x64` 矩阵项真跑了一遍**（之前只验过 msvc 与
+  msvc-cuda；我当时写的「本机无 Linux 环境」不准确）：生成 5 个随机族 → Ninja 配置编译 →
+  `ctest -V` **24/24 通过**（含 `test_family_*` 4 项与 `test_llava`）→ 抽出 workflow 的
+  验收 gate 跑 → **counts 4/4/1、GATE PASS**。
+- **修了 gate 自己的一个静默失效**：第 10 轮把 `|| true` 改成 `|| echo 0` 本意是防空变量，
+  但 `grep -c` 无匹配时会**先打印 `0` 再返回 1**，`|| echo 0` 又追加一个 → 变量成了两行的
+  `"0\n0"` → `[ "0\n0" -lt 4 ]` 报 integer 错、`if` 当假 → **gate 静默通过**，也就是测试
+  真回归时恰好拦不住。现改为 `| head -1 || true` + `${var:-0}` + 非数字硬失败
+  （`case ... *[!0-9]*) exit 1`）；在 GH Actions 真实的 `bash -e -o pipefail` 下验证四种
+  情形：正常→0（不假红）、一个族回归→1、日志缺失→1、非数字→1。
 - **从干净检出按 CI 步骤实跑一次**（之前只验了生成器产出逐字节相同 + YAML 可解析，
   没验过那串步骤在 fresh clone 上能跑）：`git clone` → 逐字执行 workflow 的生成步 →
   Ninja+MSVC 配置编译 → `ctest -V` **24/24 通过**（`test_family_{mistral,gemma,gemma2,
