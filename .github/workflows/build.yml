@@ -389,15 +389,16 @@ jobs:
           if ((Get-Item $exe).Length -lt 3GB) { throw "installer download truncated: $((Get-Item $exe).Length) bytes" }
           # -s = silent；只装编译/链接必需的子包（全装要多花几 GB）
           $p = Start-Process -FilePath $exe -Wait -PassThru -NoNewWindow -ArgumentList @(
-            '-s', 'nvcc_13.4', 'crt_13.4', 'cudart_13.4', 'cublas_13.4', 'cublas_dev_13.4')
+            '-s', 'nvcc_13.4', 'nvvm_13.4', 'crt_13.4', 'cudart_13.4', 'cublas_13.4', 'cublas_dev_13.4')
           if ($p.ExitCode -ne 0) { throw "CUDA silent install failed ($($p.ExitCode))" }
           $cuda = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4'
           if (-not (Test-Path "$cuda\bin\nvcc.exe")) { throw "nvcc not installed under $cuda" }
-          # nvcc 13.4 的 woA 预览版有个引号 bug：CICC_PATH 含空格时它拼出来的命令是
-          #   ""C:\Program Files\...\cicc" ...
-          # cmd 看到的是「空串 + C:\Program」→ The system cannot find the path specified.
-          # （实测三种 ccbin 变体都卡在同一行，见 Diagnose 步骤的日志）。整个目录搬到
-          # 无空格路径即可：同盘 rename 是瞬时的，nvcc 内部全用自身相对路径。
+          # nvcc 需要 nvvm 子包里的 cicc（设备端 C++ 编译器）；少了它 nvcc 会以
+          # "The system cannot find the path specified." 失败（cmd 找不到 cicc 就报这句话，
+          # 根本不说缺什么 —— 三次 CI 才定位到）。现在显式断言。
+          if (-not (Test-Path "$cuda\nvvm\bin\cicc.exe")) { throw "cicc missing: nvvm_13.4 subpackage not installed" }
+          # 再把整个目录搬到无空格路径：nvcc 的 profile 会把 "%CICC_PATH%\cicc" 包成双引号，
+          # cmd 遇到路径里的空格就断在 "C:\Program"。同盘 rename 瞬时完成，nvcc 全用相对路径。
           $moved = 'C:\cuda134'
           if (-not (Test-Path "$moved\bin\nvcc.exe")) {
             Move-Item -Path $cuda -Destination $moved -Force

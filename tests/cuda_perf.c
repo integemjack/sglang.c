@@ -1,4 +1,4 @@
-﻿/* cuda_perf.c — GPU 性能基准（G1 prefill / G2 W8 / G3 graph 的 A/B 工具）
+/* cuda_perf.c — GPU 性能基准（G1 prefill / G2 W8 / G3 graph 的 A/B 工具）
  *
  * 用法: cuda_perf <model_dir> [--prompt N[,N..]] [--decode M] [--batch B[,B..]]
  *                   [--rounds R] [--seg S] [--spec <draft_dir> [--spec-k K] [--newtok N]]
@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "sgl/port.h" /* _putenv 等 MSVC/C11-K 垫片（Linux 构建需要）*/
 
 #include "sgl/alloc.h"
 #include "sgl/bpe.h"

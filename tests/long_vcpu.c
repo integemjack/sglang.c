@@ -1,4 +1,4 @@
-﻿/* _long_vcpu.c — t2 验收：8K-token 重复文本 prompt，GPU forward_seg prefill
+/* _long_vcpu.c — t2 验收：8K-token 重复文本 prompt，GPU forward_seg prefill
  * logits vs CPU sgl_llama_forward 同 ids 的 maxerr（要求 < 1e-3）。
  * 一次性验收工具（不进 ctest）：CPU 8K prefill 需数分钟。
  * G16: 同时给出 GPU 内部 flash vs two-pass 的 maxerr（同进程两次前向），
@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "sgl/port.h" /* _putenv 等 MSVC/C11-K 垫片（Linux 构建需要）*/
 
 #include "sgl/alloc.h"
 #include "sgl/bpe.h"
