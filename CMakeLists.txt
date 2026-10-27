@@ -267,8 +267,10 @@ if(SGL_CUDA)
     set(SGL_NVCC_HOST_FLAGS "")
     set(SGL_NVCC_ARCH_FLAGS "")
     foreach(_a ${SGL_CUDA_ARCH})
+      # 一个 --generate-code 里要带两个 code 必须用方括号（否则 nvcc 报
+      # "redefinition of keyword 'code'"）。cubin 优先，PTX 供 JIT 兼容新卡。
       list(APPEND SGL_NVCC_ARCH_FLAGS
-           --generate-code=arch=compute_${_a},code=sm_${_a},code=compute_${_a})
+           "--generate-code=arch=compute_${_a},code=[sm_${_a},compute_${_a}]")
     endforeach()
     set(SGL_NVCC_EXTRA_FLAGS -Xcompiler -fPIC)
   endif()
