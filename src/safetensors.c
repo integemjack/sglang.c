@@ -22,6 +22,7 @@
 #include "sgl/json.h"
 #include "sgl/log.h"
 #include "sgl/port.h"
+#include "sgl/qweight.h"
 
 #define SGL_ST_MAX_SHARDS 128
 
@@ -55,6 +56,8 @@ struct sgl_st_ctx {
   /* GGUF 反量化得到的 f32 缓冲，归 ctx 生命周期（f32 已经是 owned）*/
   void **gowned;
   int n_gowned, cap_gowned;
+  /* AWQ/GPTQ：config.json 的 quantization_config；method==SGL_Q_NONE 表示无 */
+  sgl_qcfg q;
 };
 
 /* IEEE 754 half → float（位运算，无依赖）
@@ -176,6 +179,183 @@ static void shard_close(st_shard *s) {
   s->name = NULL;
 }
 
+/* ---- 裸张量访问（AWQ/GPTQ 的 qweight 是 int32，shard_get 只认浮点）---- */
+
+typedef struct {
+  const char *dtype;
+  int ndim;
+  int64_t dims[4];
+  const char *bytes; /* mmap 内的数据区指针 */
+  size_t nbytes;
+} st_raw;
+
+/* 取张量原始字节；不存在或头部异常返回 0 */
+static int shard_raw(const st_shard *c, const char *name, st_raw *out) {
+  const sgl_json *e = sgl_json_get(c->header, name);
+  if (!e) return 0;
+  const sgl_json *shape = sgl_json_get(e, "shape");
+  const sgl_json *offs = sgl_json_get(e, "data_offsets");
+  if (!shape || shape->type != SGL_JSON_ARRAY || !offs || offs->type != SGL_JSON_ARRAY ||
+      offs->count != 2 || shape->count < 1 || shape->count > 4)
+    return 0;
+  out->dtype = sgl_json_get_str(e, "dtype", "");
+  out->ndim = shape->count;
+  for (int i = 0; i < 4; i++) out->dims[i] = 1;
+  for (int i = 0; i < shape->count; i++) out->dims[i] = (int64_t)shape->items[i]->num;
+  size_t s = (size_t)offs->items[0]->num, t = (size_t)offs->items[1]->num;
+  if (s > t || t > c->data_len) return 0;
+  out->bytes = c->data + s;
+  out->nbytes = t - s;
+  return 1;
+}
+
+/* 按名字定位所在分片（index 模式靠 weight_map）*/
+static const st_shard *shard_for(const sgl_st_ctx *c, const char *name) {
+  if (!c || c->gg) return NULL;
+  if (c->wmap) {
+    const sgl_json *v = sgl_json_get(c->wmap, name);
+    if (!v || v->type != SGL_JSON_STRING || !v->str) return NULL;
+    for (int i = 0; i < c->n_sh; i++)
+      if (c->sh[i].name && !strcmp(c->sh[i].name, v->str)) return &c->sh[i];
+    return NULL;
+  }
+  return c->n_sh > 0 ? &c->sh[0] : NULL;
+}
+
+/* 把 int32 little-endian 字节复制成对齐的 int32 缓冲（拷贝是为了避开非对齐访问）*/
+static int32_t *bytes_to_i32(const char *bytes, size_t nbytes, int64_t *n) {
+  if (nbytes % 4) return NULL;
+  int64_t cnt = (int64_t)(nbytes / 4);
+  int32_t *p = (int32_t *)sgl_xmalloc((size_t)cnt * sizeof(int32_t));
+  memcpy(p, bytes, nbytes);
+  if (n) *n = cnt;
+  return p;
+}
+
+/* f16/bf16/f32 → 对齐 f32 缓冲 */
+static float *bytes_to_f32(const char *bytes, size_t nbytes, const char *dtype, int64_t *n) {
+  if (!strcmp(dtype, "F32")) {
+    if (nbytes % 4) return NULL;
+    int64_t cnt = (int64_t)(nbytes / 4);
+    float *p = (float *)sgl_xmalloc((size_t)cnt * sizeof(float));
+    memcpy(p, bytes, nbytes);
+    if (n) *n = cnt;
+    return p;
+  }
+  if (!strcmp(dtype, "F16") || !strcmp(dtype, "BF16")) {
+    if (nbytes % 2) return NULL;
+    int64_t cnt = (int64_t)(nbytes / 2);
+    float *p = (float *)sgl_xmalloc((size_t)cnt * sizeof(float));
+    const uint16_t *h = (const uint16_t *)bytes;
+    int bf = !strcmp(dtype, "BF16");
+    for (int64_t i = 0; i < cnt; i++) p[i] = bf ? bf16_to_f32(h[i]) : f16_to_f32(h[i]);
+    if (n) *n = cnt;
+    return p;
+  }
+  return NULL;
+}
+
+/* 把 qweight/qzeros/scales(/g_idx) 解成 [N,K] 的 f32。
+ * 成功时返回 malloc 的缓冲（调用方负责登记归属），失败返回 NULL。*/
+static float *quant_get(sgl_st_ctx *c, const char *base, int64_t *out_N, int64_t *out_K,
+                        int *out_ndim) {
+  char nm[512];
+  st_raw qw, qz, sc, gi;
+  memset(&qz, 0, sizeof(qz));
+  memset(&gi, 0, sizeof(gi));
+  int has_z = 0, has_g = 0;
+
+  snprintf(nm, sizeof(nm), "%s.qweight", base);
+  const st_shard *sh = shard_for(c, nm);
+  if (!sh || !shard_raw(sh, nm, &qw)) return NULL;
+  if (strcmp(qw.dtype, "I32")) {
+    SGL_ERROR("quant: %s dtype=%s，期望 I32", nm, qw.dtype);
+    return NULL;
+  }
+  snprintf(nm, sizeof(nm), "%s.scales", base);
+  sh = shard_for(c, nm);
+  if (!sh || !shard_raw(sh, nm, &sc)) {
+    SGL_ERROR("quant: 缺 %s.scales", base);
+    return NULL;
+  }
+  snprintf(nm, sizeof(nm), "%s.qzeros", base);
+  sh = shard_for(c, nm);
+  if (sh && shard_raw(sh, nm, &qz)) has_z = 1;
+  else if (c->q.zero_point) {
+    SGL_ERROR("quant: zero_point 开启但缺 %s.qzeros", base);
+    return NULL;
+  }
+  snprintf(nm, sizeof(nm), "%s.g_idx", base);
+  sh = shard_for(c, nm);
+  if (sh && shard_raw(sh, nm, &gi)) has_g = 1;
+
+  /* 形状推导：scales 是 [K/G, N]，N 从最后一维拿 */
+  int64_t sc_n = 0;
+  float *scl = bytes_to_f32(sc.bytes, sc.nbytes, sc.dtype, &sc_n);
+  if (!scl) {
+    SGL_ERROR("quant: %s.scales dtype=%s 不支持", base, sc.dtype);
+    return NULL;
+  }
+  int64_t N = sc.dims[sc.ndim - 1];
+  int64_t sc_rows = (int64_t)(sc_n / (N > 0 ? N : 1));
+  int64_t K = 0;
+  const int pack = sgl_q_pack(c->q.bits);
+  if (c->q.method == SGL_Q_AWQ) {
+    /* gemm: qweight [K, N/pack]；gemv: [N/pack, K]。方形权重（K==N）两者都满足，
+     * 所以先信 config 的 version，对不上再按形状修正。*/
+    const int gemm_ok = qw.dims[1] * pack == N;
+    const int gemv_ok = qw.dims[0] * pack == N;
+    if (!c->q.transposed && gemm_ok) {
+      K = qw.dims[0];
+    } else if ((c->q.transposed || !gemm_ok) && gemv_ok) {
+      c->q.transposed = 1;
+      K = qw.dims[1];
+    } else {
+      SGL_ERROR("quant(awq): %s qweight [%lld,%lld] 与 N=%lld（pack=%d）对不上", base,
+                (long long)qw.dims[0], (long long)qw.dims[1], (long long)N, pack);
+      sgl_xfree(scl);
+      return NULL;
+    }
+  } else {
+    K = qw.dims[0] * pack;
+    N = qw.dims[1];
+  }
+  const int64_t G = c->q.group_size > 0 ? c->q.group_size : K;
+  if (N <= 0 || K <= 0 || sc_rows < 1) {
+    SGL_ERROR("quant: %s 形状推不出来（qweight [%lld,%lld], scales [%lld,%lld]）", base,
+              (long long)qw.dims[0], (long long)qw.dims[1], (long long)sc_rows, (long long)N);
+    sgl_xfree(scl);
+    return NULL;
+  }
+  /* 没 g_idx 时 group 必须是连续的 k/G，行数要对得上 */
+  if (!has_g && sc_rows != (K + G - 1) / G) {
+    SGL_ERROR("quant: %s scales 行数 %lld 与 K=%lld / group=%lld 不符", base,
+              (long long)sc_rows, (long long)K, (long long)G);
+    sgl_xfree(scl);
+    return NULL;
+  }
+
+  int64_t qw_n = 0, qz_n = 0, gi_n = 0;
+  int32_t *qwv = bytes_to_i32(qw.bytes, qw.nbytes, &qw_n);
+  int32_t *qzv = has_z ? bytes_to_i32(qz.bytes, qz.nbytes, &qz_n) : NULL;
+  int32_t *giv = has_g ? bytes_to_i32(gi.bytes, gi.nbytes, &gi_n) : NULL;
+  float *out = (float *)sgl_xmalloc((size_t)(N * K) * sizeof(float));
+  int rc = sgl_qweight_dequant(&c->q, qwv, qw.dims[0], qw.dims[1], qzv, qz.dims[0], qz.dims[1],
+                              scl, sc_rows, N, giv, gi_n, N, K, out);
+  sgl_xfree(scl);
+  sgl_xfree(qwv);
+  sgl_xfree(qzv);
+  sgl_xfree(giv);
+  if (rc != 0) {
+    sgl_xfree(out);
+    return NULL;
+  }
+  if (out_N) *out_N = N;
+  if (out_K) *out_K = K;
+  if (out_ndim) *out_ndim = 2;
+  return out;
+}
+
 static sgl_tensor shard_get(st_shard *c, const char *name, int expect_ndim,
                             const int64_t *expect_shape) {
   sgl_tensor bad = sgl_tensor_null();
@@ -291,6 +471,9 @@ sgl_st_ctx *sgl_st_open(const char *path) {
   return c;
 }
 
+/* 读 config.json 的 quantization_config（AWQ/GPTQ）。没文件/没量化信息时 q 保持 NONE。*/
+static void load_quant_cfg(sgl_st_ctx *c, const char *dir);
+
 /* 读整个文本文件（index.json），返回可 free 的 NUL 结尾缓冲 */
 static char *read_text_(const char *path, size_t *out_len) {
   FILE *f = NULL;
@@ -367,18 +550,27 @@ sgl_st_ctx *sgl_st_open_dir(const char *dir) {
     }
     c->from_index = 1;
     SGL_INFO("safetensors: %d shard(s) from index (%s)", c->n_sh, dir);
+    load_quant_cfg(c, dir);
     return c;
   }
 
   /* 2) 单文件 model.safetensors */
   snprintf(p, sizeof(p), "%s/model.safetensors", dir);
-  if (file_exists_(p)) return sgl_st_open(p);
+  if (file_exists_(p)) {
+    sgl_st_ctx *c = sgl_st_open(p);
+    if (c) load_quant_cfg(c, dir);
+    return c;
+  }
 
   /* 3) HF 的其他约定名 */
   static const char *cand[] = {"pytorch_model.safetensors", "consolidated.safetensors"};
   for (int i = 0; i < 2; i++) {
     snprintf(p, sizeof(p), "%s/%s", dir, cand[i]);
-    if (file_exists_(p)) return sgl_st_open(p);
+    if (file_exists_(p)) {
+      sgl_st_ctx *c = sgl_st_open(p);
+      if (c) load_quant_cfg(c, dir);
+      return c;
+    }
   }
 
   /* 4) 没有 safetensors：退到 GGUF（llama.cpp 的量化格式）*/
@@ -398,6 +590,33 @@ sgl_st_ctx *sgl_st_open_dir(const char *dir) {
 }
 
 void sgl_st_close(sgl_st_ctx *c) { ctx_free(c); }
+
+/* 直接按名字取（safetensors 原生张量，不涉及 AWQ/GPTQ 解包）。
+ * index 模式下张量不在 weight_map 里时返回 null（交给 sgl_st_get 去试量化路径）。*/
+static sgl_tensor st_get_plain(sgl_st_ctx *c, const char *name, int expect_ndim,
+                              const int64_t *expect_shape) {
+  if (c->wmap) {
+    const sgl_json *v = sgl_json_get(c->wmap, name);
+    if (!v || v->type != SGL_JSON_STRING || !v->str) return sgl_tensor_null();
+    for (int i = 0; i < c->n_sh; i++)
+      if (c->sh[i].name && !strcmp(c->sh[i].name, v->str))
+        return shard_get(&c->sh[i], name, expect_ndim, expect_shape);
+    return sgl_tensor_null();
+  }
+  if (c->n_sh == 0) return sgl_tensor_null();
+  return shard_get(&c->sh[0], name, expect_ndim, expect_shape);
+}
+
+/* 读 config.json 的 quantization_config（AWQ/GPTQ）。没有文件/没有量化信息时 q 保持 NONE。*/
+static void load_quant_cfg(sgl_st_ctx *c, const char *dir) {
+  char p[1400];
+  snprintf(p, sizeof(p), "%s/config.json", dir);
+  size_t len = 0;
+  char *txt = read_text_(p, &len);
+  if (!txt) return;
+  sgl_qcfg_from_json(txt, len, &c->q);
+  sgl_xfree(txt);
+}
 
 sgl_tensor sgl_st_get(sgl_st_ctx *c, const char *name, int expect_ndim,
                       const int64_t *expect_shape) {
@@ -426,21 +645,41 @@ sgl_tensor sgl_st_get(sgl_st_ctx *c, const char *name, int expect_ndim,
     sgl_gguf_unpermute_qk(c->gg, name, buf, nd, sh);
     return sgl_tensor_from_data(nd, sh, buf);
   }
-  if (c->wmap) {
-    const sgl_json *v = sgl_json_get(c->wmap, name);
-    if (!v || v->type != SGL_JSON_STRING || !v->str) {
-      SGL_ERROR("tensor '%s' not found in weight_map", name);
-      return sgl_tensor_null();
+  sgl_tensor t = st_get_plain(c, name, expect_ndim, expect_shape);
+  if (!sgl_tensor_is_null(t)) return t;
+  /* AWQ/GPTQ：<prefix>.weight 由 <prefix>.qweight/.qzeros/.scales(/g_idx) 现场解开 */
+  if (c->q.method != SGL_Q_NONE && expect_ndim <= 2) {
+    size_t nl = strlen(name);
+    if (nl > 7 && !strcmp(name + nl - 7, ".weight")) {
+      char base[512];
+      if (nl - 7 < sizeof(base)) {
+        memcpy(base, name, nl - 7);
+        base[nl - 7] = 0;
+        int64_t N = 0, K = 0;
+        int nd = 2;
+        float *buf = quant_get(c, base, &N, &K, &nd);
+        if (buf) {
+          int bad = 0;
+          if (expect_ndim >= 0) {
+            bad = expect_ndim != 2;
+            if (!bad && expect_shape) {
+              if (expect_shape[0] >= 0 && expect_shape[0] != N) bad = 1;
+              if (expect_shape[1] >= 0 && expect_shape[1] != K) bad = 1;
+            }
+          }
+          if (bad) {
+            SGL_ERROR("quant: %s 解出 [%lld,%lld]，调用方期望 [%lld,%lld]", name, (long long)N,
+                      (long long)K, (long long)(expect_shape ? expect_shape[0] : -1),
+                      (long long)(expect_shape && expect_ndim > 1 ? expect_shape[1] : -1));
+            sgl_xfree(buf);
+            return sgl_tensor_null();
+          }
+          ctx_track(c, buf);
+          return sgl_tensor_from_data(2, (int64_t[]){N, K}, buf);
+        }
+      }
     }
-    for (int i = 0; i < c->n_sh; i++)
-      if (c->sh[i].name && !strcmp(c->sh[i].name, v->str))
-        return shard_get(&c->sh[i], name, expect_ndim, expect_shape);
-    SGL_ERROR("tensor '%s' maps to unknown shard '%s'", name, v->str);
-    return sgl_tensor_null();
   }
-  sgl_tensor t = shard_get(&c->sh[0], name, expect_ndim, expect_shape);
-  if (sgl_tensor_is_null(t) && !sgl_json_get(c->sh[0].header, name))
-    SGL_ERROR("tensor '%s' not found", name);
   return t;
 }
 

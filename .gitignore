@@ -35,3 +35,12 @@ __pycache__/
 
 # test_fp8 现场生成的临时 shard
 sgl_fp8_tmp/
+
+# AWQ/GPTQ 夹具与真实检查点切片（本地生成，不入库）
+models/mistral-rand-awq/
+models/mistral-rand-gptq/
+models/mistral-rand-gptq-act/
+models/qweight-real/
+models/gguf-quants/
+models/smollm2-135m/
+models/smollm2-135m-gguf/

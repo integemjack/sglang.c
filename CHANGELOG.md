@@ -2,6 +2,43 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — AWQ / GPTQ 权重：落盘位布局解包（2026-10-27 第五轮）
+
+接上一轮的 GGUF，把 P0-1 的另一半（AWQ / GPTQ）做完。至此市面上主流的三种量化权重
+（gguf、AWQ、GPTQ）都能直接 `sglc --model <dir>` 加载，仍然只动加载侧：解成 f32 后
+走现有 GEMM，kernel 一行未改。
+
+- **新增 `src/qweight.c` + `include/sgl/qweight.h`**：
+  - AWQ（gemm 与 gemv 两种落盘）：`qweight [K, N/(32/bits)]`，含官方 8 元重排表
+    （打包用 `AWQ_ORDER=[0,2,4,6,1,3,5,7]`，解包用 `AWQ_REVERSE_ORDER=[0,4,1,5,2,6,3,7]`），
+    `qzeros` 同行打包，`scales [K/G, N]`，`zero_point` 开关、`group_size=-1`。
+  - GPTQ：`qweight [K/(32/bits), N]`（沿 K 打包）、`qzeros [K/G, N/(32/bits)]`（沿 N 打包）、
+    `scales [K/G, N]`、`g_idx [K]`；act-order 下 `g_idx` 非连续分组，按
+    `scales[g_idx[k]] * (q - qzeros[g_idx[k]])` 逐行取，行序保持原样（这是
+    GPTQModel `_dequantize_from_codes` 的语义，已对照确认）。4bit / 8bit 都支持。
+- **接进 `sgl_st_get`**：`<prefix>.weight` 取不到时，自动用 `<prefix>.qweight/.qzeros/.scales(/g_idx)`
+  现场解成 `[N, K]` f32 返回。所以 llama / deepseek 两条加载路径、79 处调用点一行未改，
+  也不需要新的后端。`config.json` 的 `quantization_config` 在打开目录时解析。
+  明确报错而不是静默解错：AWQ `version: marlin`、GPTQ `format: gptq_v2`（zeros 带 +1 偏移）、
+  非 4/8bit、scales 行数与 K/group 不符。
+- **修一个既有 bug（`json.c`）**：`sgl_json_get_int` 只认 NUMBER，JSON 的 `true`/`false` 会
+  静默回落到默认值。而真实 config 里 `zero_point`（AWQ）和 `desc_act`（GPTQ）正是布尔值——
+  也就是说 `zero_point: false` 的 AWQ 和 `desc_act: true` 的 GPTQ 会被读错。已让 `get_int`
+  接受 BOOL，另加 `sgl_json_get_bool`。
+- **验证（三层，都是外部参考，不是自证）**：
+  - **真实检查点切片**：`tests/fetch_qweight_slices.py` 用 HTTP Range 从
+    `Qwen/Qwen2.5-0.5B-Instruct-AWQ` 与 `-GPTQ-Int4` 只抠 3 个张量（gate_proj / k_proj / down_proj，
+    共 ~2MB/个），参考值由 **AutoAWQ 官方 `dequantize_gemm` 原样代码**与 GPTQModel 语义算出：
+    C 侧 **rel_rms = 0.000e+00**（逐位一致）。
+  - **端到端**：`tests/gen_awq_gptq.py` 从 mistral-rand 造三套夹具（awq / gptq / gptq-act，
+    后者专门让 g_idx 非连续），反量化结果写成普通 HF 目录后由 `tests/ref_llama.py`（独立 numpy forward）
+    算参考 logits —— C 引擎跑量化夹具的结果与它差 **5e-8**（`test_family_qw_awq/gptq/gptq_act`）。
+  - **对未量化原始权重**：4bit group-8 的 rel_rms 5.9% / 7.3% / 7.4%，在量化误差量级内。
+  - CPU ctest **44/44**、MSVC **43/43**（新增 test_qweight + 三个 test_family_qw_*）。
+- 造夹具时踩的坑记在 `tests/gen_awq_gptq.py` 的 `save_safetensors` 注释里：`astype()` 默认
+  `order='K'`，对转置视图会返回 F-contiguous 数组，而 safetensors 按原始字节落盘（不看 strides），
+  于是 scales 会被写成转置顺序——必须逐张量 `np.ascontiguousarray`。
+
 ## [Unreleased] — GGUF 权重格式：容器 + 12 种量化反解 + 内嵌 tokenizer（2026-10-27 第四轮）
 
 起点是 `docs/GAP_vs_upstream.md` 的 P0 第一项（权重格式太窄：只有 safetensors + 自研 int8，

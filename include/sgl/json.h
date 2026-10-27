@@ -1,4 +1,4 @@
-﻿/* sgl/json.h — 最小 JSON 解析器（tokenizer.json / config.json / safetensors header 用）
+/* sgl/json.h — 最小 JSON 解析器（tokenizer.json / config.json / safetensors header 用）
  * 递归下降，只解析不改写；字符串按 UTF-8 原样保留（\uXXXX 转成 UTF-8）。 */
 #ifndef SGL_JSON_H
 #define SGL_JSON_H
@@ -37,5 +37,7 @@ const sgl_json *sgl_json_get(const sgl_json *obj, const char *key);
 const char *sgl_json_get_str(const sgl_json *obj, const char *key, const char *def);
 double sgl_json_get_num(const sgl_json *obj, const char *key, double def);
 int sgl_json_get_int(const sgl_json *obj, const char *key, int def);
+/* JSON 布尔（true/false）；也给数字（非 0 为真）。JSON 里开关常是布尔值。*/
+int sgl_json_get_bool(const sgl_json *obj, const char *key, int def);
 
 #endif

@@ -116,7 +116,18 @@ foreach(t ${SGL_TESTS})
   add_executable(${name} ${t})
   target_link_libraries(${name} PRIVATE sgl)
   add_test(NAME ${name} COMMAND ${name})
-  set_tests_properties(${name} PROPERTIES ENVIRONMENT "SGL_TEST_MODEL=${SGL_MODELS_DIR}/gpt2;SGL_TEST_LLAMA=${SGL_MODELS_DIR}/tiny-llama;SGL_TEST_LLAMA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_tinyllama.json;SGL_TEST_TINYLLAMA=${SGL_MODELS_DIR}/tinyllama;SGL_TEST_QWEN=${SGL_MODELS_DIR}/qwen05;SGL_TEST_LORA=${SGL_MODELS_DIR}/test-lora;SGL_TEST_LORA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora.json;SGL_TEST_LORA_S1=${SGL_MODELS_DIR}/test-lora-s1;SGL_TEST_LORA_S2=${SGL_MODELS_DIR}/test-lora-s2;SGL_TEST_LORA_REF_S1=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s1.json;SGL_TEST_LORA_REF_S2=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s2.json;SGL_TEST_LLAVA=${SGL_MODELS_DIR}/llava-rand;SGL_TEST_CLIP_REAL=${SGL_MODELS_DIR}/clip-vit-base-patch32;SGL_TEST_GGUF=${SGL_MODELS_DIR}/smollm2-135m-gguf;SGL_TEST_GGUF_REF=${SGL_MODELS_DIR}/smollm2-135m;SGL_TEST_GGUF_SINGLE=${SGL_MODELS_DIR}/gguf-quants/Q2_K")
+  set_tests_properties(${name} PROPERTIES ENVIRONMENT "SGL_TEST_MODEL=${SGL_MODELS_DIR}/gpt2;SGL_TEST_LLAMA=${SGL_MODELS_DIR}/tiny-llama;SGL_TEST_LLAMA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_tinyllama.json;SGL_TEST_TINYLLAMA=${SGL_MODELS_DIR}/tinyllama;SGL_TEST_QWEN=${SGL_MODELS_DIR}/qwen05;SGL_TEST_LORA=${SGL_MODELS_DIR}/test-lora;SGL_TEST_LORA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora.json;SGL_TEST_LORA_S1=${SGL_MODELS_DIR}/test-lora-s1;SGL_TEST_LORA_S2=${SGL_MODELS_DIR}/test-lora-s2;SGL_TEST_LORA_REF_S1=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s1.json;SGL_TEST_LORA_REF_S2=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s2.json;SGL_TEST_LLAVA=${SGL_MODELS_DIR}/llava-rand;SGL_TEST_CLIP_REAL=${SGL_MODELS_DIR}/clip-vit-base-patch32;SGL_TEST_GGUF=${SGL_MODELS_DIR}/smollm2-135m-gguf;SGL_TEST_GGUF_REF=${SGL_MODELS_DIR}/smollm2-135m;SGL_TEST_GGUF_SINGLE=${SGL_MODELS_DIR}/gguf-quants/Q2_K;SGL_TEST_QWEIGHT_REAL=${SGL_MODELS_DIR}/qweight-real;SGL_TEST_QW_FIXTURES=${SGL_MODELS_DIR};SGL_TEST_QW_ORIGINAL=${SGL_MODELS_DIR}/mistral-rand")
+endforeach()
+
+# ---- AWQ / GPTQ 夹具：存在就注册端到端对照（ref json 由 tests/gen_awq_gptq.py 生成）----
+foreach(qv awq gptq gptq-act)
+  string(REPLACE "-" "_" _n ${qv})
+  if(EXISTS ${SGL_MODELS_DIR}/mistral-rand-${qv}/model.safetensors AND
+     EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/_ref_mistral_${_n}.json)
+    add_test(NAME test_family_qw_${_n} COMMAND test_llama ${SGL_MODELS_DIR}/mistral-rand-${qv}
+             ${CMAKE_CURRENT_SOURCE_DIR}/tests/_ref_mistral_${_n}.json)
+    set_tests_properties(test_family_qw_${_n} PROPERTIES DEPENDS test_llama)
+  endif()
 endforeach()
 
 # ---- t10 llava 多模态：给 glob 生成的 test_llava 指定模型目录（存在才设）----

@@ -1,4 +1,4 @@
-﻿/* sgl json 实现：递归下降解析器 */
+/* sgl json 实现：递归下降解析器 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/json.h"
 
@@ -283,6 +283,18 @@ double sgl_json_get_num(const sgl_json *obj, const char *key, double def) {
 
 int sgl_json_get_int(const sgl_json *obj, const char *key, int def) {
   const sgl_json *j = sgl_json_get(obj, key);
-  if (!j || j->type != SGL_JSON_NUMBER) return def;
+  if (!j) return def;
+  /* 真实 config 里不少开关是 JSON 布尔（AWQ 的 zero_point、GPTQ 的 desc_act、
+   * sym…），只认 NUMBER 会静默回落到默认值，所以这里也接受 BOOL。*/
+  if (j->type == SGL_JSON_BOOL) return j->boolean ? 1 : 0;
+  if (j->type != SGL_JSON_NUMBER) return def;
   return (int)(j->num >= 0 ? j->num + 0.5 : j->num - 0.5); /* 四舍五入，含负数 */
+}
+
+int sgl_json_get_bool(const sgl_json *obj, const char *key, int def) {
+  const sgl_json *j = sgl_json_get(obj, key);
+  if (!j) return def;
+  if (j->type == SGL_JSON_BOOL) return j->boolean ? 1 : 0;
+  if (j->type == SGL_JSON_NUMBER) return j->num != 0.0;
+  return def;
 }

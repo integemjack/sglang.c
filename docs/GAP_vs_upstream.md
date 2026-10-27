@@ -73,16 +73,20 @@
 
 ### A. 模型与权重 —— 挡住「能不能跑」
 
-**A1 权重格式（进行中：GGUF 已完成，AWQ/GPTQ 仍未做）**
+**A1 权重格式（已完成）**
 
-已做（本轮）：**GGUF 全链路** —— 容器解析（v2/v3）、12 种量化类型的反量化（含 K-quant 全部 + IQ4_NL）、
-GGUF→HF 名字映射、从 GGUF 元数据合成 HF 风格 config、从 `tokenizer.ggml.*` 建 tokenizer。
-于是「只下载一个 `.gguf`」的目录可以直接 `sglc --model <dir>` 跑通（实测 Q4_K_M 与 Q2_K 都生成正确文本）。
+三种主流格式都能直接加载：**GGUF**（容器 v2/v3 + 12 种量化 + 内嵌 tokenizer + q/k 逆置换）、
+**AWQ**（gemm/gemv 两种落盘，zero_point 开关）、**GPTQ**（含 desc_act/g_idx，4/8bit）。
+全部只动加载侧：解成 f32 后走现有 GEMM，kernel 一行未改。
 
-仍缺：**AWQ / GPTQ**（qweight/qzeros/scales 解包）、compressed-tensors、W4A16、MXFP4/NVFP4、
-legacy `.bin`、HF Hub 直连下载与权重缓存。
-影响：上游 `layers/quantization/` 111 个文件对应十余种量化方案，C 版现在有 GGUF + W8A16/W8A8 + fp8 权重解包。
-补法：AWQ/GPTQ 同样是**只读解码**（load 时 dequant 成 f32），复用现有 GEMM，不动 kernel。
+验证分三层（都在 `test_qweight` / `test_gguf` 里）：
+1. **真实检查点切片**：从 Qwen 官方发布的 AWQ / GPTQ-Int4 文件按 HTTP Range 抠几个张量，
+   参考值用 AutoAWQ 官方 `dequantize_gemm` 原样代码算 —— **rel_rms = 0**（逐位一致）。
+2. **端到端**：三套本地夹具（awq / gptq / gptq-act）+ 三个真实 gguf，logits/生成与 numpy 参考一致（5e-8）。
+3. **对未量化原始权重**：4bit 的 rel_rms 5.9%–7.4%、GGUF 各类型 0.7%–15.4%，均在其理论量化误差内。
+
+仍缺：W4A16 / compressed-tensors / MXFP4-NVFP4；AWQ `version: marlin` 与 GPTQ `format: gptq_v2`
+落盘格式不同，目前是**明确报错**而不是静默解错；HF Hub 直连下载与权重缓存。
 
 **A2 GPU 只覆盖 llama 系（P0）**
 
@@ -183,7 +187,7 @@ GPU 服务是固定 `MAX_CONC 8` 的**整段租约**：段长 = `SGL_CUDA_CTX / 
 
 | 序 | 事项 | 为什么排这里 | 量级 |
 | --- | --- | --- | --- |
-| 1 | ~~GGUF~~ **AWQ/GPTQ 读取**（load 时 dequant） | 纯加载侧改动，不动 kernel，直接解锁市面上大多数现成权重。GGUF 已完成（含 K-quant/IQ4_NL/内嵌 tokenizer） | S–M |
+| 1 | ~~GGUF / AWQ / GPTQ 读取~~（load 时 dequant） | **已完成**：GGUF（含 K-quant/IQ4_NL/内嵌 tokenizer/q-k 逆置换）、AWQ（gemm+gemv）、GPTQ（含 desc_act/g_idx）。见 A1 | ✅ |
 | 2 | GPU 补 MoE + DeepSeek MLA kernel | 把 CPU 侧已验证的两套前向搬到 GPU，GPU 服务可用模型从 1 类变 3 类 | L |
 | 3 | GPU 页级 radix + 动态并发（去掉 8 段租约） | 解除并发上限与段长耦合，长 prompt + 高并发下的利用率 | M–L |
 | 4 | `/v1/tokenize` `/v1/detokenize` `/v1/responses` `/v1/messages` | 让 OpenAI/Anthropic SDK 能直连；分词端点还便于对拍 | S |
