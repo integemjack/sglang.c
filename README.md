@@ -2,245 +2,512 @@
 
 [![build](https://github.com/integemjack/sglang.c/actions/workflows/build.yml/badge.svg)](https://github.com/integemjack/sglang.c/actions/workflows/build.yml)
 
-**用纯 C 重写的 SGLang 推理引擎** —— 从 [sgl-project/sglang](https://github.com/sgl-project/sglang)（核心 Python 约 138 万行）重构而来的 CPU 推理栈，零第三方依赖（仅 MinGW-w64 运行库静态链接）。
+**The [SGLang](https://github.com/sgl-project/sglang) inference engine, rewritten in pure C.**
 
-> 进度：M0–M26 + t1–t12 完成（见 [ROADMAP.md](ROADMAP.md) / [CHANGELOG.md](CHANGELOG.md)）。CPU 20/20 + CUDA 全绿；GPT-2 / TinyLlama-1.1B / Qwen2.5-0.5B / **Qwen3-0.6B** 真实权重验证。
+A CPU/CUDA inference stack rebuilt from scratch on top of the ideas in SGLang (whose Python core is ~1.38M
+lines), written as portable C11 with **zero third-party dependencies** — no PyTorch, no CUDA runtime
+dependency in the CPU build, no BLAS requirement (it can use OpenBLAS if you happen to have it). The only
+non-system library in the CPU binary is the MinGW-w64 runtime, linked statically, so a single `.exe` runs on
+a clean Windows box.
 
-## 下载（预编译）
+> **Status:** milestones M0–M26 and t1–t12 are complete (see [ROADMAP.md](ROADMAP.md) /
+> [CHANGELOG.md](CHANGELOG.md)). Test suite: **26/26 CTest suites green** on the CPU stack, `cuda_test` reports
+> `test_cuda: all OK` on the GPU stack (RTX 2060, sm_75). Real checkpoints validated end to end: GPT-2,
+> TinyLlama-1.1B, Qwen2.5-0.5B, **Qwen3-0.6B**, LLaVA (CLIP-L/14-336 + `mm_projector`), Qwen3-Next (hybrid
+> linear attention + MoE).
 
-[Releases](https://github.com/integemjack/sglang.c/releases) 提供 CI 构建的全平台产物（打 `v*` tag 自动构建发布）：
+**English** | [简体中文](README.zh-CN.md)
 
-| 包 | 内容 |
-|---|---|
-| `linux-x64 / linux-arm64` | `sglc`（CPU，GNU 编译器下开 OpenMP 多线程） |
-| `macos-arm64 / macos-x64` | `sglc`（CPU，**单线程**：AppleClang 无 `-fopenmp`，CI 不装 libomp） |
-| `windows-x64` | `sglc.exe`（CPU，MSVC /MT 静态，单线程） |
-| `windows-x64-cuda` | `sglc.exe` + `cuda_cli.exe` + `cuda_http.exe`（RTX 显卡加速，sm_75+；需驱动，附带 cublas64 DLL） |
+---
 
-构建矩阵的实测状态（哪一项是怎么验的）：`docs/PROGRESS_g11_g19.md` —— linux-x64 / linux-arm64 /
-windows-msvc / windows-msvc-cuda 均已实跑；**macos-arm64 已在真机 iMac（macOS 27.0.1 / AppleClang 21）
-上编译并 ctest 24/24 通过**（`docs/g_macos_arm64.txt`）；macos-x64 仍未直接验证。
+## ⚡ One-click quick start (start here)
 
-## 能力一览
+Two scripts do everything for you: detect the toolchain, build what is missing, start the
+OpenAI-compatible HTTP server, wait for `/health`, send one demo chat request, and print the endpoint list.
 
-| 功能 | 对应 sglang 模块 | 状态 |
-|---|---|---|
-| GPT-2 / Llama / Qwen2 / **Qwen3** 后端 | `srt/models/` | ✅ 与 numpy/HF 数值对照（maxerr ≤ 2e-4，SIMD 后 1e-8） |
-| **Mistral 滑窗 / Gemma 归一化** | `srt/models/` | ✅ 随机结构 numpy 全等（tests/gen_random_*.py） |
-| 连续批处理调度器 | `srt/managers/scheduler.py` | ✅ 批处理输出与串行逐 token 全等，3 并发 +68% |
-| HTTP 服务（OpenAI 兼容，CPU+GPU 双栈） | `entrypoints/http_server.py` | ✅ /generate /v1/completions /v1/chat/completions + 超限排队 + finish_reason 如实 |
-| RadixAttention 前缀缓存 | `srt/mem_cache/radix_cache.py` | ✅ 分页 KV + 引用计数 + LRU 驱逐，长 prompt 命中提速 ~40% |
-| W8A16 量化（CPU）/ **W8A8 dp4a（CUDA）** | `srt/layers/quantization` | ✅ CPU decode 1.76x；CUDA 显存最优档（free VRAM 3947MB） |
-| int8 KV cache | fp8/int8 KV 路线 | ✅ 内存减半，吞吐 +20% |
-| Beam search | `srt/beam_search/` | ✅ W≤8，W=1 == greedy 硬断言 |
-| Speculative decoding v2 | `srt/speculative/` | ✅ n-token 批量 verify；160m draft 接受率 13%，spec==greedy 保证 |
-| 多 LoRA 热切换 | `srt/lora/` | ✅ 运行时 add/remove，N 卡 N 选 1 |
-| **CUDA FP16 / Graph / 长上下文** | `srt/` | ✅ 1.1B fp16 入 6GB 卡；graph 批处理 +89%；ctx 16384 |
-| **LLaVA 多模态（CLIP+融合+HTTP）** | `srt/models/llava.py` | ✅ CLIP ViT + **两层 MLP projector**（自动判层数，GELU）+ 视觉 token **按 `<image>` 位置插入** + `/v1/chat/completions` image_url（**PNG/JPEG 直收**，raw-float base64 仍兼容）；随机结构 numpy 全等 9.3e-9；**真实 CLIP-L/14-336 + 真实 llava mm_projector** 对 transformers 分段对照 rel **1.4e-05 / 1.8e-05** |
-| **Qwen3-Next（混合层 + MoE）** | `srt/models/qwen3_next.py` | ✅ linear_attention（gated deltanet）+ full 层的 q 门控 / partial rotary / `(1+w)` RMSNorm / MoE（top-k 路由 + 共享专家 + routed scaling）；随机结构 vs float64 numpy **2.5e-08–5.8e-08**；递归状态按**序列 key** 归属（前缀共享不互踩） |
-| **CPU OpenBLAS / AVX2 dot** | backend | ✅ 大 M GEMM 3.1x（195 GFLOPs），运行时分派零依赖可选 |
-| SSE 流式 | `--stream` | ✅ 流式拼接与非流式严格全等 |
-
-**未覆盖**：张量并行、真实 LLaVA **7B 语言模型**端到端（CLIP-L/14-336 与 mm_projector
-已用真实权重分段对照，7B LM 因磁盘/显存未下）、GPU 侧 sliding window、
-Qwen3-Next 的 CUDA 路径（仅 CPU 参考实现）。
-
-## 快速开始
+```bat
+:: Windows — double-click it, or from a terminal:
+sglang-c\quickstart.bat
+```
 
 ```bash
-# 构建（MinGW-w64 + CMake + Ninja）
+# Linux / macOS / Git Bash
+bash ./sglang-c/quickstart.sh      # or: chmod +x sglang-c/quickstart.sh && ./sglang-c/quickstart.sh
+```
+
+What you get (real output from a first run on `models/qwen05`, Windows CPU stack):
+
+```text
+[quickstart] model : models\qwen05
+[quickstart] server: http://127.0.0.1:30000   (window "sglang-c server :30000")
+[quickstart] server answered on port 30000 after 2s
+[quickstart] /health ok -- sending a demo chat request ...
+{"id":"chatcmpl-1","object":"chat.completion",...,"choices":[{"index":0,"message":{"role":"assistant",
+ "content":"Paris ..."},"finish_reason":"length"}],"usage":{"prompt_tokens":20,...}}
+
+[quickstart] server is up. Endpoints:
+    GET  http://127.0.0.1:30000/health
+    POST http://127.0.0.1:30000/generate
+    POST http://127.0.0.1:30000/v1/completions
+    POST http://127.0.0.1:30000/v1/chat/completions
+```
+
+### Modes
+
+| Command | What it does |
+| --- | --- |
+| `quickstart.bat` / `quickstart.sh` | Build if needed → serve on port 30000 → wait for `/health` → demo request |
+| `... cli [model] [n]` | One-shot CLI generation (`--w8 --kv8` enabled automatically) |
+| `... gpu [model] [port]` | Start the CUDA HTTP server (`cuda_http`), building it first if missing |
+| `... test` | Run the CTest suite (`ctest --output-on-failure`) |
+| `... build` | Full build: CPU (MinGW/Ninja, or any host C compiler) + CUDA (MSVC + nvcc) |
+| `... help` | Usage summary |
+
+### Knobs
+
+| Variable | Meaning |
+| --- | --- |
+| `SGL_MODEL=<dir>` | Model directory (default: first usable HF-format dir under `models/`) |
+| `SGL_PORT=<port>` | HTTP port (default `30000`) |
+| `SGL_NO_BUILD=1` | Never build; fail if the binary is missing |
+| `SGL_NO_PAUSE=1` | Windows only: don't wait for a key press at the end (CI / scripting) |
+| `SGL_HEALTH_TIMEOUT=<s>` | Unix only: seconds to wait for `/health` (default 180) |
+
+Both scripts drive the same underlying commands, and both were exercised against this repository's CPU
+build, CUDA build and the 26-suite CTest run (Windows `quickstart.bat`: all modes; `quickstart.sh`: under Git
+Bash — `help`, `cli`, `serve`, `gpu`). The server they start is a plain foreground process (on Windows the
+CPU server opens its own console window), so `Ctrl+C` or closing that window stops it; `server log:` lines
+point at the captured output on Unix.
+
+**Prerequisites** — one C toolchain and one model directory:
+
+- Windows CPU: CMake ≥ 3.20, Ninja, MinGW gcc (`winget install BrechtSanders.WinLibs.POSIX.UCRT`)
+- Windows GPU: VS2022 Build Tools + CUDA Toolkit 13.x (`nvcc`)
+- Linux/macOS: `cmake`, a C compiler, `curl`
+- Models: any Hugging Face export (`config.json`, `tokenizer.json`, `model.safetensors`) under `models/`
+
+Nothing else is needed — no Python, no virtualenv, no PyTorch.
+
+---
+
+## Contents
+
+- [Downloads (prebuilt binaries)](#downloads-prebuilt-binaries)
+- [Feature matrix](#feature-matrix)
+- [Build from source](#build-from-source)
+- [CLI reference](#cli-reference)
+- [HTTP API](#http-api)
+- [Models and directory format](#models-and-directory-format)
+- [Performance](#performance)
+- [Verified toolchain versions](#verified-toolchain-versions)
+- [Environment variables](#environment-variables)
+- [Engineering log](#engineering-log)
+- [Architecture](#architecture)
+- [Validation methodology](#validation-methodology)
+- [Known limitations](#known-limitations)
+- [Repository layout](#repository-layout)
+- [License](#license)
+
+## Downloads (prebuilt binaries)
+
+[Releases](https://github.com/integemjack/sglang.c/releases) ships CI-built artifacts (tagging `v*` builds and
+publishes them automatically):
+
+| Package | Contents |
+| --- | --- |
+| `linux-x64` / `linux-arm64` | `sglc` (CPU; OpenMP multithreading when built with GNU compilers) |
+| `macos-arm64` / `macos-x64` | `sglc` (CPU, **single-threaded**: AppleClang has no `-fopenmp` and CI does not install libomp) |
+| `windows-x64` | `sglc.exe` (CPU, MSVC `/MT` static, single-threaded) |
+| `windows-x64-cuda` | `sglc.exe` + `cuda_cli.exe` + `cuda_http.exe` (RTX acceleration, sm_75+; needs a driver, ships the cuBLAS DLLs) |
+
+Build-matrix status (what was actually verified and how): [docs/PROGRESS_g11_g19.md](docs/PROGRESS_g11_g19.md).
+`linux-x64`, `linux-arm64`, `windows-msvc` and `windows-msvc-cuda` have all been run for real; **macos-arm64
+was compiled on real hardware (iMac, macOS 27.0.1 / AppleClang 21) and passed ctest 24/24**
+([docs/g_macos_arm64.txt](docs/g_macos_arm64.txt)); macos-x64 has not been verified directly yet.
+
+## Feature matrix
+
+| Capability | SGLang counterpart | Status |
+| --- | --- | --- |
+| GPT-2 / Llama / Qwen2 / **Qwen3** backends | `srt/models/` | ✅ numerically matched against numpy/HF (maxerr ≤ 2e-4; 1e-8 with SIMD) |
+| **Mistral sliding window / Gemma normalization** | `srt/models/` | ✅ identical to a numpy reference on randomized structures (`tests/gen_random_*.py`) |
+| Continuous-batching scheduler | `srt/managers/scheduler.py` | ✅ batched output token-identical to serial; 3-way concurrency +68% |
+| HTTP service (OpenAI-compatible, CPU + GPU) | `entrypoints/http_server.py` | ✅ `/generate` `/v1/completions` `/v1/chat/completions`, queueing past the limit, faithful `finish_reason` |
+| RadixAttention prefix cache | `srt/mem_cache/radix_cache.py` | ✅ paged KV + refcounts + LRU eviction; ~40% faster on long repeated prompts |
+| W8A16 quantization (CPU) / **W8A8 dp4a (CUDA)** | `srt/layers/quantization` | ✅ CPU decode 1.76x; best VRAM/speed trade-off on GPU |
+| int8 KV cache | fp8/int8 KV path | ✅ half the memory, +20% throughput |
+| Beam search | `srt/beam_search/` | ✅ W ≤ 8, hard assertion that W=1 == greedy |
+| Speculative decoding v2 | `srt/speculative/` | ✅ batched n-token verify; 13% acceptance with a 160M draft; `spec == greedy` guaranteed |
+| Multi-LoRA hot swap | `srt/lora/` | ✅ runtime add/remove, pick 1 of N |
+| **CUDA FP16 / graphs / long context** | `srt/` | ✅ 1.1B fp16 fits a 6 GB card; graph batching +89%; ctx 16384 |
+| **LLaVA multimodal (CLIP + fusion + HTTP)** | `srt/models/llava.py` | ✅ CLIP ViT + **two-layer MLP projector** (layer count auto-detected, GELU) + visual tokens **inserted at the `<image>` position** + `image_url` in `/v1/chat/completions` (**PNG/JPEG accepted directly**); numpy maxerr 9.3e-9; real CLIP-L/14-336 + real `mm_projector` match transformers at rel **1.4e-05 / 1.8e-05** |
+| **Qwen3-Next (hybrid layers + MoE)** | `srt/models/qwen3_next.py` | ✅ linear attention (gated deltanet) + full layers with q-gating / partial rotary / `(1+w)` RMSNorm / MoE (top-k routing + shared experts + routed scaling); vs float64 numpy **2.5e-08–5.8e-08**; recurrent state keyed per sequence (prefix sharing cannot collide) |
+| **CPU OpenBLAS / AVX2 dot** | backend | ✅ 3.1x on large-M GEMM (195 GFLOPs), optional at runtime, zero hard dependency |
+| SSE streaming | `--stream` | ✅ streamed output strictly identical to non-streamed |
+
+**Not covered:** tensor parallelism; the full LLaVA **7B language model** end to end (CLIP-L/14-336 and
+`mm_projector` were verified against real weights piecewise; the 7B LM was not downloaded due to disk/VRAM);
+GPU-side sliding window; the CUDA path for Qwen3-Next (CPU reference implementation only).
+
+## Build from source
+
+The quickstart scripts do this for you; for a manual build use:
+
+```bash
+# CPU (MinGW-w64 on Windows, or any host C compiler elsewhere)
 cmake -S sglang-c -B sglang-c/build -G Ninja
 cmake --build sglang-c/build
-ctest --test-dir sglang-c/build          # 20 套测试（部分需 models/ 下真实权重）
+ctest --test-dir sglang-c/build          # 26 suites (some need real weights under models/)
 
-# 交互生成（GPT-2 124M / TinyLlama-1.1B / Qwen2.5-0.5B）
-sglang-c/build/bin/sglc --model models/gpt2 --prompt "The meaning of life is" --max-new 32
-sglang-c/build/bin/sglc --model models/tinyllama --w8 --kv8 --max-new 64   # 量化提速
-
-# HTTP 服务（OpenAI 兼容）
-sglang-c/build/bin/sglc --model models/qwen05 --serve --port 30000 --w8
-curl localhost:30000/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
+# CUDA backend (separate build dir; MSVC + nvcc on Windows)
+cmake -S sglang-c -B sglang-c/build-cuda -G "Visual Studio 17 2022" -A x64 -DSGL_CUDA=ON
+cmake --build sglang-c/build-cuda --config Release --target cuda_test cuda_cli cuda_http
 ```
 
-模型目录格式（HF 标准）：`config.json` / `tokenizer.json` / `model.safetensors`（F32/F16/BF16）。
+One-shot helpers in this directory: `build_all.bat` (full CPU+CUDA build + tests, exits 0 only when
+everything is green) and `quickstart.bat` (build-if-needed + serve).
 
-## 环境要求（本机验证过的工具链版本）
+Optional OpenBLAS: unpack `OpenBLAS 0.3.29 x64.zip` into `third_party/openblas` and configure with
+`-DSGL_OPENBLAS=ON`. **Use the `x64` package, not `x64_64`** — the latter is the 64-bit-integer ABI and
+dynamic calls silently read garbage with it.
 
-| 组件 | 版本 | 说明 |
-|---|---|---|
-| Windows CPU 栈 | WinLibs GCC **16.2**（winget `BrechtSanders.WinLibs.POSIX.UCRT`）| CMake ≥ 3.20 + Ninja；产物静态链接不依赖运行库 DLL |
-| CUDA 栈 | VS2022 Build Tools（MSVC 14.44）+ CUDA Toolkit **13.3** | sm_75+（RTX 20 系起）；与 MinGW 栈共存于独立 build 目录 |
-| 可选 OpenBLAS | **0.3.29 x64.zip**（Release 页） | 注意不是 `x64_64`（那是 64 位 int ABI，动态调用会静默读出垃圾值）；解压到 `third_party/openblas` 后 `-DSGL_OPENBLAS=ON` |
-| 源码编码 | UTF-8 **带 BOM** | MSVC/nvcc 按 GBK 读无 BOM 的中文注释会吞结构体声明；CMake configure 阶段有自检警告 |
-| 测试模型 | `models/` 目录 | 真实权重：gpt2 / tinyllama / qwen05 / qwen3-06 / llama-160m；随机生成（tests/gen_random_*.py）：mistral-rand / gemma-rand / llava-rand |
-
-## 性能（i7-10700F 8 核，TinyLlama-1.1B fp32）
-
-| 配置 | 吞吐 |
-|---|---|
-| 基线 | 1.5 tok/s |
-| + SIMD（SSE2/SSE4.1 手写 intrinsics） | ~3 tok/s |
-| + W8 权重 + int8 KV | **7.4 tok/s**（累计 4.9x） |
-| GEMM 峰值 | matmul_nt 8.4 GFLOPs（4x 于标量） |
-
-Qwen2.5-0.5B chat 实测 4.2 tok/s（W8+KV8+SIMD；其 151k 大词表的 lm_head 是主要成本）。
-
-**CUDA 后端（RTX 2060，sm_75；M23 自适应 GEMM：M=1 手写 kernel / M>1 cuBLAS）**：
-Qwen2.5-0.5B：单流 **45.7 tok/s**（10.9x CPU）；**批处理（4 序列）105.2 tok/s**
-（手写 64.9 → cuBLAS 93.6 → 自适应+lm_head 合并 105.2，累计 +62%）；
-prefill maxerr 3.5e-5（vs CPU），greedy 三方一致；批处理输出与各自单流全等；KV 段隔离。
-独立 CLI：`cuda_cli.exe models/qwen05 "prompt" 40 0`（自适应后单流回到 45 tok/s；
-prompt 支持 `@file` 读长文本）。
-GPU HTTP 服务：`cuda_http.exe <model_dir> [port]` —— /health /generate
-/v1/completions /v1/chat/completions（ChatML）；KV 段调度（ctx/N 段）+ 批处理
-worker；已验证：单请求正确（Paris 事实性回答）+ **两轮 8 并发全部成功且服务存活**
-（根因：req_free 用 free() 释放 sgl_xmalloc 的 text_out——对齐分配/free 不匹配）。
-`SGL_HTTP_CONC` 覆盖并发数（1-8，默认 8；段长 = ctx/并发）。
-构建：`cmake -S sglang-c -B sglang-c/build-cuda -G "Visual Studio 17 2022" -A x64 -DSGL_CUDA=ON`
-`cmake --build sglang-c/build-cuda --config Release --target cuda_test cuda_cli cuda_http`
-
-## M26：长上下文 + CUDA Graph（2026-02）
-
-**长上下文（两段式 attention 解除 4096 钳制）**：当时的设计是 ≤4096 走 shared-scores
-kernel、>4096 切两段式 kernel（chunk 1024 online-softmax，K 重算两遍换固定 shared 内存）；
-**G1 之后长行走 flash，G16 又把阀值降到 64 token**，所以**默认路径下两段式核只在
-`SGL_ATTN_TWOPASS=1` 或 head_dim 无特化（不整除 32）时才用**；llama 族的 kernel 选择逻辑
-集中在 `attn_dispatch()` 一处（GPT-2 有自己的前向循环，仍只用 shared-scores 核，
-所以它的长上下文能力没被 G1/G16 抬高）。`SGL_CUDA_CTX` 覆盖上下文上限（默认 16384，受显存约束）；
-tied lm_head 在设备端别名 wte（Qwen2.5-0.5B 省 545MB）；激活 workspace 按需增长。
-验证：两段式 vs 原 kernel maxerr 2.2e-5 且 greedy 一致；4300-token prompt 批处理
-（双 KV 段 + graph 重放）与单流逐 token 全等；kernel 确定性检查（同输入两次 prefill
-bit-exact）进 cuda_test。HTTP 端到端：5000+ token prompt（chunked prefill，3 段）
-正确答出文中 needle（"The answer is 42."）。
-**CUDA Graph（decode）**：`decode_batch` 全步 capture/replay（H2D 输入拷贝入图 +
-graph-safe KV 写 kernel 从 device 数组算地址，lens 每步变化无需重建图），
-`SGL_CUDA_GRAPH=0` 关闭。4 序列批处理 **177 → 335 tok/s（+89%）**，输出与关闭时全等。
-**修一个真 bug**：两段式 kernel 的 block 归约在「读 red[0]」与「下一 chunk 写 red」
-之间缺 barrier —— compute-sanitizer racecheck 定位（39 万 hazards），复现 10 次
-launch 2 次 bit-exact 破坏、偶发全 NaN；补 2 个 `__syncthreads()` 后消除。
-
-## 缺口关闭 G1–G6（2026-10-27）
-
-性能数字全部是**同进程 A/B**（`cuda_perf --ab`）：本卡空闲显存常常小于模型常驻量，
-WDDM 溢出会把绝对时间放大 3–20x，跨进程的数字不能直接比。详见 docs/NOTES_gaps.md。
-
-- **G1 flash prefill**：长行不再把 K 重算两遍，改走单遍分块核 `k_attn_flash`（Q 块驻
-  shared、K/V 流式、online softmax）。初版只在 >4096 行切换，8192-token prefill
-  72.4 → 8.8s（8.3x，**当时机器显存吃紧**）；**G16 把阀值降到 64 token**（短行上 short 核
-  只在 64 以下略快），干净状态下同进程 A/B：8192-token **66.1 → 2.7s（23.6x）**、
-  2048-token 11.8x。两个倍率不要互相引用（测量时的显存/并发状态不同）。
-  回退/对比开关：`SGL_ATTN_TWOPASS=1`；逐层注意力计时：`SGL_CUDA_PROF=1`；
-  实际用了哪个核：`SGL_ATTN_DEBUG=1`。
-- **G2 W8 大 M 走 tensor core**：int8 权重模式下 M>1 的投影改用 `cublasGemmEx` IMMA
-  （int8×int8→int32，整数累加与顺序无关），M=1 仍用手写 dp4a GEMV（实测更快）。
-  [2048,2048] M=8：**0.925 → 0.069ms（13.4x）**；IMMA vs dp4a prefill **maxerr = 0**。
-  强制旧路径：`SGL_W8_DP4A=1`。
-- **G3 decode graph 默认开启**：捕获前先跑一次 plain step 预热（CUDA 13 默认 lazy 内核
-  加载、cuBLAS 首次选算法都不能发生在 capture 里），失败只标记**这一个 batch 尺寸**
-  （旧版一个进程级开关会让所有尺寸永久走 plain）；`cuda_http` 起服务前 `prewarm`
-  把工作区/镜像撑到位并预捕获 B=1..conc。fp16 decode：B=1 23.0→9.7ms、B=4
-  36.6→8.9ms、B=8 38.5→11.3ms（3–4x）。`SGL_CUDA_GRAPH=0` 仍可关。
-- **G4 HTTP 卡死修复**：`active_conns` 从 `srv->lock` 拆出独立 `conns_lock`——之前
-  acceptor 登记连接要和 worker 的每步计算抢同一把锁，高负载下饿死（连接已握手但
-  长时间不建线程）。复验：12 并发负载下 600/600 次 GET /health 无超时。
-- **G5 显存预检**：上传前先算账（权重+KV+工作区+logits+workspace），不够就**降级
-  服务**而不是进程退出：`/health` 返回 `{"ok":false,"gpu":false,"degraded":true,
-  "reason":"..."}`，`/generate` 直接 503 + 建议（降 `SGL_CUDA_CTX` 或开
-  `SGL_CUDA_FP16=1`/`SGL_CUDA_W8=1`）。
-- **G6 GPU 前缀缓存**：同一段 system prompt 的后续请求不再重算前缀——请求结束后它的
-  KV 段被「租让」给前缀缓存，新请求按 token 精确比对最长公共前缀，命中部分用
-  `sgl_cuda_copy_kv` 搬行、只 prefill 后缀（LRU 驱逐，段被复用时先释放租让）。
-  输出与无缓存**逐字一致**（`cuda_test [prefix]` maxerr 1.43e-05、greedy 6/6 全同）；
-  端到端 756-token 共享前缀：0.76s → **0.34s（2.2x）**。`/health` 的 `prefix` 字段给出
-  hits/hit_rows/leased_rows（G15 又扩成 slots/hits/misses/hit_rate/flushes，并且租让
-  现在也覆盖**生成 token 的行**与**带图请求的 text 部分**，同 prompt 重发 0.262s → 0.103s）。
-- 新工具：`tests/cuda_perf.c`（同进程 A/B 基准）、`tests/conc_test.ps1`、
-  `tests/prefix_e2e.ps1`、`tests/soak_curve.ps1`（RSS/VRAM 斜率）、`tests/g4_probe.py`、
-  `tests/bom_fix.ps1`（批量补 UTF-8 BOM）。
-
-## 缺口关闭 G11–G19（2026-10-27，全部实测）
-
-数据与口径：`CHANGELOG.md` 的 `[Unreleased]` 节（每项都带实测数字与日志路径）、
-`docs/BENCH.md`（G14/G15/G16/G18 四节）、`docs/NOTES_g8.md §8`（真实 llava）、
-`docs/NOTES_g9.md §5`（Qwen3-Next）、`docs/PROGRESS_g11_g19.md`（逐轮过程）。
-
-- **G16 flash 从 64 token 起就用**（阀值原 4096）：qwen05 int8 同进程 best-of-3 下
-  128 tok 快 1.3x、512 tok 3.7x、2048 tok **11.8x**、4096 tok **20.2x**；64 tok 以下
-  short 核仍略快，保留。head_dim 新增 D=96 特化 + `D % 32` 守卫（ND=D/32 不整除会静默
-  只算前 64 维）。`SGL_ATTN_DEBUG=1` 打出实际用的核。
-- **G15 前缀租让覆盖生成 token**：登记行数从「只算 prompt」改成「段里真有有效 KV 的行」
-  （`n_prompt + n_gen - 1` → 多轮对话/续写整段复用：命中 552 → **573** 行）；带图请求也
-  登记 text 部分（以前完全跳过）。同 prompt 重发 0.262s → **0.103s（2.5x）**。
-  `/health` 的 `prefix` 字段给 `slots/hits/misses/hit_rate/hit_rows/leased_rows/flushes`；
-  `SGL_PFX_MAX=0` 彻底关缓存。
-- **G11 GPU 侧直收 PNG/JPEG**：`cuda_http` 按 data URL 的 mime 分派，走与 CPU 版同一条
-  stb_image + PIL 语义 resize/crop + CLIP + projector 路径（以前只认 raw float base64）。
-- **G12 真实 llava**：两层 MLP projector、视觉 token 按 `<image>` 位置插入（后缀文本位置
-  顺延）、支持 `mm_vision_select_layer=-2`；**顺带修了 tokenizer 只在 pre-token 边界匹配
-  added token 的 bug**（`USER: <image> ...` 里拿不到 `<image>` id）。
-- **G13 Qwen3-Next**：见上方能力表；递归状态归属键从「首 KV 页」换成 64 位序列 key
-  （radix 前缀共享时两条序列会抢同一个槽 → 状态互踩）。
-- **G14 投机解码**：流水线化（预填 np-1、prompt 末 token 挂起、固定 n=K+1 verify，
-  去掉每轮一次 target 图步）+ small-M GEMV（模板 MT=2/4/8）。K=1 **0.44x → 0.73x**，
-  **但仍净减速**：回本需 K=1 接受率 >88%，实测 39.1%（draft 太弱）。`SGL_SPEC_PROF=1`
-  打阶段分解。
-- **G17 GPU 版 HTTP 卡死（与 G4 不同病）**：`read_request` 在**未 NUL 截断**的缓冲上用
-  `strstr("Content-Length:")`，负载一大会撞上前一个 POST 留在堆里的残值，把无 body 的
-  `GET /health` 挂到客户端超时（修前 12 并发 load：**0/600**）。修后 GPU **600/600**。
-  `SGL_HTTP_TRACE=1` 可逐连接打印入口/收包/应答/退出。
-- **G18 CPU 侧性能**：MSVC 构建之前**只跑 SSE2**（AVX2 内积只有 GCC 有），同线程下比
-  GCC 慢 **10.2x**；新增单独编译单元的 AVX2 dot + CPUID 分派后 930-token prefill
-  326.2s → **33.6s（9.7x）**。8K GPU-vs-CPU 绝对对照：**maxerr 1.48e-04 < 1e-3**、
-  greedy 相同（日志 `docs/g18_8192.log`）。
-- **G19 CI 真跑模型族**：CI 自己生成 5 个随机族（与仓库夹具逐字节相同），验收判据从
-  「ctest 退码 0」改成「`test_family_*` 必须 Passed、`test_llava` 必须 all OK」。
-
-## LoRA 适配器（M21）
+## CLI reference
 
 ```bash
-export SGL_LORA=path/to/adapter_dir   # 含 adapter.safetensors + adapter_config.json
-export SGL_LORA_SCALE=1.0             # 可选额外缩放
-sglc --model models/tinyllama --prompt "..."   # 加载时合并，零推理开销
-```
-PEFT 标准命名（q/k/v/o/gate/up/down 全支持）；合并语义 `W += B·A·(alpha/r)`，
-与 numpy 合并参考 greedy 全等验证（test_lora）；mmap 权重自动换堆可写副本。
-CUDA×LoRA：已验证全等（α=1/16 两档，GPU == numpy 合并参考逐 token）；
-此前误报的「LoRA×CUDA 分叉」实为 cuda_cli decode 位置 off-by-one
-（首 decode 写在 np+1 跳过位置 np，attention 读到未写页垃圾）——已修复，
-并附带澄清：numpy 参考含 qkv-bias 修复后的新 truth，旧 [553,...] 为 M11 期错误参考。
+# interactive generation
+sglang-c/build/bin/sglc --model models/gpt2 --prompt "The meaning of life is" --max-new 32
+sglang-c/build/bin/sglc --model models/tinyllama --w8 --kv8 --max-new 64   # quantized, faster
 
-## 架构（对应关系）
-
+# HTTP service (OpenAI compatible)
+sglang-c/build/bin/sglc --model models/qwen05 --serve --port 30000 --w8
 ```
+
+| Flag | Meaning |
+| --- | --- |
+| `--model <dir>` | Model directory (required) |
+| `--prompt <text>` | Prompt for one-shot generation |
+| `--max-new N` | Max new tokens (default 32) |
+| `--temperature F` / `--top-k N` / `--top-p F` / `--seed N` | Sampling controls |
+| `--w8` | int8 weights (W8A16; decode ~1.8x faster) |
+| `--kv8` | int8 KV cache (half the memory) |
+| `--serve` | Start the HTTP server (`/health` `/generate` `/v1/completions` `/v1/chat/completions`) |
+| `--host H` / `--port P` | Bind address / port (default port 30000) |
+| `--vision <clip_dir>` / `--projector <file>` | Enable the LLaVA vision path |
+| `--lora name=dir[,name2=dir2,...]` | LoRA instance pool (each adapter pre-merged into its own model copy) |
+| `--verbose` | Debug logging |
+
+Note: MSVC builds of `sglc` have no `--serve`; use `cuda_http.exe` for the GPU HTTP server.
+
+The CUDA CLI is positional: `cuda_cli.exe <model_dir> "<prompt>" [max_new] [seed]`
+(`@file` reads a long prompt from disk). The CUDA server is `cuda_http.exe <model_dir> [port]`.
+
+## HTTP API
+
+All three POST routes take JSON; `/health` is a plain GET.
+
+```bash
+# health + counters
+curl -s http://127.0.0.1:30000/health
+{"ok":true,"gpu":true,"ctx":16384,"seg":2048,"conc":8,"prefix":{"slots":16,"hits":0,"misses":0,...}}
+
+# chat completion
+curl -s http://127.0.0.1:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":24}'
+
+# text completion / raw prompt
+curl -s http://127.0.0.1:30000/v1/completions -d '{"prompt":"The meaning of life is","max_tokens":32}'
+
+# streaming (SSE)
+curl -s http://127.0.0.1:30000/v1/chat/completions \
+  -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+Because the wire format is OpenAI's, the usual SDKs work unchanged:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="none")
+print(client.chat.completions.create(
+    model="sglang-c",
+    messages=[{"role": "user", "content": "What is the capital of France?"}],
+).choices[0].message.content)
+```
+
+On the GPU server, `/health` also reports `gpu`, `ctx`, `seg` (KV segment length), `conc` (concurrency) and
+the prefix-cache counters, and it switches to `{"ok":false,"gpu":false,"degraded":true,"reason":"..."}`
+when the VRAM pre-check fails (requests then get 503 with a suggestion instead of the process dying).
+
+## Models and directory format
+
+A model directory is a standard Hugging Face export:
+
+```text
+models/qwen05/
+├── config.json
+├── tokenizer.json          # and optionally tokenizer_config.json
+└── model.safetensors       # F32 / F16 / BF16
+```
+
+Tested fixtures used by the suite: `models/gpt2`, `models/tinyllama`, `models/qwen05`, `models/qwen3-06`,
+`models/llama-160m`, plus randomly generated structures (`tests/gen_random_*.py` → `mistral-rand`,
+`gemma-rand`, `gemma2-rand`, `llava-rand`, `qwen3next-rand`) and real LLaVA pieces
+(`clip-vit-large-patch14-336`, `llava-mlp`, `llava-real`).
+
+## Performance
+
+All numbers below are measured, not modelled. Absolute times were taken on the machines listed; the "same
+process A/B" numbers come from `cuda_perf --ab` because WDDM spill-over can inflate absolute times 3–20x
+when free VRAM is tight — cross-process comparisons are not valid on that box.
+
+### CPU (i7-10700F, 8 cores, TinyLlama-1.1B fp32)
+
+| Configuration | Throughput |
+| --- | --- |
+| Baseline | 1.5 tok/s |
+| + SIMD (hand-written SSE2/SSE4.1 intrinsics) | ~3 tok/s |
+| + W8 weights + int8 KV | **7.4 tok/s** (4.9x cumulative) |
+| GEMM peak | `matmul_nt` 8.4 GFLOPs (4x scalar) |
+
+Qwen2.5-0.5B chat: 4.2 tok/s (W8 + KV8 + SIMD; its 151k-vocabulary `lm_head` dominates the cost).
+
+### CUDA (RTX 2060, sm_75; M23 adaptive GEMM: hand-written kernel for M=1, cuBLAS for M>1)
+
+Qwen2.5-0.5B: single stream **45.7 tok/s** (10.9x the CPU stack); **batched (4 sequences) 105.2 tok/s**
+(hand-written 64.9 → cuBLAS 93.6 → adaptive + fused `lm_head` 105.2, +62% cumulative). Prefill maxerr
+3.5e-5 vs CPU, greedy identical in all three implementations, batch output identical to single-stream runs,
+KV segments isolated.
+
+Current snapshot ([bench_results.txt](../bench_results.txt), 2026-10-26): CUDA single-stream 42.2 tok/s,
+batch-4 102.1 tok/s, numerics maxerr 3.5e-05, batch-4 invariant PASS, CPU suite 100% passed.
+
+Highlights from the optimization log (details and logs in [CHANGELOG.md](CHANGELOG.md),
+[docs/BENCH.md](docs/BENCH.md)):
+
+- **Flash prefill (G1/G16)**: single-pass chunked attention kernel; the switch-over threshold dropped from
+  4096 to 64 tokens. Same-process A/B on a clean machine: 8192-token prefill 66.1 s → **2.7 s (23.6x)**,
+  2048-token 11.8x. (An earlier run under VRAM pressure measured 8.3x — the two ratios must not be quoted
+  interchangeably.)
+- **W8 large-M on tensor cores (G2)**: int8×int8→int32 IMMA for M>1, dp4a GEMV kept for M=1.
+  [2048,2048] M=8: 0.925 ms → **0.069 ms (13.4x)**; IMMA vs dp4a prefill maxerr = 0.
+- **Decode CUDA graphs (G3)**: 4-sequence batch 177 → **335 tok/s (+89%)**, output identical with graphs
+  off. fp16 decode B=1 23.0 → 9.7 ms, B=4 36.6 → 8.9 ms, B=8 38.5 → 11.3 ms.
+- **Prefix caching (G6/G15)**: token-exact longest-common-prefix reuse by copying KV rows; 756-token shared
+  prefix 0.76 s → **0.34 s (2.2x)**; repeating the same prompt 0.262 s → **0.103 s (2.5x)**.
+- **MSVC CPU path (G18)**: previously SSE2-only and 10.2x slower than GCC; a separate AVX2 translation unit
+  with CPUID dispatch brought 930-token prefill 326.2 s → **33.6 s (9.7x)** and 8192-token prefill
+  3733.0 s → **611.8 s (6.1x)**, numerics unchanged (maxerr 1.43e-04 at 8K, greedy identical).
+
+## Verified toolchain versions
+
+| Component | Version | Notes |
+| --- | --- | --- |
+| Windows CPU stack | WinLibs GCC **16.2** (`winget install BrechtSanders.WinLibs.POSIX.UCRT`) | CMake ≥ 3.20 + Ninja; artifacts are statically linked |
+| CUDA stack | VS2022 Build Tools (MSVC 14.44) + CUDA Toolkit **13.3** | sm_75+ (RTX 20 series and newer); coexists with the MinGW build in a separate build dir |
+| Optional OpenBLAS | **0.3.29 x64.zip** | see the warning above about `x64` vs `x64_64`; `-DSGL_OPENBLAS=ON` |
+| Source encoding | UTF-8 **with BOM** | MSVC/nvcc read BOM-less files as GBK and swallow struct declarations after Chinese comments; CMake warns during configure |
+| Test models | `models/` | real weights: gpt2 / tinyllama / qwen05 / qwen3-06 / llama-160m; generated: mistral-rand / gemma-rand / llava-rand |
+
+## Environment variables
+
+Everything is optional; defaults are production settings.
+
+| Variable | Scope | Meaning |
+| --- | --- | --- |
+| `SGL_W8` / `SGL_KV8` | CPU | Same as `--w8` / `--kv8` |
+| `SGL_POOL_SLOTS` | CPU | KV page count of the pool (large contexts need a larger pool) |
+| `SGL_LIN_SLOTS` | CPU | Recurrent-state slots for Qwen3-Next linear layers |
+| `SGL_BLAS` / `SGL_BLAS_MINMAC` / `SGL_OPENBLAS_PATH` | CPU | Enable/limit OpenBLAS GEMM use and point at the DLL |
+| `SGL_LORA` / `SGL_LORA_SCALE` | CPU | LoRA adapter directory and extra scale |
+| `SGL_DRAFT_LAYERS` | CPU | Truncated draft depth for speculative decoding |
+| `SGL_SPEC_PROF` | CPU | Print the spec-decoding stage breakdown |
+| `SGL_CLIP_LAYER` | Multimodal | Override `mm_vision_select_layer` for CLIP |
+| `SGL_CUDA_CTX` | GPU | Context cap (default 16384, bounded by VRAM) |
+| `SGL_CUDA_FP16` / `SGL_CUDA_W8` | GPU | fp16 weights / int8 weights on device |
+| `SGL_CUDA_GRAPH` | GPU | `0` disables decode CUDA graphs |
+| `SGL_ATTN_TWOPASS` | GPU | Force the two-pass attention kernel |
+| `SGL_ATTN_DEBUG` / `SGL_CUDA_PROF` / `SGL_CUDA_DBG` | GPU | Print the kernel actually used / per-layer timing / debug counters |
+| `SGL_FORCE_CUBLAS`, `SGL_SMALLM_CUBLAS`, `SGL_W8_DP4A`, `SGL_FORCE_LONG_ATTN` | GPU | Force a specific GEMM/attention path (A/B experiments, slower in production) |
+| `SGL_HTTP_CONC` | GPU server | Concurrency (1–8, default 8; segment length = ctx / concurrency) |
+| `SGL_HTTP_TRACE` | both servers | Per-connection tracing (accept / read / reply / close) |
+| `SGL_PFX_MAX` | GPU server | Prefix-cache slots; `0` disables the cache |
+
+Debug-only: `SGL_IMG_DEBUG` (scheduler image path), `SGL_DEBUG_IDS` / `SGL_DEBUG_GAP` (token ids / top1-top2
+gap per step in `cuda_cli`), `SGL_FULL_RECOMP` (disable the cached-KV fast path in `cuda_cli`).
+
+## Engineering log
+
+Chronological notes on the hard parts. Everything here was measured; the full write-ups with logs live in
+[CHANGELOG.md](CHANGELOG.md), [docs/NOTES_gaps.md](docs/NOTES_gaps.md),
+[docs/NOTES_g8.md](docs/NOTES_g8.md), [docs/NOTES_g9.md](docs/NOTES_g9.md) and
+[docs/PROGRESS_g11_g19.md](docs/PROGRESS_g11_g19.md).
+
+### M26 — long context + CUDA graphs (2026-02)
+
+**Long context (two-pass attention lifts the 4096 clamp).** The original design used the shared-scores
+kernel up to 4096 tokens and a two-pass kernel above it (1024-token chunks, online softmax, K recomputed
+twice for fixed shared memory). After G1 routed long rows through flash and G16 dropped the threshold to 64
+tokens, **the default path only uses the two-pass kernel when `SGL_ATTN_TWOPASS=1` or the head dimension has
+no specialization (`head_dim % 32 != 0`)**; the llama-family kernel choice lives in one place
+(`attn_dispatch()`). GPT-2 has its own forward loop and still uses the shared-scores kernel, so its long
+context was not raised by G1/G16. `SGL_CUDA_CTX` overrides the context cap (default 16384, VRAM bound);
+tied `lm_head` aliases `wte` on device (saves 545 MB for Qwen2.5-0.5B); activation workspaces grow on demand.
+Verified: two-pass vs original kernel maxerr 2.2e-5 with identical greedy output; a 4300-token prompt with
+batched serving (two KV segments + graph replay) matches single-stream token by token; kernel determinism
+(two identical prefills are bit-exact) is part of `cuda_test`. HTTP end to end: a 5000+ token prompt
+(chunked prefill, 3 segments) answers the in-text needle ("The answer is 42.").
+
+**CUDA graphs (decode).** `decode_batch` captures and replays every step (H2D input copies captured into the
+graph, a graph-safe KV-write kernel computes addresses from a device array, so changing lens needs no
+re-capture). `SGL_CUDA_GRAPH=0` turns it off. 4-sequence batch **177 → 335 tok/s (+89%)**, output identical
+with graphs disabled.
+
+**A real bug fixed on the way:** the two-pass kernel's block reduction had no barrier between "read
+`red[0]`" and "write `red` for the next chunk" — found with compute-sanitizer racecheck (~390k hazards);
+reproducing 10 launches corrupted bit-exactness twice and occasionally produced all-NaN. Two
+`__syncthreads()` calls eliminated it.
+
+### Gaps G1–G6 (2026-10-27)
+
+All performance numbers are same-process A/B (`cuda_perf --ab`).
+
+- **G1 flash prefill** — long rows no longer recompute K twice; the single-pass chunked kernel
+  (`k_attn_flash`: Q blocks resident in shared memory, streamed K/V, online softmax). Initially enabled only
+  above 4096 rows (8192-token prefill 72.4 s → 8.8 s, 8.3x, on a VRAM-pressured box); G16 lowered the
+  threshold to 64 tokens, and a clean same-process A/B gives 8192-token **66.1 s → 2.7 s (23.6x)** and
+  2048-token 11.8x.
+- **G2 W8 large-M on tensor cores** — see performance highlights above.
+- **G3 decode graphs on by default** — a plain warm-up step runs before capture (cuBLAS algorithm selection
+  cannot happen inside capture); failures only mark **that batch size** instead of flipping a process-wide
+  switch. `cuda_http` pre-warms workspaces/images and pre-captures B=1..conc before serving.
+- **G4 HTTP hang fix** — `active_conns` got its own `conns_lock` instead of sharing `srv->lock` with the
+  compute loop, which starved the acceptor under load (connection handshaked but no thread created for a
+  long time). Re-verified: 600/600 `GET /health` at 12-way concurrency with no timeout.
+- **G5 VRAM pre-check** — weights + KV + workspace + logits are summed before upload; if it does not fit the
+  server **degrades instead of dying**: `/health` returns `{"ok":false,"gpu":false,"degraded":true,
+  "reason":"..."}` and `/generate` answers 503 with a suggestion (lower `SGL_CUDA_CTX`, enable
+  `SGL_CUDA_FP16`/`SGL_CUDA_W8`).
+- **G6 GPU prefix cache** — the KV segment of a finished request is leased to a prefix cache; a new request
+  compares tokens for the longest common prefix, copies matching rows with `sgl_cuda_copy_kv` and prefills
+  only the suffix (LRU eviction, leases released on reuse). Output is **byte-identical** to the uncached path
+  (`cuda_test [prefix]` maxerr 1.43e-05, greedy 6/6 identical); 756-token shared prefix 0.76 s → 0.34 s.
+
+### Gaps G11–G19 (2026-10-27, all measured)
+
+- **G16 flash from 64 tokens** — qwen05 int8, same-process best-of-3: 128 tok 1.3x, 512 tok 3.7x, 2048 tok
+  **11.8x**, 4096 tok **20.2x**; below 64 tokens the short kernel stays slightly faster. Added a D=96
+  specialization and a `D % 32` guard (a non-divisible ND silently computed only the first 64 dims).
+  `SGL_ATTN_DEBUG=1` prints the kernel actually used.
+- **G15 prefix leases cover generated tokens** — registered rows changed from "prompt only" to "rows that
+  really hold valid KV" (`n_prompt + n_gen - 1`), so multi-turn chat reuses the whole segment (matched rows
+  552 → **573**); image requests now register their text portion too. Same prompt twice: 0.262 s → 0.103 s.
+- **G11 GPU-side PNG/JPEG** — `cuda_http` dispatches on the data-URL mime and runs the same stb_image +
+  PIL-semantics resize/crop + CLIP + projector path as the CPU build (it previously accepted only raw-float
+  base64).
+- **G12 real LLaVA** — two-layer MLP projector, visual tokens inserted at the `<image>` position (suffix text
+  positions shifted so RoPE follows), `mm_vision_select_layer=-2` honored; this also fixed a tokenizer bug
+  where added tokens matched only at pre-token boundaries (so `USER: <image> ...` never produced an
+  `<image>` id).
+- **G13 Qwen3-Next** — the recurrent-state ownership key moved from "first KV page" to a 64-bit sequence key
+  (two sequences sharing a radix prefix used to fight over one slot and corrupt each other's state).
+- **G14 speculative decoding** — pipelined (prefill n-1, park the last prompt token, fixed n=K+1 verify, no
+  per-round target graph step) plus small-M GEMV templates (MT=2/4/8). K=1 0.44x → 0.73x, **still a net
+  slowdown**: it needs >88% acceptance to pay off, measured 39.1% (the draft model is too weak).
+  `SGL_SPEC_PROF=1` prints the stage breakdown.
+- **G17 GPU HTTP hang (different bug from G4)** — `read_request` ran `strstr("Content-Length:")` on a buffer
+  that was not NUL-terminated, so under load it hit stale bytes from a previous POST and hung body-less
+  `GET /health` until the client timed out (12-way load: **0/600** before, **600/600** after).
+  `SGL_HTTP_TRACE=1` traces each connection.
+- **G18 CPU performance** — the MSVC build previously ran SSE2 only (AVX2 dot existed for GCC only) and was
+  10.2x slower than GCC at the same thread count; a separate AVX2 translation unit plus CPUID dispatch
+  brought 930-token prefill 326.2 s → 33.6 s. 8K GPU-vs-CPU absolute check: **maxerr 1.48e-04 < 1e-3**,
+  greedy identical ([docs/g18_8192.log](docs/g18_8192.log)).
+- **G19 CI runs real model families** — CI generates five random families itself (byte-identical to the repo
+  fixtures) and the gate changed from "ctest exit code 0" to "`test_family_*` must be Passed and `test_llava`
+  must print all OK".
+
+### LoRA adapters (M21)
+
+```bash
+export SGL_LORA=path/to/adapter_dir   # adapter.safetensors + adapter_config.json
+export SGL_LORA_SCALE=1.0             # optional extra scale
+sglc --model models/tinyllama --prompt "..."
+```
+
+Standard PEFT naming (q/k/v/o/gate/up/down all supported); merge semantics `W += B·A·(alpha/r)`, verified
+greedy-identical to a numpy merge reference (`test_lora`); mmap'd weights are copied to a writable heap
+copy automatically. CUDA×LoRA verified identical (α=1 and α=1/16, GPU == numpy merge per token). The
+formerly suspected "LoRA×CUDA divergence" turned out to be an off-by-one in `cuda_cli` decode positions
+(the first decode wrote at `np+1`, skipping `np`, so attention read an unwritten page) — fixed.
+
+## Architecture
+
+```text
 sglc CLI ── HTTP (http.c) ── Scheduler (scheduler.c) ── RadixCache (radix.c)
-                                  │  连续批处理 / 流式 / stop/n
+                                  │  continuous batching / streaming / stop sequences
                                   ▼
-                          Model 抽象层 (model.c)  ←── gpt2.c / llama.c（含 Qwen2 差异项）
-                                  │  分页 KV 池（引用计数）
+                          Model abstraction (model.c)  ←── gpt2.c / llama.c (incl. Qwen2 differences)
+                                  │  paged KV pool (refcounted)
                                   ▼
-                    算子层 (ops.c, quant.c)  ← SIMD 内积 / W8A16 / int8 KV
+                     Operators (ops.c, quant.c)  ← SIMD dot products / W8A16 / int8 KV
                                   ▼
-              基础库：safetensors(mmap 零拷贝) / BPE+SP tokenizer / JSON / log / alloc
+              Foundation: safetensors (mmap zero-copy) / BPE+SP tokenizer / JSON / log / alloc
 ```
 
-## 验证方法学
+The CUDA backend (`src/cuda_backend.cu`) plugs in behind the same operator layer: adaptive GEMM (hand-written
+kernel for M=1, cuBLAS for M>1), flash prefill, decode CUDA graphs, W8 dp4a/IMMA, and the GPU prefix cache.
 
-每个组件三层对照：
-1. **单元**：手算/性质断言（如 beam W=1 == greedy）
-2. **独立参考**：numpy 从零实现的前向（与 C 零共享代码）、HF tokenizers（Rust）、tiktoken
-3. **端到端**：真实权重生成 + 事实性检查（"capital of France is **Paris**"）
+## Validation methodology
 
-## 已知问题
+Every component is checked at three levels:
 
-- WinLibs GCC 16.2 的 AVX2 自动向量化在本机间歇崩溃（最小复现已定位），故用 `-march=x86-64-v2` + 手写 SSE（见 CMakeLists 注释）；AVX2 内积单独用函数级 target / 单文件 `/arch:AVX2` 开后运行时 CPUID 分派
-- 激活重尾 outlier（行内 maxabs/median 达 1311x）使 W8A8 不可行，采 W8A16（见 ROADMAP M12）
-- 未训练的截层 draft 接受率 ~0%（spec 加速需专门训练的小模型，M19）；
-  llama-160m 对 tinyllama 也只有 39%（K=1）——所以 spec 目前仍净减速（G14）
-- **MSVC 构建不开 OpenMP**（`-fopenmp` 只给 GNU）：实测 CPU prefill 开 8 线程只值 2.05x，
-  数值路径完全一致，需要时再给 MSVC 加 `/openmp`（G18 补记）
-- 前缀缓存是**段级租让**（一个并发段一个槽，token 精确比对），不是 CPU 侧的 radix 树；
-  多图仍拼在**同一个** `<image>` 位置（llava 是一图一占位，G12/G15）
-- CI 不跑 CUDA 与真实 llava 权重（runner 无 NVIDIA 驱动 / 不下 1.7GB 权重）；
-  `test_llava_real` 与 `cuda_test` 只在本地有夹具时跑
-- GPT-2 路径没接 G1/G16 的 attention 优化（仍是 shared-scores 核，长上下文受 shared 上限约束）；
-  共享前缀缓存也只有 llama 族的 `cuda_http` 有（CPU 版是 radix 树）
+1. **Unit** — hand-computed values and property assertions (e.g. beam W=1 == greedy, scheduler batch output
+   == serial output).
+2. **Independent reference** — a from-scratch numpy forward pass sharing no code with the C implementation,
+   plus HF tokenizers (Rust) and tiktoken for tokenization.
+3. **End to end** — real weights plus factual checks ("the capital of France is **Paris**").
+
+The suite is 26 CTest targets (`ctest --test-dir sglang-c/build`), including randomly generated model
+families for regression coverage of the llama/mistral/gemma/gemma2/qwen3/qwen3-next code paths.
+
+## Known limitations
+
+- WinLibs GCC 16.2's AVX2 auto-vectorization crashes intermittently on this machine (minimal reproducer
+  isolated), so the build uses `-march=x86-64-v2` + hand-written SSE (see the comment in `CMakeLists.txt`);
+  the AVX2 dot product is opened per-function / per-file with CPUID dispatch at runtime.
+- Activation outliers are heavy-tailed (row maxabs/median up to 1311x), which rules out W8A8 on CPU; W8A16
+  is used instead (see ROADMAP M12).
+- Untrained truncated drafts accept ~0% of tokens; even llama-160m against tinyllama only reaches 39% at
+  K=1 — so speculative decoding is still a net slowdown today (G14).
+- **MSVC builds don't enable OpenMP** (`-fopenmp` is GNU-only): measured CPU prefill gains only 2.05x from
+  8 threads with identical numerics; `/openmp` can be added to MSVC when needed (G18).
+- The prefix cache is a **segment lease** (one slot per concurrent segment, token-exact comparison), not the
+  CPU-side radix tree; multiple images still collapse into the **same** `<image>` position (LLaVA is one
+  image per placeholder, G12/G15).
+- CI does not run CUDA or real LLaVA weights (runners have no NVIDIA driver and don't download 1.7 GB
+  checkpoints); `test_llava_real` and `cuda_test` only run locally when the fixtures are present.
+- The GPT-2 path does not use the G1/G16 attention optimizations (still the shared-scores kernel, so long
+  context is bounded by shared memory), and only the llama-family `cuda_http` has the shared-prefix cache
+  (the CPU build uses the radix tree).
+
+## Repository layout
+
+```text
+sglang-c/
+├── apps/           sglc.c (CLI + HTTP), cuda_cli.c, cuda_http.c
+├── include/        public headers (sgl/*.h)
+├── src/            model backends, scheduler, radix cache, ops, quantization, tokenizer, HTTP, CUDA backend
+├── tests/          CTest targets, numpy/HF reference scripts, perf harnesses, fixture generators
+├── docs/           benchmark logs, gap notes, progress reports
+├── models/         small generated fixtures used by the suite
+├── quickstart.bat  one-click launcher (Windows)
+├── quickstart.sh   one-click launcher (Linux / macOS / Git Bash)
+├── build_all.bat   full CPU + CUDA build and test
+├── ROADMAP.md      milestone plan
+└── CHANGELOG.md    per-change log with measurements
+```
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE). Portions of the design are derived from
+[sgl-project/sglang](https://github.com/sgl-project/sglang).
