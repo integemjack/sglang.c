@@ -767,6 +767,90 @@ M0 解决的是「并发」，设计文档的另两个目标仍未达成：
 
 ---
 
+## 14. M1 实测：FP4 可行但精度有损，故默认不用（2026-10-28）
+
+### 14.1 已实现并保留为可选（`SGL_W4=1`，默认关）
+
+- 权重格式：**int4 补码 + 每 16 元素一个 fp16 块缩放**（0.625 B/参数，
+  相对 int8 的 1.0 B 减少 1.6×）；`lm_head` 也转 FP4（2.54 GB → 0.795 GB）
+- kernel：`k_gemm_w4_q`（M=1）/ `k_gemm_w4_mrow<MT>`（M=2..32），
+  用 `__byte_perm` 展开 nibble + `__vsubss4` 符号扩展 + `__dp4a`
+- 激活先量化成 int8（复用 `k_quant_rows`），与 int8 权重路径同一语义
+- 显存：**21733 MiB**（int8 是 31711 MiB），剩余 10378 MiB
+
+### 14.2 微基准：格式选择是决定性的（`.mb2.cu`）
+
+同一形状（mlp gate N=17408 K=5120、lm_head N=248320 K=5120）下：
+
+| 写法 | mlp gate | lm_head |
+| --- | --- | --- |
+| FP4 码书 → shared-mem 查表 → float FMA | 266 GB/s | 272 GB/s |
+| FP4 码书 → 算术构造 float 位型 → float FMA | 280 GB/s | 286 GB/s |
+| **int4 → `__byte_perm` 展开 → `__dp4a`** | **1930 GB/s** | **1677 GB/s** |
+
+结论：**「4-bit 权重 × float 激活」这条路在 sm_120 上只有峰值的 16%**，
+无论查表还是算术解码；必须用 dp4a 走整数。这也解释了为什么
+`c_e2m1[nib]` 用 `__constant__` 比用 shared memory 还差（动态下标让常量
+内存广播失效，16 路串行）。
+
+### 14.3 精度：确实掉了，所以不做默认
+
+相同 prompt、greedy 解码，int8 vs int4（每 16 组缩放）：
+
+| prompt | int8（默认） | int4-FP4 |
+| --- | --- | --- |
+| `Q: What year did World War II end?` | `1945` ✅ | `...about when World War I...` ❌ **答成一战** |
+| `List three prime numbers:` | `2, 3, 5. You are right!` ✅ | `2, 3, 5` 后偏离到列合数 ⚠️ |
+| 其余 4 个基础题 | ✅ | ✅ |
+
+所以 **int4 只作为实验开关保留**，默认走 int8（零精度损失）。
+若将来要用 4-bit，需要升级到 NVFP4 真码书 + 更细的块缩放，
+并配一套 perplexity / needle 评测，而不是靠几个 prompt 目测。
+
+### 14.4 吞吐对比（ctx=2048, lin_slots=32）
+
+| | 单发 tok/s | 32 并发聚合 tok/s | 精度 |
+| --- | --- | --- | --- |
+| int8（默认） | 34.0 | **231.2** | 无损 |
+| int4-FP4（可选） | 41.3 | 125.7 | 有损 |
+
+注意 int4 的**并发聚合反而更低**（125.7 vs 231.2）：因为 M>1 走的是
+`k_gemm_w4_mrow` 的 CUDA-core 路径，而 int8 的 M>1 走 IMMA 张量核。
+
+### 14.5 单发速度的权威分解（`SGL_CUDA_PROF=1`，int8 路径）
+
+```
+[prof] n=1  total 23.9 ms | attn(full) 0.4 ms | lin-recur 1.1 ms | rest 22.4 ms
+```
+
+对照带宽地板：27.296 GB / 1690 GB/s = **16.15 ms**。于是：
+
+| 项 | 时间 | 说明 |
+| --- | --- | --- |
+| 权重带宽地板 | 16.15 ms | 单发 61.9 tok/s 的硬上限 |
+| GEMM 内非带宽开销 | 6.25 ms | launch、warp 归约、寄存器搬移 |
+| attention（16 层 full） | 0.4 ms | 已经很干净 |
+| GDN 递归（48 层） | 1.1 ms | 已经很干净 |
+| **前向合计** | **23.9 ms** | = 41.8 tok/s |
+| 前向之外（采样/D2H/HTTP） | ~5.5 ms | 端到端 34.0 tok/s |
+
+微基准还确认：int8 GEMV 在**真正从 DRAM 取数**时已经到峰值
+（lm_head 1.27 GB → 1693 GB/s，block/行 与 warp/行 一样）。
+所以剩下的 6.25 ms 不是 GEMV 读写的问题，是固定开销。
+
+### 14.6 不降精度就上 100 tok/s 的路线
+
+1. **削掉 6.25 ms 固定开销**：CUDA graph 回放（现在 `decode graphs 0/32`，
+   hybrid 被 `decode_step_launch` 的前置判断整段跳过）+ 把 GEMV 改成
+   warp/行以减少归约次数 → 前向可望降到 17–18 ms（~56 tok/s）
+2. **削掉前向外的 5.5 ms**：采样放到 device 上做 argmax、避免整行 logits D2H
+3. **MTP 投机解码**（权重里已有 `mtp.*`，代码完全未用）：
+   每次前向出 2.4–2.6 个 token → **48 × 2.5 ≈ 120 tok/s**
+
+第 3 项是唯一能把单发推过 100 且不动精度的杠杆。
+
+---
+
 ## 附：本文数字的来源
 
 **实测**（本机，方法见 §1.1/§1.2/§1.4）：显存带宽 1690 GB/s、PCIe 56/54/51 GB/s、RAM 125 GB/s、

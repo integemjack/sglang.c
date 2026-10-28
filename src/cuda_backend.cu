@@ -44,8 +44,14 @@
  * batch size then runs the plain path; invalidate_graphs() clears it. */
 #define SGL_NO_GRAPH ((void *)~(size_t)0)
 
-/* t8 W8A8 per-channel int8 weights: w[N,K] int8 + scale[N]. */
-typedef struct { int8_t *w; float *scale; } sgl_w8w;
+/* t8 W8A8 per-channel int8 weights: w[N,K] int8 + scale[N].
+ * M1：w4 指向同一投影的 FP4 副本（NULL = 没有）。use_w4 时 PROJ 走它，
+ * int8 数据不再上传——两套同时放显存放不下。*/
+typedef struct { int8_t *w; float *scale; void *w4; } sgl_w8w;
+/* M1: NVFP4 风格的 4-bit 权重。数据 2 个值/字节（e2m1），缩放按 16 元素一块
+ * 存 fp16。相对 int8 的 1 字节/参数，这里是 0.5 + 2/16 = 0.625 字节/参数
+ * （1.6× 减容）；e2m1 只有 16 个电平，必须靠小块缩放才能保住精度。*/
+typedef struct { uint8_t *w; __half *bs; } sgl_w4w;
 
 struct sgl_cuda_model {
   int L, H, HK, E, I, V, D, KD, ctx;
@@ -60,6 +66,15 @@ struct sgl_cuda_model {
   float **qb, **kb, **vb;
   float **ln2, **gw, **uw, **dw;
   sgl_w8w *qw8, *kw8, *vw8, *ow8, *gw8, *uw8, *dw8; /* t8: per-layer [L], NULL when off */
+  /* M1 FP4 权重（与 w8 互斥：只上其中一套，否则显存放不下两套 27 GB）*/
+  sgl_w4w *qw4, *kw4, *vw4, *ow4, *gw4, *uw4, *dw4;
+  sgl_w4w lm_head_w4;
+  int use_w4;
+  /* M1：FP4 GEMM 的 int8 激活 scratch（M 行 × K 列 + 每行一个缩放）。
+   * K 最大 17408（down_proj）、M 最大 32，共 557 KB，按需扩。*/
+  int8_t *w4_a8;
+  float *w4_as;
+  size_t w4_acap;   /* 已分配的 M*K 字节数 */
   float *freqs; /* [D/2] */
   cublasHandle_t blas; /* M22: all projections via cublas */
   float *kc, *vc; /* [ctx][KD] */
@@ -2170,6 +2185,290 @@ static void w8_free_layers(sgl_w8w *arr, int L) {
   free(arr);
 }
 
+/* ================= M1: NVFP4 权重 =================
+ * e2m1 的 16 个电平（bit3 = 符号，低 3 位 = 幅度序号）。
+ * 幅度：0, .5, 1, 1.5, 2, 3, 4, 6 —— 这是 NVFP4 规定的码书。*/
+static const float k_e2m1_pos[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+__constant__ float c_e2m1[16] = {0.f,   0.5f, 1.f,   1.5f, 2.f,   3.f,   4.f,   6.f,
+                                 -0.f,  -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
+/* 量化时每 16 元素一块；K 不是 16 的倍数时把尾巴并进最后一块。*/
+#define W4_BLK 16
+static inline int w4_nblk(int K) { return (K + W4_BLK - 1) / W4_BLK; }
+
+/* 把一个 16 元块量化成 8 字节（16 个 int4 补码 nibble）+ 一个 fp16 块缩放。
+ *
+ * 为什么不用 e2m1：微基准实测（docs/DESIGN_1M_32C.md §14）在 sm_120 上，
+ *「FP4 码书 → float 解码再 FMA」无论用 smem 查表还是算术构造 float 位型，
+ * 都只能跑到 **272–286 GB/s**（峰值的 16%）；而 int4 补码 + prmt 展开 +
+ * int8 激活 → __dp4a 能跑到 **1677–1930 GB/s（lm_head 上就是峰值）**。
+ * 差 6.2× 的原因是 dp4a 一次算 4 个乘加且没有查表延迟，而 float 路径
+ * 每值一次 30-cycle 的 LDS/长依赖链。
+ * 代价：int4 只有 16 个电平（−7..7），靠每 16 元素一个缩放保精度。*/
+static inline void w4_quant_block(const float *x, int n, uint8_t *out8, __half *sc) {
+  float amax = 0.f;
+  for (int i = 0; i < n; i++) { float v = fabsf(x[i]); if (v > amax) amax = v; }
+  float s = (amax > 1e-12f) ? amax / 7.f : 0.f;
+  *sc = __float2half(s);
+  float inv = s > 0.f ? 1.f / s : 0.f;
+  for (int i = 0; i < n; i++) {
+    float v = x[i] * inv;
+    int q = (int)lrintf(v);
+    if (q > 7) q = 7;
+    if (q < -7) q = -7;
+    unsigned nib = (unsigned)(q & 0x0f);   /* 4-bit 补码 */
+    if (i & 1) out8[i >> 1] |= (uint8_t)(nib << 4);
+    else       out8[i >> 1] = (uint8_t)(nib & 0x0f);
+  }
+}
+
+/* 从 host f32 权重量化成 FP4（N 行 × K 列）。*/
+static int dev_copy_w4(const float *src, int N, int K, sgl_w4w *out) {
+  if (!src) return -1;
+  int nb = w4_nblk(K);
+  size_t wbytes = ((size_t)N * (size_t)K + 1) / 2;
+  uint8_t *q = (uint8_t *)calloc(wbytes ? wbytes : 1, 1);
+  __half *s = (__half *)malloc(sizeof(__half) * (size_t)N * nb);
+  if (!q || !s) { free(q); free(s); return -1; }
+  for (int n = 0; n < N; n++) {
+    const float *r = src + (size_t)n * K;
+    for (int b = 0; b < nb; b++) {
+      int k0 = b * W4_BLK;
+      int cnt = (K - k0 < W4_BLK) ? (K - k0) : W4_BLK;
+      w4_quant_block(r + k0, cnt, q + (size_t)n * K / 2 + (size_t)k0 / 2, &s[(size_t)n * nb + b]);
+    }
+  }
+  cudaError_t e1 = cudaMalloc((void **)&out->w, wbytes);
+  cudaError_t e2 = cudaMalloc((void **)&out->bs, sizeof(__half) * (size_t)N * nb);
+  if (e1 != cudaSuccess || e2 != cudaSuccess) {
+    if (e1 == cudaSuccess) cudaFree(out->w);
+    if (e2 == cudaSuccess) cudaFree(out->bs);
+    free(q); free(s);
+    return -1;
+  }
+  cudaMemcpy(out->w, q, wbytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(out->bs, s, sizeof(__half) * (size_t)N * nb, cudaMemcpyHostToDevice);
+  free(q); free(s);
+  return 0;
+}
+
+/* 从已量化的 host int8 权重（llama.c 流式 W8 的产物）转成 FP4、
+ * 免回 f32 中转。反量化用行缩放 hs[n]，重量化用 16 元块缩放。
+ * 精度损失：int8 已有一次误差，此处再加一次 FP4 误差；
+ * 实测对 greedy 输出的影响见 docs/DESIGN_1M_32C.md §13 的对照方法。*/
+static int dev_copy_w4_from_i8(const int8_t *hq, const float *hs, int N, int K, sgl_w4w *out) {
+  if (!hq || !hs) return -1;
+  int nb = w4_nblk(K);
+  size_t wbytes = ((size_t)N * (size_t)K + 1) / 2;
+  uint8_t *q = (uint8_t *)calloc(wbytes ? wbytes : 1, 1);
+  __half *s = (__half *)malloc(sizeof(__half) * (size_t)N * nb);
+  float *buf = (float *)malloc(sizeof(float) * W4_BLK);
+  if (!q || !s || !buf) { free(q); free(s); free(buf); return -1; }
+  for (int n = 0; n < N; n++) {
+    const int8_t *r = hq + (size_t)n * K;
+    float sc = hs[n];
+    for (int b = 0; b < nb; b++) {
+      int k0 = b * W4_BLK;
+      int cnt = (K - k0 < W4_BLK) ? (K - k0) : W4_BLK;
+      for (int i = 0; i < cnt; i++) buf[i] = (float)r[k0 + i] * sc;
+      w4_quant_block(buf, cnt, q + (size_t)n * K / 2 + (size_t)k0 / 2, &s[(size_t)n * nb + b]);
+    }
+  }
+  cudaError_t e1 = cudaMalloc((void **)&out->w, wbytes);
+  cudaError_t e2 = cudaMalloc((void **)&out->bs, sizeof(__half) * (size_t)N * nb);
+  if (e1 != cudaSuccess || e2 != cudaSuccess) {
+    if (e1 == cudaSuccess) cudaFree(out->w);
+    if (e2 == cudaSuccess) cudaFree(out->bs);
+    free(q); free(s); free(buf);
+    return -1;
+  }
+  cudaMemcpy(out->w, q, wbytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(out->bs, s, sizeof(__half) * (size_t)N * nb, cudaMemcpyHostToDevice);
+  free(q); free(s); free(buf);
+  return 0;
+}
+
+static int w4_alloc_layers(sgl_w4w **arr, int L) {
+  *arr = (sgl_w4w *)calloc((size_t)L, sizeof(sgl_w4w));
+  return *arr ? 0 : -1;
+}
+static void w4_free_layers(sgl_w4w *arr, int L) {
+  if (!arr) return;
+  for (int l = 0; l < L; l++) {
+    if (arr[l].w) cudaFree(arr[l].w);
+    if (arr[l].bs) cudaFree(arr[l].bs);
+  }
+  free(arr);
+}
+
+/* ---- FP4(int4) GEMV / 小 M：dp4a 路径 ----
+ * 一个 uint32 装 8 个 int4。用 __byte_perm 把 nibble 展开成字节（2 条指令出
+ * 4 字节），再用 __vsubss4 做符号扩展，最后 4 次 __dp4a 算完 16 个乘加。
+ * 每值约 1.25 条指令（vs float 解码的 4 条且有查表依赖）。
+ *
+ * 为什么不能直接拿 int4 权重乘 float 激活：
+ * 实测（.mb2.cu，mlp gate N=17408 K=5120）：smem-LUT 266 GB/s、
+ * 算术解码 280 GB/s、int4+dp4a **1930 GB/s**。差 6–7 倍。
+ * 所以激活必须先量化成 int8（k_quant_rows），与仓库 int8 路径同一套语义。*/
+__device__ __forceinline__ void w4_x8(unsigned v, int *a, int *b) {
+  unsigned lom = v & 0x0F0F0F0Fu;
+  unsigned him = (v >> 4) & 0x0F0F0F0Fu;
+  unsigned lo = __byte_perm(lom, him, 0x5140);  /* → [n0][n1][n2][n3] */
+  unsigned hi = __byte_perm(lom, him, 0x7362);  /* → [n4][n5][n6][n7] */
+  *a = (int)__vsubss4(lo ^ 0x08080808u, 0x08080808u);
+  *b = (int)__vsubss4(hi ^ 0x08080808u, 0x08080808u);
+}
+
+__global__ void k_gemm_w4_q(const int8_t *A8, const uint8_t *W, const __half *bs,
+                            const float *as, const float *bias, float *C, int N, int K) {
+  extern __shared__ float red[];
+  int n = blockIdx.x;
+  if (n >= N) return;
+  int nb = (K + 15) / 16;
+  int nch = (K + 31) / 32;
+  const uint4 *wr = (const uint4 *)(W + (size_t)n * K / 2);
+  const __half *br = bs + (size_t)n * nb;
+  float acc = 0.f;
+  for (int c = threadIdx.x; c < nch; c += blockDim.x) {
+    uint4 v = wr[c];
+    unsigned q[4] = {v.x, v.y, v.z, v.w};
+    int b8[8];
+#pragma unroll
+    for (int u = 0; u < 4; u++) { int x, y; w4_x8(q[u], &x, &y); b8[u * 2] = x; b8[u * 2 + 1] = y; }
+    int base = c * 32;
+#pragma unroll
+    for (int hf = 0; hf < 2; hf++) {
+      int bb = c * 2 + hf;
+      if (bb >= nb) break;
+      int sacc = 0;
+#pragma unroll
+      for (int t = 0; t < 4; t++)
+        sacc = __dp4a(*(const int *)(A8 + base + hf * 16 + t * 4), b8[hf * 4 + t], sacc);
+      acc += (float)sacc * __half2float(br[bb]);
+    }
+  }
+  red[threadIdx.x] = acc;
+  __syncthreads();
+  for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+    if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) C[n] = red[0] * as[0] + (bias ? bias[n] : 0.f);
+}
+
+/* M=2..8：一个 block 一个输出行，权重读一遍，累计 MT 个激活行。
+ * C 是 M 行×N 列行主序，第 i 行的第 n 个元素在 C[i*N+n]。*/
+template <int MT>
+__global__ void k_gemm_w4_mrow(const int8_t *A8, const uint8_t *W, const __half *bs,
+                               const float *as, const float *bias, float *C, int M, int N, int K) {
+  extern __shared__ float wred[];
+  int n = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+  if (n >= N) return;
+  int nb = (K + 15) / 16;
+  int nch = (K + 31) / 32;
+  const uint4 *wr = (const uint4 *)(W + (size_t)n * K / 2);
+  const __half *br = bs + (size_t)n * nb;
+  float acc[MT];
+#pragma unroll
+  for (int i = 0; i < MT; i++) acc[i] = 0.f;
+  for (int c = tid; c < nch; c += nt) {
+    uint4 v = wr[c];
+    unsigned q[4] = {v.x, v.y, v.z, v.w};
+    int b8[8];
+#pragma unroll
+    for (int u = 0; u < 4; u++) { int x, y; w4_x8(q[u], &x, &y); b8[u * 2] = x; b8[u * 2 + 1] = y; }
+    int base = c * 32;
+#pragma unroll
+    for (int hf = 0; hf < 2; hf++) {
+      int bb = c * 2 + hf;
+      if (bb >= nb) break;
+      float fs = __half2float(br[bb]);
+#pragma unroll
+      for (int i = 0; i < MT; i++) {
+        if (i >= M) continue;
+        const int8_t *ar = A8 + (size_t)i * K + base + hf * 16;
+        int sacc = 0;
+#pragma unroll
+        for (int t = 0; t < 4; t++) sacc = __dp4a(*(const int *)(ar + t * 4), b8[hf * 4 + t], sacc);
+        acc[i] += (float)sacc * fs;
+      }
+    }
+  }
+  /* 归约：warp 内 shuffle，再每 warp lane0 汇总 */
+  int lane = tid & 31, warp = tid >> 5, nwarp = nt >> 5;
+#pragma unroll
+  for (int i = 0; i < MT; i++) {
+    float v = acc[i];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+    if (lane == 0) wred[i * 8 + warp] = v;
+  }
+  __syncthreads();
+  if (tid == 0) {
+#pragma unroll
+    for (int i = 0; i < MT; i++) {
+      if (i >= M) continue;
+      float t = 0.f;
+      for (int w = 0; w < nwarp && w < 8; w++) t += wred[i * 8 + w];
+      C[(size_t)i * N + n] = t * as[i] + (bias ? bias[n] : 0.f);
+    }
+  }
+}
+
+/* lm_head 分派：FP4 优先，否则 fp16/fp32。两处调用点都走这里。*/
+static void gemm_w4_launch(sgl_cuda_model *g, const float *A, const sgl_w4w *W,
+                           const float *bias, float *C, int M, int N, int K);
+static void lm_head_gemm(sgl_cuda_model *g, const float *A, float *C, int M) {
+  if (g->use_w4 && g->lm_head_w4.w)
+    gemm_w4_launch(g, A, &g->lm_head_w4, NULL, C, M, g->V, g->E);
+  else
+    gemm_nt_any(g, A, g->lm_head, g->lm_head_h, NULL, C, M, g->V, g->E);
+}
+
+static void gemm_w4_launch(sgl_cuda_model *g, const float *A, const sgl_w4w *W,
+                           const float *bias, float *C, int M, int N, int K) {
+  cudaStream_t s = g->stream;
+  /* 先把激活量化成 int8（每行一个缩放），与 int8 权重路径同一套语义。
+   * dp4a 要求两边都是 int8；这正是 v2 跑到 1677 GB/s 的前提。*/
+  size_t need = (size_t)M * (size_t)K;
+  if (need > g->w4_acap) {
+    if (g->w4_a8) cudaFree(g->w4_a8);
+    if (cudaMalloc((void **)&g->w4_a8, need) != cudaSuccess) { g->w4_acap = 0; return; }
+    if (!g->w4_as && cudaMalloc((void **)&g->w4_as, sizeof(float) * 32) != cudaSuccess) {
+      cudaFree(g->w4_a8); g->w4_a8 = NULL; g->w4_acap = 0; return;
+    }
+    g->w4_acap = need;
+  }
+  if (!g->w4_a8 || !g->w4_as) return;
+  k_quant_rows<<<M, 256, 0, s>>>(A, g->w4_a8, g->w4_as, M, K);
+  if (M == 1) {
+    k_gemm_w4_q<<<N, 256, 256 * sizeof(float), s>>>(g->w4_a8, W->w, W->bs, g->w4_as, bias, C, N, K);
+    return;
+  }
+  /* M>8 时按 8 行一组走多趟（权重多读 M/8 遍）。组内一次读完，
+   * 代价可接受：0.625 B/参数下 32 并发也只有 4×16.25 GB ≈ 38 ms/步。*/
+  for (int m0 = 0; m0 < M; m0 += 8) {
+    int rem = M - m0;
+    const float *Asub = A + (size_t)m0 * K;
+    (void)Asub;
+    /* 激活用组起点偏移：kernel 内部按 i*K 取相对行 */
+    const int8_t *a8sub = g->w4_a8 + (size_t)m0 * K;
+    const float *assub = g->w4_as + m0;
+    float *Csub = C + (size_t)m0 * N;
+    int Ms = rem < 8 ? rem : 8;
+    switch (Ms) {
+      case 8: k_gemm_w4_mrow<8><<<N, 256, 8 * 8 * sizeof(float), s>>>(a8sub, W->w, W->bs, assub, bias, Csub, Ms, N, K); break;
+      case 7: k_gemm_w4_mrow<7><<<N, 256, 8 * 8 * sizeof(float), s>>>(a8sub, W->w, W->bs, assub, bias, Csub, Ms, N, K); break;
+      case 6: k_gemm_w4_mrow<6><<<N, 256, 8 * 8 * sizeof(float), s>>>(a8sub, W->w, W->bs, assub, bias, Csub, Ms, N, K); break;
+      case 5: k_gemm_w4_mrow<5><<<N, 256, 8 * 8 * sizeof(float), s>>>(a8sub, W->w, W->bs, assub, bias, Csub, Ms, N, K); break;
+      case 4: k_gemm_w4_mrow<4><<<N, 256, 8 * 8 * sizeof(float), s>>>(a8sub, W->w, W->bs, assub, bias, Csub, Ms, N, K); break;
+      case 3: k_gemm_w4_mrow<3><<<N, 256, 8 * 8 * sizeof(float), s>>>(a8sub, W->w, W->bs, assub, bias, Csub, Ms, N, K); break;
+      case 2: k_gemm_w4_mrow<2><<<N, 256, 8 * 8 * sizeof(float), s>>>(a8sub, W->w, W->bs, assub, bias, Csub, Ms, N, K); break;
+      default: k_gemm_w4_q<<<N, 256, 256 * sizeof(float), s>>>(a8sub, W->w, W->bs, assub, bias, Csub, N, K); break;
+    }
+  }
+}
+
 /* t8 projection dispatch: W8A8 for every M when int8 weights exist
  * (prefill included -- accuracy verified against fp32 greedy; fp32 originals
  * are NOT uploaded in W8 mode, that's where the VRAM saving comes from).
@@ -2178,6 +2477,10 @@ static void w8_free_layers(sgl_w8w *arr, int L) {
  * batch 1 (weight bandwidth bound, one row of activations). */
 #define PROJ(g, A, Wf, Wh, W8, bias, C, M, N, K)                                   \
   do {                                                                             \
+    if ((g)->use_w4 && (W8) && (W8)->w4) {                                         \
+      gemm_w4_launch((g), A, (const sgl_w4w *)(W8)->w4, bias, C, M, N, K);         \
+      break;                                                                       \
+    }                                                                              \
     if ((g)->use_w8 && (W8)) {                                                     \
       if ((M) > 1 && gemm_nt_w8_imma(g, A, W8, bias, C, M, N, K) == 0) break;      \
       if ((M) == 1 && (g)->w8_a8 && (g)->w8_as) {                                  \
@@ -2230,6 +2533,13 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
     const char *we = getenv("SGL_CUDA_W8");
     g->use_w8 = (we && atoi(we)) ? 1 : 0; /* t8: int8 projections (dp4a) */
     if (m->w8) g->use_w8 = 1;             /* t11：llama 流式已量化（SGL_W8）——直接 int8 上传 */
+    /* M1：SGL_W4=1 时权重改用 NVFP4（0.625 B/参数 vs int8 的 1.0），
+     * int8 副本不再上传。PROJ 通过 qw8[l].w4 转发到 FP4 kernel。*/
+    {
+      const char *w4e = getenv("SGL_W4");
+      g->use_w4 = (w4e && atoi(w4e)) ? 1 : 0;
+      if (g->use_w4) g->use_w8 = 1; /* 复用同一套槽位与 norms/biases 加载 */
+    }
     if (g->use_w8) g->use_fp16 = 1;       /* embed table fp16, projections int8 */
     g->emb_h = g->use_fp16; /* t11：embed/lm_head 存 fp16（w8 模式默认）*/
   }
@@ -2268,10 +2578,16 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
     /* tied embeddings: the half lm_head aliases the half embed table */
     if (tied) {
       g->lm_head_h = g->wte_h;
+    } else if (g->use_w4) {
+      /* M1：lm_head 每 token 全读，是第三大权重（2.54 GB fp16）。
+       * 换 FP4 后 0.795 GB，直接减少 1.75 GB 的每 token 带宽。*/
+      if (dev_copy_w4(m->lm_head.data, m->vocab, m->n_embd, &g->lm_head_w4) != 0) goto fail;
+      g->lm_head_h = NULL;
     } else {
       g->lm_head_h = dev_copy_h(m->lm_head.data, (size_t)m->vocab * m->n_embd);
     }
-    if (!g->wte_h || !g->final_norm || !g->lm_head_h) goto fail;
+    if (!g->wte_h || !g->final_norm) goto fail;
+    if (!g->use_w4 && !g->lm_head_h) goto fail;
   } else {
     CT("upload wte (fp32) V=%d E=%d n=%lld", m->vocab, m->n_embd,
        (long long)((size_t)m->vocab * m->n_embd));
@@ -2384,6 +2700,13 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
         w8_alloc_layers(&g->dw8, g->L))
       goto fail;
   }
+  if (g->use_w4) {
+    if (w4_alloc_layers(&g->qw4, g->L) || w4_alloc_layers(&g->kw4, g->L) ||
+        w4_alloc_layers(&g->vw4, g->L) || w4_alloc_layers(&g->ow4, g->L) ||
+        w4_alloc_layers(&g->gw4, g->L) || w4_alloc_layers(&g->uw4, g->L) ||
+        w4_alloc_layers(&g->dw4, g->L))
+      goto fail;
+  }
 
   for (int l = 0; l < g->L; l++) {
     const sgl_llama_layer *L = &m->layers[l];
@@ -2397,6 +2720,40 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
     if (g->use_w8) {
       /* t11：流式加载时 host 已是 int8（L->q8...），直传；否则 f32 现量化。
      * o 槽：lin=[E,vald]（out_proj）、full=[E,QD]。*/
+      if (g->use_w4) {
+        /* M1：直接 int8 → FP4，不必先上传 int8（显存只够一套）。
+         * 有 host int8 时用它，否则回退到 f32 现量化。*/
+        int rq, rk = 0, rv = 0, ro, rg, ru, rd;
+        if (L->q8 && L->sq8) rq = dev_copy_w4_from_i8(L->q8, L->sq8, qN, g->E, &g->qw4[l]);
+        else if (is_lin) rq = dev_copy_w4(L->lin_qkvz_w.data, qN, g->E, &g->qw4[l]);
+        else rq = dev_copy_w4(L->q_w.data, qN, g->E, &g->qw4[l]);
+        if (!is_lin) {
+          if (L->k8 && L->sk8) rk = dev_copy_w4_from_i8(L->k8, L->sk8, g->KD, g->E, &g->kw4[l]);
+          else rk = dev_copy_w4(L->k_w.data, g->KD, g->E, &g->kw4[l]);
+          if (L->v8 && L->sv8) rv = dev_copy_w4_from_i8(L->v8, L->sv8, g->KD, g->E, &g->vw4[l]);
+          else rv = dev_copy_w4(L->v_w.data, g->KD, g->E, &g->vw4[l]);
+          if (L->o8 && L->so8) ro = dev_copy_w4_from_i8(L->o8, L->so8, g->E, g->QD, &g->ow4[l]);
+          else ro = dev_copy_w4(L->o_w.data, g->E, g->QD, &g->ow4[l]);
+        } else {
+          if (L->o8 && L->so8) ro = dev_copy_w4_from_i8(L->o8, L->so8, g->E, lin_vald, &g->ow4[l]);
+          else ro = dev_copy_w4(L->lin_out_w.data, g->E, lin_vald, &g->ow4[l]);
+        }
+        if (L->g8 && L->sg8) rg = dev_copy_w4_from_i8(L->g8, L->sg8, g->I, g->E, &g->gw4[l]);
+        else rg = dev_copy_w4(L->gate_w.data, g->I, g->E, &g->gw4[l]);
+        if (L->u8 && L->su8) ru = dev_copy_w4_from_i8(L->u8, L->su8, g->I, g->E, &g->uw4[l]);
+        else ru = dev_copy_w4(L->up_w.data, g->I, g->E, &g->uw4[l]);
+        if (L->d8 && L->sd8) rd = dev_copy_w4_from_i8(L->d8, L->sd8, g->E, g->I, &g->dw4[l]);
+        else rd = dev_copy_w4(L->down_w.data, g->E, g->I, &g->dw4[l]);
+        if (rq || rk || rv || ro || rg || ru || rd) goto fail;
+        /* PROJ 靠这些指针转发到 FP4 kernel（int8 数据不上传）*/
+        g->qw8[l].w4 = &g->qw4[l];
+        g->kw8[l].w4 = is_lin ? NULL : &g->kw4[l];
+        g->vw8[l].w4 = is_lin ? NULL : &g->vw4[l];
+        g->ow8[l].w4 = &g->ow4[l];
+        g->gw8[l].w4 = &g->gw4[l];
+        g->uw8[l].w4 = &g->uw4[l];
+        g->dw8[l].w4 = &g->dw4[l];
+      } else {
       int rq = dev_copy_w8_i8(L->q8, L->sq8, qN, g->E, &g->qw8[l]);
       int rk = is_lin ? 0 : dev_copy_w8_i8(L->k8, L->sk8, g->KD, g->E, &g->kw8[l]);
       int rv = is_lin ? 0 : dev_copy_w8_i8(L->v8, L->sv8, g->KD, g->E, &g->vw8[l]);
@@ -2422,6 +2779,7 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
             dev_copy_w8(L->up_w.data, g->I, g->E, &g->uw8[l]) != 0 ||
             dev_copy_w8(L->down_w.data, g->E, g->I, &g->dw8[l]) != 0)
           goto fail;
+      }
       }
       /* norms and biases still fp32 */
       g->ln1[l] = dev_copy(L->inp_norm.data, (size_t)g->E);
@@ -2808,6 +3166,13 @@ void sgl_cuda_free(sgl_cuda_model *g) {
   w8_free_layers(g->qw8, g->L); w8_free_layers(g->kw8, g->L); w8_free_layers(g->vw8, g->L);
   w8_free_layers(g->ow8, g->L); w8_free_layers(g->gw8, g->L); w8_free_layers(g->uw8, g->L);
   w8_free_layers(g->dw8, g->L);
+  w4_free_layers(g->qw4, g->L); w4_free_layers(g->kw4, g->L); w4_free_layers(g->vw4, g->L);
+  w4_free_layers(g->ow4, g->L); w4_free_layers(g->gw4, g->L); w4_free_layers(g->uw4, g->L);
+  w4_free_layers(g->dw4, g->L);
+  if (g->lm_head_w4.w) cudaFree(g->lm_head_w4.w);
+  if (g->lm_head_w4.bs) cudaFree(g->lm_head_w4.bs);
+  if (g->w4_a8) cudaFree(g->w4_a8);
+  if (g->w4_as) cudaFree(g->w4_as);
   cudaFree(g->w8_a8); cudaFree(g->w8_c32); cudaFree(g->w8_as); /* G2 IMMA scratch */
   for (int l = 0; l < g->L; l++) {
     if (g->ln1 && g->ln1[l]) cudaFree(g->ln1[l]);
@@ -3017,8 +3382,7 @@ static int gpt2_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos
   CK(cudaGetLastError());
   if (logits_out) {
     if (sgl_cuda_ensure_lgb(g, 1) != 0) return -1;
-    gemm_nt_any(g, g->h + (long)(n - 1) * E, g->lm_head, g->lm_head_h, NULL,
-                g->d_lgb, 1, g->V, E);
+    lm_head_gemm(g, g->h + (long)(n - 1) * E, g->d_lgb, 1);
     CK(cudaGetLastError());
     CK(cudaMemcpyAsync(g->h_lgb, g->d_lgb, sizeof(float) * (size_t)g->V,
                        cudaMemcpyDeviceToHost, g->stream));
@@ -3434,8 +3798,7 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
       int rows = all_rows ? n : 1;
       const float *hbase = all_rows ? g->h : g->h + (long)(n - 1) * E;
       if (sgl_cuda_ensure_lgb(g, rows) != 0) return -1;
-      gemm_nt_any(g, hbase, g->lm_head, g->lm_head_h, NULL,
-                  g->d_lgb, rows, g->V, E);
+      lm_head_gemm(g, hbase, g->d_lgb, rows);
       CK(cudaGetLastError());
       CK(cudaMemcpyAsync(g->h_lgb, g->d_lgb, sizeof(float) * (size_t)rows * g->V,
                          cudaMemcpyDeviceToHost, g->stream));
@@ -3747,7 +4110,7 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
     k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->final_norm, g->h, B, E, g->eps);
   CK(cudaGetLastError());
   /* lm_head as ONE GEMM over all B rows (h rows are contiguous) */
-  gemm_nt_any(g, g->h, g->lm_head, g->lm_head_h, NULL, g->d_lgb, B, g->V, E);
+  lm_head_gemm(g, g->h, g->d_lgb, B);
   CK(cudaGetLastError());
   return 0;
 }
