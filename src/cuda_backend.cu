@@ -538,9 +538,9 @@ __global__ void k_rope_p(float *qk, int n, int head_dim, int heads_per_tok,
                          int pos0, const double *invf, int rot) {
   int half = rot / 2;
   long idx = blockIdx.x * (long)blockDim.x + threadIdx.x;
-  /* t11 fix：上界是 n*heads_per_tok*half。之前漏了 heads_per_tok，只旋转了前
-   * 1/H 个头——partial rope（rot<D）下 27B 输出退化成 "is is is" 的元凶。*/
-  if (idx >= (long)n * heads_per_tok * half) return;
+  /* n 是头行数（调用方传 tokens*H），与 k_rope 同约定；上界多乘 heads_per_tok 会让
+   * 末块的补齐线程旋转缓冲区之外的头（rows*H*half 不是 256 的倍数时越界）。*/
+  if (idx >= (long)n * half) return;
   long tok = idx / ((long)half * heads_per_tok);
   int i = idx % half;
   float *head = qk + (long)(idx / half) * head_dim;

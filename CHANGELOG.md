@@ -19,7 +19,10 @@
   无视 `ignore_eos`。
 - **M2 量化 KV 池（`SGL_KVQ=1`，默认关）一并入库**：之前未提交的工作，与 M3 在同一批改动里；
   262K 下 decode 仍远低于 M2 目标（在查）。
-- 已知：`SGL_PREFILL_CHUNK=1` 时 `k_rope_p` 越界读；`/v1/completions` 流式发 `delta.content` 而非 `text`。
+- **修 `k_rope_p` 越界**：上界多乘了 `heads_per_tok`，末块补齐线程旋转缓冲区外的头
+  （`rows*H*half` 非 256 倍数时；27B 的 k 头奇数行即触发，`SGL_PREFILL_CHUNK=1` 直接 illegal access）。
+- **`/v1/completions` 流式**改发 OpenAI `text_completion` 块（`choices[0].text`），不再是 chat 的
+  `delta.content`；排队中的流式请求也能收到 token（之前只收到结束块）。
 
 ## [Unreleased] — AWQ / GPTQ 权重：落盘位布局解包（2026-10-27 第五轮）
 

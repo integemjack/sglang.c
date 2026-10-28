@@ -100,9 +100,10 @@ int sgl_cuda_mtp_accept_test(sgl_cuda_model *m, const int *prompt, int np, int n
 
 /* ============ M3: 投机解码（草稿 → 一次验证 → 接受最长前缀）============
  * 只对贪心请求（temperature=0 / top_k=1）开：验证就是「argmax 是否相等」。
- * 验证是 M=W+1 的前向（IMMA GEMM + prefill attention），decode 是 M=1，舍入不同，
- * 所以输出只在近 tie 的 token（off 的 top-1 概率 0.3–0.55）处与不开投机分叉，
- * 不保证逐位一致。采样请求需拒绝采样才能保分布，走原路径。*/
+ * 验证走 fwd_seg_llama（k_lin_persist_reg、prefill attention），普通 decode 走
+ * decode_step_launch（k_lin_step_b、decode attention），归约顺序不同，所以输出只在
+ * 近 tie 的 token（off 的 top-1 概率 0.3–0.55）处与不开投机分叉，不保证逐位一致。
+ * 采样请求需拒绝采样才能保分布，走原路径。*/
 
 /* 分配逐行 GDN 状态快照（W+1 行），返回 0 成功。只对 lin kernel 的 path=2
  * （k_lin_persist_reg，默认路径）生效；其它路径上会静默关掉投机。*/

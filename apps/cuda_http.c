@@ -149,6 +149,7 @@ typedef struct request {
   int want_lp;
   int choices_done;    /* 1 = tool_calls 结束（finish_reason 用）*/
   int streaming;
+  int stream_text;     /* 1 = /v1/completions：SSE 块用 OpenAI text_completion 形状（choices[0].text）*/
   int n_streamed;
   int spec_ready;      /* M3: 已把 prefill 末位 hidden 存进 mtp.hlast，可开投机 */
   struct request *next_done;
@@ -1324,6 +1325,18 @@ static request *find_req(int id) {
   return NULL;
 }
 
+/* 一个 token 的 SSE 块：/v1/completions 用 text_completion 形状，chat 与 /generate 用 delta */
+static int sse_token_chunk(const request *r, const char *esc, char *chunk, size_t cap) {
+  if (r->stream_text)
+    return snprintf(chunk, cap,
+                    "data: {\"object\":\"text_completion\",\"choices\":[{\"index\":0,\"text\":\"%s\","
+                    "\"finish_reason\":null}]}\n\n",
+                    esc);
+  return snprintf(chunk, cap,
+                  "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+                  esc);
+}
+
 /* wait until request id reaches DONE/FAIL; optionally stream SSE meanwhile */
 static int wait_done(SOCKET fd, int id, char **text, request **out_r) {
   static int dbgw = -1;
@@ -1350,9 +1363,7 @@ static int wait_done(SOCKET fd, int id, char **text, request **out_r) {
           char esc[512];
           json_escape(piece ? piece : "", esc, sizeof(esc));
           char chunk[1024];
-          int n = snprintf(chunk, sizeof(chunk),
-                           "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
-                           esc);
+          int n = sse_token_chunk(r, esc, chunk, sizeof(chunk));
           LeaveCriticalSection(&E.lock);
           send_all(fd, chunk, n);
           EnterCriticalSection(&E.lock);
@@ -1375,9 +1386,7 @@ static int wait_done(SOCKET fd, int id, char **text, request **out_r) {
         char esc[512];
         json_escape(piece ? piece : "", esc, sizeof(esc));
         char chunk[1024];
-        int n = snprintf(chunk, sizeof(chunk),
-                         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
-                         esc);
+        int n = sse_token_chunk(r, esc, chunk, sizeof(chunk));
         LeaveCriticalSection(&E.lock);
         send_all(fd, chunk, n);
         EnterCriticalSection(&E.lock);
@@ -1615,10 +1624,13 @@ static int route(SOCKET fd, const http_req *req) {
 static int finish_request(SOCKET fd, int id, int is_stream, int chat, int openai) {
 
   if (is_stream) {
-    /* mark streaming then wait_done emits SSE chunks */
+    /* mark streaming then wait_done emits SSE chunks（find_req 也覆盖排队中的请求）*/
     EnterCriticalSection(&E.lock);
-    for (int i = 0; i < MAX_CONC; i++)
-      if (E.reqs[i] && E.reqs[i]->id == id) { E.reqs[i]->streaming = 1; break; }
+    request *sr = find_req(id);
+    if (sr) {
+      sr->streaming = 1;
+      sr->stream_text = openai && !chat;
+    }
     LeaveCriticalSection(&E.lock);
     const char *hdr =
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
@@ -1632,9 +1644,14 @@ static int finish_request(SOCKET fd, int id, int is_stream, int chat, int openai
       (void)esc;
       const char *fin = r ? (r->finish[0] ? r->finish : "stop") : "stop";
       char chunk[256];
-      int n = snprintf(chunk, sizeof(chunk),
-                       "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\ndata: [DONE]\n\n",
-                       fin);
+      int n = (r && r->stream_text)
+                  ? snprintf(chunk, sizeof(chunk),
+                             "data: {\"object\":\"text_completion\",\"choices\":[{\"index\":0,\"text\":\"\","
+                             "\"finish_reason\":\"%s\"}]}\n\ndata: [DONE]\n\n",
+                             fin)
+                  : snprintf(chunk, sizeof(chunk),
+                             "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\ndata: [DONE]\n\n",
+                             fin);
       send_all(fd, chunk, n);
       free(text);
     }

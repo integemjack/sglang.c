@@ -1085,14 +1085,20 @@ GDN kernel 直接读了 `in_proj_ba` **权重**的前 2·nh 个数 —— 门控
   都是近 tie（中文那处测得 0.82，但流式逐 token 拆字有 2 处对不齐，映射不可靠）。
 - **强制错误草稿与正常投机在完全相同的 token 处分叉**：草稿、k 序列都不同，分叉点不变，
   说明回滚是对的，分叉来自确定性的数值差异。
-- 数值来源：verify 走 M=W+1（IMMA GEMM + prefill attention + 多行 lm_head），decode 走 M=1
-  （`w8a8_q` GEMM + decode attention），舍入不同。要逐位一致需要批不变的 verify 路径，
-  代价可能吃掉部分加速，所以验收标准放宽为「只在近 tie 处分叉」。
+- 数值来源**不是**行数：off 用 `SGL_PREFILL_CHUNK=1` 与 `=64`（同一个 `fwd_seg_llama`，prompt
+  逐行 vs 整块，GEMM 分别走 `w8a8_q` 与 IMMA）4 个 prompt × 200 token 输出逐字相同。不同的是
+  **两个前向函数**：verify 走 `fwd_seg_llama`（GDN `k_lin_persist_reg`、prefill attention），普通 decode
+  走 `decode_step_launch`（`k_lin_step_b`、decode attention），两边的归约顺序不同。要逐位一致需要让
+  verify 与 decode 共用同一套 kernel，代价可能吃掉部分加速，所以验收标准放宽为「只在近 tie 处分叉」。
 
-### 17.4 已知的旁路问题
+### 17.4 验收时顺带修掉的旁路问题
 
-- `SGL_PREFILL_CHUNK=1`（ws rows=1）时 `k_rope_p` 越界读（compute-sanitizer 定位，默认配置不触发）。
-- `/v1/completions` 流式发的是 chat 式 `delta.content`，不是 OpenAI 的 `text`。
+- `k_rope_p` 上界多乘了 `heads_per_tok`（调用方传的 n 已是头行数），末块补齐线程会旋转缓冲区之外的头：
+  `rows*H*half` 不是 256 的倍数时越界（27B 的 k 头 HK=4、half=32，奇数行即触发；`SGL_PREFILL_CHUNK=1`
+  时直接 illegal access）。修后 memcheck 在 chunk=1/3 下零报错。
+- `/v1/completions` 流式改发 OpenAI `text_completion` 块（`choices[0].text`），之前发的是 chat 的
+  `delta.content`（按 `text` 读的客户端，如 `.speed.sh`，拿到的全是空串）。chat 与 `/generate` 不变。
+  排队中的请求也会被标成流式（之前只标在跑的槽，排队请求只收到结束块）。
 
 ---
 
