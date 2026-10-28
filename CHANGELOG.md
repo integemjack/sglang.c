@@ -2,6 +2,25 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — Qwen3.8 GPU：GDN 门控修复 + M3 MTP 投机解码（2026-10-29）
+
+详细数据见 [docs/DESIGN_1M_32C.md](docs/DESIGN_1M_32C.md) §17。
+
+- **修 GPU GDN 门控（影响所有 qwen3_5 / Qwen3-Next 的 GPU 输出）**：四个 GDN kernel 把
+  `in_proj_ba` 权重的前 2·nh 个数当成门控输入，β/α 与输入无关。新增 `k_lin_ba` 逐行算
+  `h·W_ba^T`（`l_ba_all [ws_cap][2*nh]`，归约顺序与 M 无关）。Qwen3.8-27B 上 off 输出全部改变、
+  质量变好；decode 35.5 tok/s 不变。`SGL_LLAMA_DBG=N` 让 CPU 逐层打印，与 GPU 的 `SGL_CUDA_DBG` 对拍。
+- **M3 投机解码接进 GPU 服务**（`SGL_SPEC_W=4`，只对单请求贪心）：MTP 链式草稿 → 一次 W+1 行
+  verify → 最长前缀 → GDN 逐行快照回滚。默认 `SGL_MTP_CHAIN=post`。27B 单流 decode
+  **52–81 tok/s（off 35.5，1.5–2.3x）**，2.83 token/步。输出只在近 tie token 处与 off 分叉
+  （verify 与 decode 舍入不同，不保证逐位一致）；强制错误草稿（`SGL_SPEC_CORRUPT=1`）与正常投机
+  分叉点相同，回滚正确。`SGL_SPEC_STATS=1` 逐步打印 k。
+- 投机路径的两个 bug：一步收 k+1 个 token 时不看 `max_tokens` 余量（越过定长 `gen[]`）、
+  无视 `ignore_eos`。
+- **M2 量化 KV 池（`SGL_KVQ=1`，默认关）一并入库**：之前未提交的工作，与 M3 在同一批改动里；
+  262K 下 decode 仍远低于 M2 目标（在查）。
+- 已知：`SGL_PREFILL_CHUNK=1` 时 `k_rope_p` 越界读；`/v1/completions` 流式发 `delta.content` 而非 `text`。
+
 ## [Unreleased] — AWQ / GPTQ 权重：落盘位布局解包（2026-10-27 第五轮）
 
 接上一轮的 GGUF，把 P0-1 的另一半（AWQ / GPTQ）做完。至此市面上主流的三种量化权重

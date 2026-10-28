@@ -150,6 +150,7 @@ typedef struct request {
   int choices_done;    /* 1 = tool_calls 结束（finish_reason 用）*/
   int streaming;
   int n_streamed;
+  int spec_ready;      /* M3: 已把 prefill 末位 hidden 存进 mtp.hlast，可开投机 */
   struct request *next_done;
   struct request *next_q; /* t5: wait-queue link */
 } request;
@@ -495,6 +496,8 @@ static char *decode_gen(request *r) {
 
 /* ---------------- worker: prefill + batched decode ---------------- */
 
+static int spec_try_step(request *r, int W); /* M3，定义在 worker 之后 */
+
 SGL_THREAD_SIG(worker) {
   (void)arg;
   float *batch_logits = (float *)malloc(sizeof(float) * (size_t)MAX_CONC * E.vocab);
@@ -721,6 +724,28 @@ SGL_THREAD_SIG(worker) {
         nb++;
       }
       if (nb > 0) {
+        /* M3：单请求 + 贪心 → 投机解码。其它情况走原路（批量/采样都不受影响）。*/
+        int did_spec = 0;
+        {
+          static int spec_on = -1, spec_W = 0;
+          if (spec_on < 0) {
+            const char *sw = getenv("SGL_SPEC_W");
+            spec_W = sw ? atoi(sw) : 0;
+            spec_on = 0;
+            if (spec_W > 0 && spec_W <= 8) {
+              if (sgl_cuda_spec_begin(E.gpu, spec_W) == 0) spec_on = 1;
+              else { fprintf(stderr, "[spec] snapshot alloc failed -> spec off\n"); spec_W = 0; }
+            } else spec_W = 0;
+            if (spec_W > 0) fprintf(stderr, "[spec] W=%d chain=%s\n", spec_W,
+                                    getenv("SGL_MTP_CHAIN") ? getenv("SGL_MTP_CHAIN") : "post");
+          }
+          request *r0 = br[0];
+          if (spec_on && nb == 1 && sgl_cuda_mtp_ready(E.gpu) &&
+              r0->sp.temperature <= 0.0f && r0->sp.top_k <= 1 && !r0->gram &&
+              !r0->want_lp && r0->n_gen > 0)
+            did_spec = spec_try_step(r0, spec_W);
+        }
+        if (!did_spec) {
         sgl_cuda_set_decode_slots(E.gpu, bs, nb);
         if (getenv("SGL_HTTP_DBG")) {
           fprintf(stderr, "[dec] nb=%d", nb);
@@ -757,6 +782,7 @@ SGL_THREAD_SIG(worker) {
             br[b]->has_logits = 1;
           }
         }
+        } /* !did_spec */
       }
       WakeAllConditionVariable(&E.cv_step);
     } else if (any) {
@@ -786,6 +812,87 @@ SGL_THREAD_SIG(worker) {
 typedef struct { char *body; size_t body_len; char method[8]; char path[128]; } http_req;
 
 static int trace_on(void); /* G17 诊断开关（定义在 conn_thread 上方）*/
+
+/* M3：一次投机迭代。调用时机 = 普通 decode 前向的位置（2b）。
+ *
+ * 约定与普通路径完全一致，只是把「一次前向出 1 个 token」变成「一次前向出
+ * k+1 个」：
+ *   - 进入时 r->gen 末位是已经采样好的 t0，r->logits 是 t0 之后的预测；
+ *   - 草稿 d1..dW 由 MTP 链式拟出；（hidden 取最后一个落定位置）
+ *   - 一次 verify 前向（n=W+1 行，带因果掩码）拿到每行 logits；
+ *   - 取最长匹配前缀 k，追加 d1..dk，把 GDN 状态回滚到 k+1 行；
+ *   - r->logits 换成第 k 行（= 最后一个落定位置之后的预测），下一轮继续。
+ *
+ * 返回 1 = 已推进（调用方跳过普通 decode）；0 = 没做（降级到原路）。*/
+static int spec_try_step(request *r, int W) {
+  static float *rows = NULL;
+  static int rows_cap = 0;
+  int i, k = 0, nd, room, pos, stop_at = -1;
+  int drafts[16], toks[16];
+  if (!r || r->n_gen <= 0 || !r->logits) return 0;
+  if (!r->spec_ready) {
+    if (sgl_cuda_mtp_set_hidden(E.gpu, -1) != 0) return 0;
+    r->spec_ready = 1;
+  }
+  pos = r->n_prompt + r->n_img + r->n_gen - 1; /* 最后一个已落定 token 的位置 */
+  room = r->seg_len - pos - 1;                 /* 还能写几个位置 */
+  if (room < 1) return 0;
+  if (W > room - 1) W = room - 1;
+  /* 草稿全收后 n_gen 不能超过 max_new（gen[] 是定长数组；普通路径到 max_new 即停）*/
+  if (W > r->max_new - r->n_gen) W = r->max_new - r->n_gen;
+  if (W > 15) W = 15;
+  if (W < 1) return 0;
+  if (rows_cap < (W + 1) * E.vocab) {
+    float *nr = (float *)realloc(rows, sizeof(float) * (size_t)(W + 1) * E.vocab);
+    if (!nr) return 0;
+    rows = nr;
+    rows_cap = (W + 1) * E.vocab;
+  }
+  toks[0] = r->gen[r->n_gen - 1];
+  nd = sgl_cuda_mtp_drafts(E.gpu, toks[0], pos, W, drafts);
+  if (nd < 1) return 0;
+  /* 验收用：SGL_SPEC_CORRUPT=1 每步把第 (step % nd) 个草稿改坏，逼出各个 k 上的
+   * 拒绝 + 回滚；与正常投机应在相同 token 处（off 的近 tie 处）与 off 分叉。SGL_SPEC_STATS=1 逐步打印 k。*/
+  static int spec_corrupt = -1, spec_stats = -1;
+  static long spec_steps = 0, spec_toks = 0;
+  if (spec_corrupt < 0) {
+    spec_corrupt = getenv("SGL_SPEC_CORRUPT") ? atoi(getenv("SGL_SPEC_CORRUPT")) : 0;
+    spec_stats = getenv("SGL_SPEC_STATS") ? atoi(getenv("SGL_SPEC_STATS")) : 0;
+  }
+  if (spec_corrupt) {
+    int c = (int)(spec_steps % nd);
+    drafts[c] = (drafts[c] + 1) % E.vocab;
+  }
+  for (i = 0; i < nd; i++) toks[i + 1] = drafts[i];
+  if (sgl_cuda_spec_verify(E.gpu, toks, nd + 1, pos, r->seg * E.seg_len, rows, &k) != 0)
+    return 0;
+  if (k > nd) k = nd;
+  /* 停词：出现在第 i 个草稿就只收前 i 个（与普通路径一致，EOS 本身不入 gen）*/
+  for (i = 0; i < k; i++) {
+    if ((drafts[i] == E.eos && !r->sp.ignore_eos) || sgl_sampling_is_stop(&r->sp, drafts[i])) {
+      stop_at = i;
+      break;
+    }
+  }
+  if (stop_at >= 0) k = stop_at;
+  if (sgl_cuda_spec_commit(E.gpu, r->seg, k) != 0) return 0;
+  spec_steps++;
+  spec_toks += k + 1;
+  if (spec_stats)
+    fprintf(stderr, "[spec] step=%ld pos=%d nd=%d k=%d tok/step=%.3f\n", spec_steps, pos, nd, k,
+            (double)spec_toks / (double)spec_steps);
+  for (i = 0; i < k; i++) r->gen[r->n_gen++] = drafts[i];
+  memcpy(r->logits, rows + (size_t)k * E.vocab, sizeof(float) * E.vocab);
+  r->has_logits = 1;
+  E.tot_decode += (long)(k + 1);
+  if (stop_at >= 0) {
+    r->state = R_DONE;
+    strcpy_s(r->finish, sizeof(r->finish), "stop");
+    r->text_out = decode_gen(r);
+    E.tot_finished++;
+  }
+  return 1;
+}
 
 static int read_request(SOCKET fd, http_req *req) {
   size_t cap = 8192, len = 0;
@@ -1677,7 +1784,11 @@ int sgl_cuda_http_serve(const char *dir, int port, const char *host) {
    * （实测 8K prefill 2.8s → 10.4s），所以预检留 192MB 余量。 */
   {
     const char *ce = getenv("SGL_CUDA_CTX");
-    int cap = (ce && atoi(ce) > 0) ? atoi(ce) : 16384;
+    /* M2：量化 KV 下 17 KiB/token，16384 这个旧上限（为 FP32 KV 设的）没意义了 */
+    const char *kqe0 = getenv("SGL_KVQ");
+    int kvq_on0 = (kqe0 && atoi(kqe0)) ? 1 : 0;
+    int cap = ce ? atoi(ce) : (kvq_on0 ? (1 << 23) : 16384);
+    if (cap <= 0) cap = 1 << 23;
     int want = E.cpu->n_ctx < cap ? E.cpu->n_ctx : cap;
     const char *ec = getenv("SGL_HTTP_CONC");
     int conc = ACTIVE_CONC;

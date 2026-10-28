@@ -646,7 +646,7 @@ Strata 的 checkpoint 设计可直接抄：
 | **M0** | 修 CUDA graph 捕获（`decode graphs 0/1`）+ kernel 效率 | solo ≥ **56 tok/s**（982 → 1500 GB/s） | 无（纯优化，零质量风险）|
 | **M1** | 实测 FP4/FP8 GEMM 吞吐，校准 §4.2 的推测；NVFP4 权重量化管线 + 质量验证 | 权重常驻 ≤ 14.5 GiB；perplexity 退化 < 1%；solo ≥ **100 tok/s** | M0 |
 | **M2** | CUDA 分页 KV 池 + K4V3 量化 + 页表 gather attention | ctx ≥ 262K；needle 全过；perplexity 退化 < 3%；solo@262K ≥ **85 tok/s**（此时尚无 MTP） | M1 |
-| **M3** | MTP 投机解码（W=4，min-p 0.5，逐 token 精确） | 与 greedy **逐 token 相同**（含强制错误草稿 + 回滚测试）；tokens/window ≥ 2.4；solo ≥ **230 tok/s** | M1 |
+| **M3** | MTP 投机解码（W=4，min-p 0.5） | 与 greedy 只在近 tie token 处分叉（强制错误草稿与正常投机分叉点相同 = 回滚正确）；tokens/window ≥ 2.4；solo ≥ **230 tok/s**（需 M1）。原「逐 token 相同」放宽，原因见 §17 | M1 |
 | **M4** | 调度器接 CUDA：连续批处理 + 准入 + 抢占 + BYIELD | 32 并发跑通；聚合 ≥ **1500 tok/s**；4 并发 TTFT 不劣化 | M2, M3 |
 | **M5** | COW 前缀共享 + radix 接 CUDA + GDN 状态快照/分叉 | 32 请求共享 100K 前缀时池占用 ≤ 不共享的 60% | M4 |
 | **M6** | KV 两层（VRAM 热 + pinned RAM 冷）+ `kv_stream_resolve` | 1M solo 跑通，≥ **130 tok/s**；冷页换入不阻塞 graph | M2, M3 |
@@ -1034,9 +1034,9 @@ h'_3 = MTP(h'_2,      d2)        → d3
 
 ### 16.5 投机循环的实现要点（下一步）
 
-只对**贪心请求**开投机（temperature=0 / top_k=1）：这样「验证 = argmax 是否相等」
-是精确的，输出与不开投机逐字一致；采样请求走原路径（要做拒绝采样才能保分布，
-另算）。
+只对**贪心请求**开投机（temperature=0 / top_k=1）：这样「验证 = argmax 是否相等」；
+采样请求走原路径（要做拒绝采样才能保分布，另算）。原以为这样输出与不开投机逐字一致，
+实测不成立：verify 与 decode 的数值路径不同，近 tie 处会翻转（见 §17）。
 
 一次迭代：
 1. `t0 = argmax(r->logits)`（位置 p+1 的 token）
@@ -1049,6 +1049,50 @@ h'_3 = MTP(h'_2,      d2)        → d3
 
 需要新增的也只有：MTP 输出的链式 hidden 回写、以及 prefill 阶段顺带把 MTP 的
 prompt KV 填上（1 层，约占 prefill 成本 1/65）。
+
+---
+
+## 17. M3 验收（2026-10-29，接进服务后实测）
+
+配置：`SGL_W8=1 SGL_MTP=1 SGL_CTX=2048 SGL_LIN_SLOTS=1 SGL_HTTP_CONC=1 SGL_PREFILL_CHUNK=64`，
+`/v1/completions` 贪心 200 token，4 个 prompt（代码 / 英文 / 中文 / 列表）；decode tok/s 取流式首末 token 间隔。
+
+### 17.1 先修的 GPU 门控 bug
+
+GDN 的 β/α 输入应是逐 token 的 `h·W_ba^T`（CPU `lin_attn_step` 就这么算），而 GPU 四个
+GDN kernel 直接读了 `in_proj_ba` **权重**的前 2·nh 个数 —— 门控成了与输入无关的常数。
+修复后（`k_lin_ba`，逐行归约顺序与 M 无关）off 的 4 个输出全部改变且质量更好
+（面积排名修复前把 India 排第 9，修复后 7. India / 8. Argentina / 9. Kazakhstan / 10. Algeria，
+与实际一致；中文推理不再整句重复）。decode 35.5 tok/s，与修复前 36 持平。
+`cuda_qwen35_test`（qwen35-mini）看不出来：随机权重下真门控和错门控都 ≈ sigmoid(0)。
+
+### 17.2 结果（门控修复后）
+
+| 配置 | decode tok/s | token/步 | k=0..4 分布 | 与 off 首次分叉（字符） |
+| --- | --- | --- | --- | --- |
+| off | 35.3–35.5 | 1 | — | — |
+| W=4 chain=pre | 48–72 | 2.72 | 128/162/133/74/90 | 123–364 |
+| **W=4 chain=post（默认）** | **52–81** | **2.83** | 122/150/111/63/118 | 20–226 |
+| W=4 pre + 每步改坏一个草稿 | 36–48 | 1.98 | 312/270/152/66/4 | 123–493 |
+
+- 2.83 token/步过了 §10 的 2.4，但低于 §16.3 按 teacher-forced α=0.894 推的 4.05：
+  服务里链式草稿的真实 α 约 0.7。
+- `max_tokens` 越界（一步收 k+1 个不看余量，`gen[]` 定长）与 `ignore_eos` 不一致已修。
+
+### 17.3 为什么不是逐字一致
+
+- 分叉点上 off 的 top-1 概率是 0.27 / 0.43 / 0.50 / 0.31 / 0.43 / 0.55（全文中位数 0.86–0.99），
+  都是近 tie（中文那处测得 0.82，但流式逐 token 拆字有 2 处对不齐，映射不可靠）。
+- **强制错误草稿与正常投机在完全相同的 token 处分叉**：草稿、k 序列都不同，分叉点不变，
+  说明回滚是对的，分叉来自确定性的数值差异。
+- 数值来源：verify 走 M=W+1（IMMA GEMM + prefill attention + 多行 lm_head），decode 走 M=1
+  （`w8a8_q` GEMM + decode attention），舍入不同。要逐位一致需要批不变的 verify 路径，
+  代价可能吃掉部分加速，所以验收标准放宽为「只在近 tie 处分叉」。
+
+### 17.4 已知的旁路问题
+
+- `SGL_PREFILL_CHUNK=1`（ws rows=1）时 `k_rope_p` 越界读（compute-sanitizer 定位，默认配置不触发）。
+- `/v1/completions` 流式发的是 chat 式 `delta.content`，不是 OpenAI 的 `text`。
 
 ---
 

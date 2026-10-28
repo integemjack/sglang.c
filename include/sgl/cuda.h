@@ -97,6 +97,37 @@ int sgl_cuda_mtp_draft(sgl_cuda_model *m, int token, int pos, const float *hidde
  * 结果写进 *acc（接受率）与 *n_ok（命中数）。返回 0 成功。 */
 int sgl_cuda_mtp_accept_test(sgl_cuda_model *m, const int *prompt, int np, int ngen,
                              double *acc, int *n_ok);
+
+/* ============ M3: 投机解码（草稿 → 一次验证 → 接受最长前缀）============
+ * 只对贪心请求（temperature=0 / top_k=1）开：验证就是「argmax 是否相等」。
+ * 验证是 M=W+1 的前向（IMMA GEMM + prefill attention），decode 是 M=1，舍入不同，
+ * 所以输出只在近 tie 的 token（off 的 top-1 概率 0.3–0.55）处与不开投机分叉，
+ * 不保证逐位一致。采样请求需拒绝采样才能保分布，走原路径。*/
+
+/* 分配逐行 GDN 状态快照（W+1 行），返回 0 成功。只对 lin kernel 的 path=2
+ * （k_lin_persist_reg，默认路径）生效；其它路径上会静默关掉投机。*/
+int sgl_cuda_spec_begin(sgl_cuda_model *m, int W);
+
+/* 把上一次前向的第 row 行（row<0 = 末行）hidden 存成草稿输入。
+ * prefill → 第一次投机之间用一次。*/
+int sgl_cuda_mtp_set_hidden(sgl_cuda_model *m, int row);
+
+/* 链式草稿：从位置 pos 开始草拟 W 个 token，写进 out[0..W-1]。
+ * 第 i 步用上一步的输出 hidden（MTP 自己的，不是主模型的）——因为主模型对
+ * 尚未存在的 token 没有 hidden。返回实际生成的个数（<= W）。*/
+int sgl_cuda_mtp_drafts(sgl_cuda_model *m, int t0, int pos, int W, int *out);
+
+/* 一次验证：对 toks[0..n-1]（= [t0, 草稿...]）在 pos0 处做带因果掩码的前向，
+ * 每行一份 logits（host，[n][V]），同时开启逐行状态快照。
+ * 回写 *k_out = 最长匹配前缀长度（第 j 行的 argmax == toks[j+1] 则 j 计入）。*/
+int sgl_cuda_spec_verify(sgl_cuda_model *m, const int *toks, int n, int pos0, int kv_base,
+                         float *logits_rows, int *k_out);
+
+/* 提交：把第 slot 槽的 GDN 状态回滚到「处理完 k+1 行」（k 个草稿被接受），
+ * 并把「最后落定位置的 hidden」存成下一步草稿的输入。返回 0 成功。*/
+int sgl_cuda_spec_commit(sgl_cuda_model *m, int slot, int k);
+
+/* 最后一行的 logits（commit 后预测下一个 token 用）*/
 /* G5: 当前可用显存（cudaMemGetInfo 的 free，MB）；失败返回 -1 */
 long sgl_cuda_avail_vram_mb(void);
 

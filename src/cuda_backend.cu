@@ -78,7 +78,67 @@ typedef struct {
   int hsrc;                   /* 0 = final-norm 之前, 1 = 之后（用接受率裁决）*/
   int *d_tok;                 /* [1] 草稿输入 token */
   int *d_arg;                 /* [1] device argmax 结果 */
+  /* 链式草稿（W>1）：本层输出 hidden 给下一步当输入。只分配 E 大小的两个副本。*/
+  float *chain_pre, *chain_post;
+  int chain_use_post;         /* SGL_MTP_CHAIN=post 时用 chain_post */
+  float *hlast;               /* [E] 「最后一个已落定位置」的 hidden（草稿输入）*/
 } sgl_mtp;
+
+/* ================= M3: 投机解码的 GDN 状态快照 =================
+ * 拒绝部分草稿时，KDN 递归状态已经多推进了几行，必须回滚到「第 k 行处理完」
+ * 的精确状态。状态在寄存器里（k_lin_persist_reg 的 st[CH]），kernel 只在结尾
+ * 写回全局，所以逐行快照只能写在 kernel 的行循环里。
+ * 内存：每行 = 全部 lin 层的 state+hist；W=4 时 5 行，约 720 MiB（只对 1 个槽）。*/
+typedef struct {
+  int rows;                   /* = W+1 */
+  float *S;                   /* [rows][lin_n][nh][kd][vd] */
+  float *H;                   /* [rows][lin_n][convd][K-1] */
+  long s_layer;               /* 单层 state 的 float 数 */
+  long h_layer;               /* 单层 hist 的 float 数 */
+} sgl_specsnap;
+
+/* ================= M2/M6：量化分页 KV =================
+ * 为什么必须量化：16 层 full-attn 的 KV 在 FP32 下每 token 128 KiB，
+ * 262K 上下文每 token 要读 137 GB（24 个 q head 各读一遍同一个 kv head），
+ * 1690 GB/s 也要 81 ms——比 27 GB 权重读取贵 5 倍。4-bit 后降到 17 GB。
+ *
+ * 布局（每 token 每层 tok_stride 字节）：
+ *   [0, nvals/2)                K 的 int4 nibble（低半字节 = 偶数 d）
+ *   [nvals/2, nvals)            V 的 int4
+ *   [nvals, nvals+nblk*4)       K 的 scale（每 SGL_KVQ_BLK 个值一个 float）
+ *   [nvals+nblk*4, ...)         V 的 scale
+ * 其中 nvals = HK*D = 1024，nblk = nvals/128 = 8 → tok_stride = 1088 B，
+ * 16 层 = 17.0 KiB/token（FP32 是 128 KiB，降 7.5 倍）。
+ *
+ * 分页：页 = SGL_KVQ_P(64) 个位置。物理池 [nkv][n_slots][P][tok_stride]，
+ * 页表 pt[page] = slot 或 -1。M2 阶段 n_slots = n_pages（页表恒等、全驻留）；
+ * M6 阶段 n_slots < n_pages，冷页的权威副本在 pinned host，靠 resolve 换入。*/
+#define SGL_KVQ_P 64
+#define SGL_KVQ_BLK 128
+typedef struct {
+  int on;                 /* 1 = 量化分页路径启用 */
+  int nkv;                /* KV 层数 */
+  int P;                  /* 页大小（token）*/
+  int n_pages;            /* 页表长度 = ceil(ctx/P) */
+  int n_slots;            /* 物理槽数；= n_pages 即全驻留 */
+  int HK, D, nvals, nblk;
+  long tok_stride;        /* 每 token 每层字节 */
+  long slot_layer;        /* 每 slot 每层字节 = P*tok_stride */
+  long layer_slots;       /* 每层全部 slot 字节 */
+  unsigned char *d_pool;  /* [nkv][n_slots][P][tok_stride] */
+  int *d_pt;              /* [n_pages] page -> slot / -1 */
+  int *h_pt;              /* host 镜像（resolve 决策用）*/
+  unsigned char *h_pool;  /* [nkv][n_pages][P][tok_stride] pinned 权威副本（M6）*/
+  int host_slots;         /* 1 = h_pool 已分配 */
+  unsigned *d_clock;      /* [n_pages] CLOCK 参考位（M6）*/
+  float *d_split;         /* [Bmax*H*nsplit][2+D] split-KV 部分和 */
+  int split_cap;          /* 已分配条目数 */
+  int nsplit;             /* 每 (b,h) 切几段 */
+} sgl_kvq;
+
+/* 定义在 M2/M6 区段，但 KV 分配处（更早）要用 */
+static int kvq_init(sgl_cuda_model *g, long ctx, int nkv, int HK, int D, int host_resident,
+                    int n_slots_want);
 /* M1: NVFP4 风格的 4-bit 权重。数据 2 个值/字节（e2m1），缩放按 16 元素一块
  * 存 fp16。相对 int8 的 1 字节/参数，这里是 0.5 + 2/16 = 0.625 字节/参数
  * （1.6× 减容）；e2m1 只有 16 个电平，必须靠小块缩放才能保住精度。*/
@@ -207,6 +267,10 @@ struct sgl_cuda_model {
   float *w8_as;    /* [ws_cap] per-row activation scales */
 
   sgl_mtp mtp;     /* M3: MTP 草稿头（mtp.ok=0 时全部跳过）*/
+  sgl_specsnap snap; /* M3: 投机解码的逐行状态快照（spec_on=0 时全空）*/
+  sgl_kvq kvq;       /* M2/M6: 量化分页 KV（kvq.on=0 时全部跳过）*/
+  int spec_on;       /* 1 = 正在跑投机验证，lin kernel 要逐行快照 */
+  int last_rows;     /* 上一次前向写了几行激活（prefill 末位 hidden 靠它定位）*/
   void *st;        /* llama 模型的 safetensors 上下文（MTP 加载用，不拥有）*/
 };
 
@@ -1003,7 +1067,7 @@ __global__ __launch_bounds__(512) void k_lin_persist_reg(
     const float *qkvz_all, const float *cw, float *hist, float *S,
     const float *ba, const float *alog, const float *dtb, const float *nw,
     float *o_all, int n, int nk, int nh, int K, int ratio, int gw, float eps,
-    long soff, long hoff) {
+    long soff, long hoff, float *snapS, float *snapH, long snapS_rs, long snapH_rs) {
   const int G = 4;         /* i 方向分组数 */
   const int CH = KD / G;   /* 每组负责的 i 个数 */
   const int NW = KD / 32;  /* 归约参与的 warp 数 */
@@ -1149,9 +1213,24 @@ __global__ __launch_bounds__(512) void k_lin_persist_reg(
           ov[tid] * inv * nw[tid] * (z / (1.0f + __expf(-z)));
     }
     __syncthreads();
+    /* M3：逐行快照（只在本行处理完之后写）。snapS 指向本层的区段、行步长
+     * snapS_rs，所以 snapS + t*snapS_rs 就是「第 t 行处理完后」的状态。
+     * 拒绝部分草稿时靠它把状态回滚到精确的 k 行。*/
+    if (snapS) {
+      long so2 = (long)t * snapS_rs + sbase;
+#pragma unroll
+      for (int k = 0; k < CH; k++) snapS[so2 + (long)col * KD + (i0 + k)] = st[k];
+      long ho2 = (long)t * snapH_rs;
+      if (tid < KD)
+        for (int j = 0; j < K - 1; j++) {
+          snapH[ho2 + (long)(g * KD + tid) * (K - 1) + j] = hq[(long)j * KD + tid];
+          snapH[ho2 + (long)(keyd + g * KD + tid) * (K - 1) + j] = hk[(long)j * KD + tid];
+        }
+      if (tid >= KD && tid < KD + VD)
+        for (int j = 0; j < K - 1; j++)
+          snapH[ho2 + (long)(2 * keyd + h * VD + col) * (K - 1) + j] = hv[(long)j * VD + col];
+    }
   }
-
-  /* 状态 / 历史 写回 */
 #pragma unroll
   for (int k = 0; k < CH; k++) S[soff + sbase + (long)col * KD + (i0 + k)] = st[k];
   if (tid < KD)
@@ -1164,6 +1243,318 @@ __global__ __launch_bounds__(512) void k_lin_persist_reg(
       hist[hoff + (long)(2 * keyd + h * VD + col) * (K - 1) + j] = hv[(long)j * VD + col];
 }
 
+
+/* ================= M2/M6：量化 KV 的存取 kernel ================= */
+
+/* 把一个量化块（SGL_KVQ_BLK 个值）的 amax 归约出来（block 内 128 线程）*/
+__device__ __forceinline__ float kvq_amax(float v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+  __shared__ float sm[4];
+  int w = threadIdx.x >> 5;
+  if ((threadIdx.x & 31) == 0) sm[w] = v;
+  __syncthreads();
+  v = sm[0];
+  if (w == 0) {
+    float t = (threadIdx.x < 4) ? sm[threadIdx.x] : 0.0f;
+#pragma unroll
+    for (int off = 2; off > 0; off >>= 1) t = fmaxf(t, __shfl_xor_sync(0xffffffffu, t, off));
+    sm[threadIdx.x] = t;
+  }
+  __syncthreads();
+  return sm[0];
+}
+
+/* 写入：把 [n][HK*D] 的 k/v（已做完 qk-norm + rope）量化进分页池。
+ * grid = n * (2 * nvals/128)，block = 128 线程；一个 block 处理一个量化块。
+ * bpos<0：用 pos = base[t] + lens[t]（decode 批量清晰路径）。
+ * slot<0（页未驻留）时直接跳过：权威副本在 host（M6 写侧另写）。*/
+__global__ void k_kvq_write(unsigned char *pool, const int *pt, const float *k, const float *v,
+                            int n, int pos0, int kv_base, int HK, int D, int P,
+                            long slot_layer, long layer_slots, long tok_stride,
+                            const int *base, const int *lens) {
+  int bpb = 2 * ((HK * D) / SGL_KVQ_BLK); /* 每 token 的量化块数 */
+  int blk = blockIdx.x;
+  int t = blk / bpb, sub = blk % bpb;
+  int isv = sub / ((HK * D) / SGL_KVQ_BLK);
+  int qb = sub % ((HK * D) / SGL_KVQ_BLK);
+  int nvals = HK * D;
+  int pos = base ? (base[t] + lens[t]) : (kv_base + pos0 + t);
+  int page = pos / P, off = pos - page * P;
+  int slot = pt ? pt[page] : page;
+  if (slot < 0) return;
+  const float *src = (isv ? v : k) + (long)t * nvals + (long)qb * SGL_KVQ_BLK;
+  float x = src[threadIdx.x];
+  float amax = kvq_amax(fabsf(x));
+  float sc = amax > 0.0f ? amax / 7.0f : 1.0f;
+  int q = __float2int_rn(x / sc);
+  if (q > 7) q = 7;
+  if (q < -7) q = -7;
+  int qp = __shfl_xor_sync(0xffffffffu, q, 1); /* 配对成 1 字节 */
+  unsigned char *dst = pool + (long)slot * slot_layer + (long)off * tok_stride;
+  int qbase = isv ? (nvals / 2) : 0;
+  if ((threadIdx.x & 1) == 0)
+    dst[qbase + (qb * SGL_KVQ_BLK + threadIdx.x) / 2] =
+        (unsigned char)((q & 0xF) | ((qp & 0xF) << 4));
+  /* scale：每块一个 float */
+  if (threadIdx.x == 0) {
+    int nblk = nvals / SGL_KVQ_BLK;
+    int sbase = nvals + (isv ? nblk * 4 : 0);
+    *(float *)(dst + sbase + qb * 4) = sc;
+  }
+}
+
+/* 读一个 4-bit 值（dq 必须是偶数起点成对读，外面循环步长 2）*/
+__device__ __forceinline__ void kvq_deq2(const unsigned char *base, int d, int nvals,
+                                         float *o0, float *o1) {
+  unsigned char b = base[d >> 1];
+  int n0 = (b & 0xF), n1 = (b >> 4);
+  n0 = (n0 << 28) >> 28;
+  n1 = (n1 << 28) >> 28;
+  int nblk = nvals / SGL_KVQ_BLK;
+  float sc = *(const float *)(base + nvals + (d >> 7) * 4);
+  *o0 = (float)n0 * sc;
+  *o1 = (float)n1 * sc;
+}
+
+/* 单 KN 值（attention 里按需取用，d 任意）*/
+__device__ __forceinline__ float kvq_deq1(const unsigned char *base, int d, int nvals) {
+  unsigned char b = base[d >> 1];
+  int q = (d & 1) ? (b >> 4) : (b & 0xF);
+  q = (q << 28) >> 28;
+  float sc = *(const float *)(base + nvals + (d >> 7) * 4);
+  return (float)q * sc;
+}
+
+__device__ __forceinline__ float kvq_deqv(const unsigned char *base, int d, int nvals) {
+  int half = nvals / 2;
+  unsigned char b = base[half + (d >> 1)];
+  int q = (d & 1) ? (b >> 4) : (b & 0xF);
+  q = (q << 28) >> 28;
+  int nblk = nvals / SGL_KVQ_BLK;
+  float sc = *(const float *)(base + nvals + nblk * 4 + (d >> 7) * 4);
+  return (float)q * sc;
+}
+
+/* M2：分页 + 4-bit 反量化的 attention（prefill 用，两遍法）*/
+/* M2：分页 + 4-bit 反量化的 flash attention（warp-per-(t,h)，单遍 online softmax）。
+ *
+ * 为什么重写：第一版按「每线程一个 p、逐值标量反量化」写，每个值要算两次
+ * 整数除法（page/off）+ 读一次 scale，实测 11K 上下文 decode 147 ms/token
+ * （6.8 tok/s），差异 20 倍以上。这里改成：
+ *   - 一个 warp 包一个 (t, h)；lane 负责连续的 ND=D/32 个维度 → int4 一次读 4 B
+ *   - scale 每 128 值一个：D=256、ND=8 时每 16 个 lane 共享一个 scale
+ *   - 单遍 online softmax（不再读两遍 KV）
+ *   - 按页循环：同页的 64 个位置只查一次页表
+ * 要求 D % 32 == 0（不满足时调用方退回k_attn_q）。*/
+#define KVQ_FLASH_WARPS 4
+__global__ void k_attn_q_flash(const float *q, const unsigned char *pool, const int *pt,
+                               float *out, int pos0, int kv_base, int n, int H, int HK, int D,
+                               float scale, int win, int P, int nvals, long slot_layer,
+                               long tok_stride) {
+  const int ND = D / 32;
+  const int nblk = nvals / SGL_KVQ_BLK;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int th = blockIdx.x * KVQ_FLASH_WARPS + warp;
+  if (th >= n * H) return;
+  int t = th / H, h = th % H;
+  int upto = pos0 + t + 1;
+  int hkv = h / (H / HK);
+  int from = (win > 0 && upto > win) ? upto - win : 0;
+  const float *qh = q + ((long)t * H + h) * D;
+  /* lane 负责 d = lane*ND .. +ND-1（连续） => int4 恰好 4 字节 */
+  float qr[16];
+  if (ND > 16) return;
+#pragma unroll
+  for (int i = 0; i < ND; i++) qr[i] = qh[lane * ND + i];
+  int vbase = hkv * D + lane * ND; /* 该 lane 的全局值起点 */
+  int kbyte = vbase >> 1;          /* K 区字节偏移（相对 token 起点）*/
+  int vbyte = (nvals >> 1) + (vbase >> 1);
+  int sblk_k = vbase >> 7; /* scale 块号 */
+  int sblk_v = sblk_k;
+  unsigned sfree = 0;
+  (void)sfree;
+
+  float m = -1e30f, lsum = 0.0f;
+  float acc[16];
+#pragma unroll
+  for (int i = 0; i < ND; i++) acc[i] = 0.0f;
+
+  int p = from;
+  while (p < upto) {
+    int gpos = kv_base + p;
+    int page = gpos / P, off = gpos - page * P;
+    int pend = (page + 1) * P - kv_base;
+    if (pend > upto) pend = upto;
+    int slot = pt[page];
+    if (slot < 0) { /* 未驻留：跳过（M6 先 resolve 再跑）*/
+      p = pend;
+      continue;
+    }
+    const unsigned char *pg = pool + (long)slot * slot_layer;
+    for (; p < pend; p++, off++) {
+      const unsigned char *kb = pg + (long)off * tok_stride;
+      /* ---- QK^T：lane 读 4 字节 = 8 个 int4 ---- */
+      float szk = *(const float *)(kb + nvals + sblk_k * 4);
+      float dot = 0.0f;
+      {
+        const unsigned char *bp = kb + kbyte;
+#pragma unroll
+        for (int j = 0; j < ND; j += 2) {
+          unsigned char by = bp[j >> 1];
+          int n0 = (by & 0xF), n1 = (by >> 4);
+          n0 = (n0 << 28) >> 28;
+          n1 = (n1 << 28) >> 28;
+          dot += qr[j] * (float)n0 + qr[j + 1] * (float)n1;
+        }
+        dot *= szk;
+      }
+#pragma unroll
+      for (int off2 = 16; off2 > 0; off2 >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off2);
+      float s = dot * scale;
+      /* ---- online softmax + V 累加 ---- */
+      float mn = fmaxf(m, s);
+      float alpha = __expf(m - mn);
+      float e = __expf(s - mn);
+      lsum = lsum * alpha + e;
+      float szv = *(const float *)(kb + nvals + nblk * 4 + sblk_v * 4);
+      const unsigned char *bp = kb + vbyte;
+#pragma unroll
+      for (int j = 0; j < ND; j += 2) {
+        unsigned char by = bp[j >> 1];
+        int n0 = (by & 0xF), n1 = (by >> 4);
+        n0 = (n0 << 28) >> 28;
+        n1 = (n1 << 28) >> 28;
+        acc[j] = acc[j] * alpha + e * ((float)n0 * szv);
+        acc[j + 1] = acc[j + 1] * alpha + e * ((float)n1 * szv);
+      }
+      m = mn;
+    }
+  }
+  float inv = lsum > 0.0f ? 1.0f / lsum : 0.0f;
+  float *o = out + ((long)t * H + h) * D;
+#pragma unroll
+  for (int i = 0; i < ND; i++) o[lane * ND + i] = acc[i] * inv;
+}
+
+__global__ void k_attn_q(const float *q, const unsigned char *pool, const int *pt,
+                         float *out, int pos0, int kv_base, int n, int H, int HK, int D,
+                         float scale, int win, int P, int nvals, long slot_layer,
+                         long tok_stride) {
+  __shared__ float sc[SGL_ATTN_CHUNK];
+  __shared__ float red[256];
+  int th = blockIdx.x;
+  int t = th / H, h = th % H;
+  int upto = pos0 + t + 1;
+  const float *qh = q + ((long)t * H + h) * D;
+  int hkv = h / (H / HK);
+  int from = (win > 0 && upto > win) ? upto - win : 0;
+  int koff = (hkv * D) / 2; /* K 区起点（配对打包）*/
+  int voff = nvals / 2 + (hkv * D) / 2;
+
+  /* pass 1：全局 max + 在线归一化因子 */
+  float run_max = -1e30f, run_sum = 0.0f;
+  for (int c0 = from; c0 < upto; c0 += SGL_ATTN_CHUNK) {
+    int ce = c0 + SGL_ATTN_CHUNK; if (ce > upto) ce = upto;
+    float cmax = -1e30f;
+    for (int p = c0 + threadIdx.x; p < ce; p += blockDim.x) {
+      int gpos = kv_base + p;
+      int page = gpos / P, off = gpos - page * P;
+      int slot = pt[page];
+      float s = 0;
+      if (slot >= 0) {
+        const unsigned char *kb = pool + (long)slot * slot_layer + (long)off * tok_stride;
+        for (int d = 0; d < D; d += 2) {
+          float v0, v1;
+          const unsigned char *bb = kb + koff + (d >> 1);
+          unsigned char by = *bb;
+          int n0 = (by & 0xF), n1 = (by >> 4);
+          n0 = (n0 << 28) >> 28; n1 = (n1 << 28) >> 28;
+          float sc0 = *(const float *)(kb + nvals + ((hkv * D + d) >> 7) * 4);
+          v0 = (float)n0 * sc0; v1 = (float)n1 * sc0;
+          s += qh[d] * v0 + qh[d + 1] * v1;
+        }
+        s *= scale;
+      } else
+        s = -1e30f;
+      sc[p - c0] = s;
+      if (s > cmax) cmax = s;
+    }
+    red[threadIdx.x] = cmax;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+      if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+      __syncthreads();
+    }
+    cmax = red[0];
+    float alpha = __expf(run_max - cmax);
+    float cs = 0;
+    for (int p = threadIdx.x; p < ce - c0; p += blockDim.x) {
+      float e = __expf(sc[p] - cmax);
+      sc[p] = e;
+      cs += e;
+    }
+    __syncthreads();
+    red[threadIdx.x] = cs;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+      if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+      __syncthreads();
+    }
+    run_sum = run_sum * alpha + red[0];
+    run_max = cmax;
+    __syncthreads();
+  }
+  float invsum = 1.0f / run_sum;
+
+  /* pass 2：用最终 max 重算权重，累加 V */
+  float *o = out + ((long)t * H + h) * D;
+  for (int d = threadIdx.x; d < D; d += blockDim.x) o[d] = 0;
+  __syncthreads();
+  for (int c0 = from; c0 < upto; c0 += SGL_ATTN_CHUNK) {
+    int ce = c0 + SGL_ATTN_CHUNK; if (ce > upto) ce = upto;
+    for (int p = c0 + threadIdx.x; p < ce; p += blockDim.x) {
+      int gpos = kv_base + p;
+      int page = gpos / P, off = gpos - page * P;
+      int slot = pt[page];
+      float s = 0;
+      if (slot >= 0) {
+        const unsigned char *kb = pool + (long)slot * slot_layer + (long)off * tok_stride;
+        for (int d = 0; d < D; d += 2) {
+          const unsigned char *bb = kb + koff + (d >> 1);
+          unsigned char by = *bb;
+          int n0 = (by & 0xF), n1 = (by >> 4);
+          n0 = (n0 << 28) >> 28; n1 = (n1 << 28) >> 28;
+          float sc0 = *(const float *)(kb + nvals + ((hkv * D + d) >> 7) * 4);
+          s += qh[d] * ((float)n0 * sc0) + qh[d + 1] * ((float)n1 * sc0);
+        }
+        s *= scale;
+      } else
+        s = -1e30f;
+      sc[p - c0] = __expf(s - run_max);
+    }
+    __syncthreads();
+    for (int p = c0; p < ce; p++) {
+      int gpos = kv_base + p;
+      int page = gpos / P, off = gpos - page * P;
+      int slot = pt[page];
+      if (slot < 0) continue;
+      const unsigned char *vb = pool + (long)slot * slot_layer + (long)off * tok_stride;
+      float w = sc[p - c0];
+      for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        const unsigned char *bb = vb + voff + (d >> 1);
+        unsigned char by = *bb;
+        int q4 = (d & 1) ? (by >> 4) : (by & 0xF);
+        q4 = (q4 << 28) >> 28;
+        float scv = *(const float *)(vb + nvals + (nvals / SGL_KVQ_BLK) * 4 +
+                                    ((hkv * D + d) >> 7) * 4);
+        o[d] += w * ((float)q4 * scv);
+      }
+    }
+    __syncthreads();
+  }
+  for (int d = threadIdx.x; d < D; d += blockDim.x) o[d] *= invsum;
+}
 
 __global__ void k_attn(const float *q, const float *kc, const float *vc,
                        float *out, int pos0, int kv_base, int n, int H, int HK, int D,
@@ -1607,6 +1998,346 @@ static int launch_flash(sgl_cuda_model *g, int l, int n, int pos0, int kv_base,
  * SGL_FORCE_LONG_ATTN）时先试 flash，flash 不支持该 head_dim 才退回：
  *   行不长（<= SHORT_MAX）-> short 核（shared 分数，保持老行为）
  *   行很长              -> 两遍核（shared 无上限） */
+/* M2：分页 + 4-bit 反量化的 batch attention（decode 用）*/
+/* M2：decode 的 split-KV attention。
+ * 问题：B 小时 (B*H/KVQ_FLASH_WARPS) 只有 6 个 block，170 个 SM 只用了 6 个
+ * （实测 11K 上下文 decode 191 ms/token，有效算力 3.5%）。
+ * 解法：每 (b,h) 的历史切成 nsplit 段，各段并行算部分 (m,l,acc)，再合并。
+ * 这就是 flash-decoding 的做法。*/
+typedef struct {
+  int nsplit;
+  float *part; /* [B*H*nsplit][2 + Dmax] : m, l, acc[D] */
+  int cap;     /* 已分配的 B*H*nsplit 条目数 */
+  int dm;      /* D */
+} sgl_kvq_split;
+
+/* 算一段，输出部分归约结果。warp 内 lane 负责连续的 ND 维。*/
+__global__ void k_attn_q_split_partial(const float *q, const unsigned char *pool, const int *pt,
+                                       const int *base, const int *lens, int B, int H, int HK,
+                                       int D, float scale, int win, int P, int nvals,
+                                       long slot_layer, long tok_stride, int nsplit,
+                                       float *part) {
+  const int ND = D / 32;
+  const int nblk = nvals / SGL_KVQ_BLK;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int wid = blockIdx.x * KVQ_FLASH_WARPS + warp;
+  int total = B * H * nsplit;
+  if (wid >= total || ND > 16 || ND <= 0) return;
+  int seg = wid % nsplit;
+  int bh = wid / nsplit;
+  int b = bh / H, h = bh % H;
+  int upto = lens[b] + 1;
+  int hkv = h / (H / HK);
+  int from = (win > 0 && upto > win) ? upto - win : 0;
+  int span = upto - from;
+  if (span <= 0) {
+    if (lane == 0) {
+      float *o = part + (long)wid * (2 + D);
+      o[0] = -1e30f;
+      o[1] = 0.0f;
+    }
+    return;
+  }
+  /* 把 [from, upto) 均分给 nsplit 段 */
+  int step = (span + nsplit - 1) / nsplit;
+  int s0 = from + seg * step;
+  int s1 = s0 + step;
+  if (s1 > upto) s1 = upto;
+  float qr[16];
+  const float *qh = q + ((long)b * H + h) * D;
+#pragma unroll
+  for (int i = 0; i < ND; i++) qr[i] = qh[lane * ND + i];
+  int vbase = hkv * D + lane * ND;
+  int kbyte = vbase >> 1;
+  int vbyte = (nvals >> 1) + (vbase >> 1);
+  int sblk = vbase >> 7;
+  float m = -1e30f, lsum = 0.0f;
+  float acc[16];
+#pragma unroll
+  for (int i = 0; i < ND; i++) acc[i] = 0.0f;
+  int bpos = base[b];
+  int p = s0;
+  while (p < s1) {
+    int gpos = bpos + p;
+    int page = gpos / P, off = gpos - page * P;
+    int pend = (page + 1) * P - bpos;
+    if (pend > s1) pend = s1;
+    int slot = pt[page];
+    if (slot < 0) {
+      p = pend;
+      continue;
+    }
+    const unsigned char *pg = pool + (long)slot * slot_layer;
+    for (; p < pend; p++, off++) {
+      const unsigned char *kb = pg + (long)off * tok_stride;
+      float szk = *(const float *)(kb + nvals + sblk * 4);
+      float dot = 0.0f;
+      const unsigned char *bp = kb + kbyte;
+#pragma unroll
+      for (int j = 0; j < ND; j += 2) {
+        unsigned char by = bp[j >> 1];
+        int n0 = (by & 0xF), n1 = (by >> 4);
+        n0 = (n0 << 28) >> 28;
+        n1 = (n1 << 28) >> 28;
+        dot += qr[j] * (float)n0 + qr[j + 1] * (float)n1;
+      }
+      dot *= szk;
+#pragma unroll
+      for (int o2 = 16; o2 > 0; o2 >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o2);
+      float s = dot * scale;
+      float mn = fmaxf(m, s);
+      float alpha = __expf(m - mn);
+      float e = __expf(s - mn);
+      lsum = lsum * alpha + e;
+      float szv = *(const float *)(kb + nvals + nblk * 4 + sblk * 4);
+      const unsigned char *vp = kb + vbyte;
+#pragma unroll
+      for (int j = 0; j < ND; j += 2) {
+        unsigned char by = vp[j >> 1];
+        int n0 = (by & 0xF), n1 = (by >> 4);
+        n0 = (n0 << 28) >> 28;
+        n1 = (n1 << 28) >> 28;
+        acc[j] = acc[j] * alpha + e * ((float)n0 * szv);
+        acc[j + 1] = acc[j + 1] * alpha + e * ((float)n1 * szv);
+      }
+      m = mn;
+    }
+  }
+  float *o = part + (long)wid * (2 + D);
+  if (lane == 0) {
+    o[0] = m;
+    o[1] = lsum;
+  }
+#pragma unroll
+  for (int i = 0; i < ND; i++) o[2 + lane * ND + i] = acc[i];
+}
+
+/* 合并 nsplit 份：warp per (b,h)，lane 沿 D 分 */
+__global__ void k_attn_q_split_merge(float *out, const float *part, int B, int H, int D,
+                                     int nsplit) {
+  const int ND = D / 32;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int bh = blockIdx.x * KVQ_FLASH_WARPS + warp;
+  if (bh >= B * H || ND > 16 || ND <= 0) return;
+  float m = -1e30f;
+  for (int s = 0; s < nsplit; s++) {
+    const float *o = part + (long)(bh * nsplit + s) * (2 + D);
+    m = fmaxf(m, o[0]);
+  }
+  float lsum = 0.0f;
+  float acc[16];
+#pragma unroll
+  for (int i = 0; i < ND; i++) acc[i] = 0.0f;
+  for (int s = 0; s < nsplit; s++) {
+    const float *o = part + (long)(bh * nsplit + s) * (2 + D);
+    float w = __expf(o[0] - m);
+    lsum += o[1] * w;
+#pragma unroll
+    for (int i = 0; i < ND; i++) acc[i] += o[2 + lane * ND + i] * w;
+  }
+  float inv = lsum > 0.0f ? 1.0f / lsum : 0.0f;
+  float *p = out + (long)bh * D;
+#pragma unroll
+  for (int i = 0; i < ND; i++) p[lane * ND + i] = acc[i] * inv;
+}
+
+/* M2：batch 版 flash（decode 用；每行有自己的 base/lens）*/
+__global__ void k_attn_q_batch_flash(const float *q, const unsigned char *pool, const int *pt,
+                                     float *out, const int *base, const int *lens, int B, int H,
+                                     int HK, int D, float scale, int win, int P, int nvals,
+                                     long slot_layer, long tok_stride) {
+  const int ND = D / 32;
+  const int nblk = nvals / SGL_KVQ_BLK;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int th = blockIdx.x * KVQ_FLASH_WARPS + warp;
+  if (th >= B * H) return;
+  if (ND > 16 || ND <= 0) return;
+  int b = th / H, h = th % H;
+  int upto = lens[b] + 1;
+  int hkv = h / (H / HK);
+  int from = (win > 0 && upto > win) ? upto - win : 0;
+  const float *qh = q + ((long)b * H + h) * D;
+  float qr[16];
+#pragma unroll
+  for (int i = 0; i < ND; i++) qr[i] = qh[lane * ND + i];
+  int vbase = hkv * D + lane * ND;
+  int kbyte = vbase >> 1;
+  int vbyte = (nvals >> 1) + (vbase >> 1);
+  int sblk = vbase >> 7;
+
+  float m = -1e30f, lsum = 0.0f;
+  float acc[16];
+#pragma unroll
+  for (int i = 0; i < ND; i++) acc[i] = 0.0f;
+
+  int bpos = base[b];
+  int p = from;
+  while (p < upto) {
+    int gpos = bpos + p;
+    int page = gpos / P, off = gpos - page * P;
+    int pend = (page + 1) * P - bpos;
+    if (pend > upto) pend = upto;
+    int slot = pt[page];
+    if (slot < 0) {
+      p = pend;
+      continue;
+    }
+    const unsigned char *pg = pool + (long)slot * slot_layer;
+    for (; p < pend; p++, off++) {
+      const unsigned char *kb = pg + (long)off * tok_stride;
+      float szk = *(const float *)(kb + nvals + sblk * 4);
+      float dot = 0.0f;
+      const unsigned char *bp = kb + kbyte;
+#pragma unroll
+      for (int j = 0; j < ND; j += 2) {
+        unsigned char by = bp[j >> 1];
+        int n0 = (by & 0xF), n1 = (by >> 4);
+        n0 = (n0 << 28) >> 28;
+        n1 = (n1 << 28) >> 28;
+        dot += qr[j] * (float)n0 + qr[j + 1] * (float)n1;
+      }
+      dot *= szk;
+#pragma unroll
+      for (int off2 = 16; off2 > 0; off2 >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off2);
+      float s = dot * scale;
+      float mn = fmaxf(m, s);
+      float alpha = __expf(m - mn);
+      float e = __expf(s - mn);
+      lsum = lsum * alpha + e;
+      float szv = *(const float *)(kb + nvals + nblk * 4 + sblk * 4);
+      const unsigned char *vp = kb + vbyte;
+#pragma unroll
+      for (int j = 0; j < ND; j += 2) {
+        unsigned char by = vp[j >> 1];
+        int n0 = (by & 0xF), n1 = (by >> 4);
+        n0 = (n0 << 28) >> 28;
+        n1 = (n1 << 28) >> 28;
+        acc[j] = acc[j] * alpha + e * ((float)n0 * szv);
+        acc[j + 1] = acc[j + 1] * alpha + e * ((float)n1 * szv);
+      }
+      m = mn;
+    }
+  }
+  float inv = lsum > 0.0f ? 1.0f / lsum : 0.0f;
+  float *o = out + ((long)b * H + h) * D;
+#pragma unroll
+  for (int i = 0; i < ND; i++) o[lane * ND + i] = acc[i] * inv;
+}
+
+__global__ void k_attn_q_batch(const float *q, const unsigned char *pool, const int *pt,
+                               float *out, const int *base, const int *lens, int B, int H,
+                               int HK, int D, float scale, int win, int P, int nvals,
+                               long slot_layer, long tok_stride) {
+  __shared__ float sc[SGL_ATTN_CHUNK];
+  __shared__ float red[256];
+  int th = blockIdx.x;
+  int b = th / H, h = th % H;
+  int upto = lens[b] + 1;
+  const float *qh = q + ((long)b * H + h) * D;
+  int hkv = h / (H / HK);
+  int from = (win > 0 && upto > win) ? upto - win : 0;
+  int koff = (hkv * D) / 2;
+  int voff = nvals / 2 + (hkv * D) / 2;
+  int nblk = nvals / SGL_KVQ_BLK;
+  float run_max = -1e30f, run_sum = 0.0f;
+
+  for (int c0 = from; c0 < upto; c0 += SGL_ATTN_CHUNK) {
+    int ce = c0 + SGL_ATTN_CHUNK; if (ce > upto) ce = upto;
+    float cmax = -1e30f;
+    for (int p = c0 + threadIdx.x; p < ce; p += blockDim.x) {
+      int gpos = base[b] + p;
+      int page = gpos / P, off = gpos - page * P;
+      int slot = pt[page];
+      float s = 0;
+      if (slot >= 0) {
+        const unsigned char *kb = pool + (long)slot * slot_layer + (long)off * tok_stride;
+        for (int d = 0; d < D; d += 2) {
+          const unsigned char *bb = kb + koff + (d >> 1);
+          unsigned char by = *bb;
+          int n0 = (by & 0xF), n1 = (by >> 4);
+          n0 = (n0 << 28) >> 28; n1 = (n1 << 28) >> 28;
+          float sc0 = *(const float *)(kb + nvals + ((hkv * D + d) >> 7) * 4);
+          s += qh[d] * ((float)n0 * sc0) + qh[d + 1] * ((float)n1 * sc0);
+        }
+        s *= scale;
+      } else
+        s = -1e30f;
+      sc[p - c0] = s;
+      if (s > cmax) cmax = s;
+    }
+    red[threadIdx.x] = cmax;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+      if (threadIdx.x < st) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + st]);
+      __syncthreads();
+    }
+    cmax = red[0];
+    float alpha = __expf(run_max - cmax);
+    float cs = 0;
+    for (int p = threadIdx.x; p < ce - c0; p += blockDim.x) {
+      float e = __expf(sc[p] - cmax);
+      sc[p] = e;
+      cs += e;
+    }
+    __syncthreads();
+    red[threadIdx.x] = cs;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+      if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+      __syncthreads();
+    }
+    run_sum = run_sum * alpha + red[0];
+    run_max = cmax;
+    __syncthreads();
+  }
+  float invsum = 1.0f / run_sum;
+  float *o = out + ((long)b * H + h) * D;
+  for (int d = threadIdx.x; d < D; d += blockDim.x) o[d] = 0;
+  __syncthreads();
+  for (int c0 = from; c0 < upto; c0 += SGL_ATTN_CHUNK) {
+    int ce = c0 + SGL_ATTN_CHUNK; if (ce > upto) ce = upto;
+    for (int p = c0 + threadIdx.x; p < ce; p += blockDim.x) {
+      int gpos = base[b] + p;
+      int page = gpos / P, off = gpos - page * P;
+      int slot = pt[page];
+      float s = 0;
+      if (slot >= 0) {
+        const unsigned char *kb = pool + (long)slot * slot_layer + (long)off * tok_stride;
+        for (int d = 0; d < D; d += 2) {
+          const unsigned char *bb = kb + koff + (d >> 1);
+          unsigned char by = *bb;
+          int n0 = (by & 0xF), n1 = (by >> 4);
+          n0 = (n0 << 28) >> 28; n1 = (n1 << 28) >> 28;
+          float sc0 = *(const float *)(kb + nvals + ((hkv * D + d) >> 7) * 4);
+          s += qh[d] * ((float)n0 * sc0) + qh[d + 1] * ((float)n1 * sc0);
+        }
+        s *= scale;
+      } else
+        s = -1e30f;
+      sc[p - c0] = __expf(s - run_max);
+    }
+    __syncthreads();
+    for (int p = c0; p < ce; p++) {
+      int gpos = base[b] + p;
+      int page = gpos / P, off = gpos - page * P;
+      int slot = pt[page];
+      if (slot < 0) continue;
+      const unsigned char *vb = pool + (long)slot * slot_layer + (long)off * tok_stride;
+      float w = sc[p - c0];
+      for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        const unsigned char *bb = vb + voff + (d >> 1);
+        unsigned char by = *bb;
+        int q4 = (d & 1) ? (by >> 4) : (by & 0xF);
+        q4 = (q4 << 28) >> 28;
+        float scv = *(const float *)(vb + nvals + nblk * 4 + ((hkv * D + d) >> 7) * 4);
+        o[d] += w * ((float)q4 * scv);
+      }
+    }
+    __syncthreads();
+  }
+  for (int d = threadIdx.x; d < D; d += blockDim.x) o[d] *= invsum;
+}
+
 static void attn_dispatch(sgl_cuda_model *g, int l, int n, int pos0, int kv_base,
                           float sc, int two_pass, int force_long, int E) {
   int D = g->D, H = g->H, HK = g->HK;
@@ -2637,7 +3368,10 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
    * thanks to tied-lm_head reuse; SGL_CUDA_CTX overrides. */
   {
     const char *e = getenv("SGL_CUDA_CTX");
-    int cap = (e && atoi(e) > 0) ? atoi(e) : 16384;
+    /* M2：量化 KV 下 17 KiB/token，旧上限 16384（为 FP32 KV 设的）不再适用 */
+    const char *kqe = getenv("SGL_KVQ");
+    int kvq_on = (kqe && atoi(kqe)) ? 1 : 0;
+    int cap = (e && atoi(e) > 0) ? atoi(e) : (kvq_on ? (1 << 23) : 16384);
     if (g->ctx > cap) g->ctx = cap;
   }
 
@@ -2976,8 +3710,18 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
     if (auto_e && atoi(auto_e) > 0) {
       size_t fb = 0, tb = 0;
       if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
-        size_t per_tok = (size_t)(g->n_kv_layers ? g->n_kv_layers : g->L) *
-                         (size_t)g->KD * 2ULL * 4ULL;
+        /* M2：量化池已启时按 17 KiB/token 算，而不是 FP32 的 128 KiB */
+        const char *kqe = getenv("SGL_KVQ");
+        int kqw = (kqe && atoi(kqe)) ? 1 : 0;
+        size_t per_tok;
+        if (kqw) {
+          int nvals0 = g->HK * g->D;
+          long tok_stride0 = (long)nvals0 + 2L * (nvals0 / SGL_KVQ_BLK) * 4L;
+          per_tok = (size_t)(g->n_kv_layers ? g->n_kv_layers : g->L) * (size_t)tok_stride0;
+        } else {
+          per_tok = (size_t)(g->n_kv_layers ? g->n_kv_layers : g->L) *
+                    (size_t)g->KD * 2ULL * 4ULL;
+        }
         size_t reserve = 896ULL << 20; /* prefill 工作区峰值 ~405MB + logits/碎片 */
         size_t fit = fb > reserve ? (fb - reserve) / per_tok : 0;
         size_t cur = (size_t)g->ctx;
@@ -2997,11 +3741,30 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
   fprintf(stderr, "[kv] n_kv_layers=%d L=%d ctx=%zu KD=%d floats/each=%zu\n",
           g->n_kv_layers, g->L, ctx, g->KD,
           (size_t)(g->n_kv_layers ? g->n_kv_layers : g->L) * ctx * g->KD);
-  g->kc = dev_copy(NULL, (size_t)(g->n_kv_layers ? g->n_kv_layers : g->L) * ctx * g->KD);
-  g->vc = dev_copy(NULL, (size_t)(g->n_kv_layers ? g->n_kv_layers : g->L) * ctx * g->KD);
+  /* M2/M6：先试量化分页池（SGL_KVQ=1）。成功就不分配 FP32 池：
+   * 262K 下 FP32 要 32 GiB（装不下），4-bit 只要 4.26 GiB。*/
+  {
+    const char *kq = getenv("SGL_KVQ");
+    int want = (kq && atoi(kq)) ? 1 : 0;
+    if (want) {
+      const char *hr = getenv("SGL_KVQ_HOST");
+      const char *ns = getenv("SGL_KVQ_SLOTS");
+      int host_res = (hr && atoi(hr)) ? 1 : 0;
+      int nsw = ns ? atoi(ns) : 0;
+      int nkv = g->n_kv_layers ? g->n_kv_layers : g->L;
+      if (kvq_init(g, (long)ctx, nkv, g->HK, g->D, host_res, nsw) != 0) {
+        fprintf(stderr, "[kvq] init failed -> falling back to FP32 KV\n");
+        g->kvq.on = 0;
+      }
+    }
+  }
+  if (!g->kvq.on) {
+    g->kc = dev_copy(NULL, (size_t)(g->n_kv_layers ? g->n_kv_layers : g->L) * ctx * g->KD);
+    g->vc = dev_copy(NULL, (size_t)(g->n_kv_layers ? g->n_kv_layers : g->L) * ctx * g->KD);
+  }
   /* activation workspace is growable now (sgl_cuda_reserve): only the KV
    * pool scales with ctx, long prompts don't need ctx-sized activations */
-  if (!g->kc || !g->vc) goto fail;
+  if (!g->kvq.on && (!g->kc || !g->vc)) goto fail;
   CT("kv alloc done L=%d ctx=%zu KD=%d", g->L, ctx, g->KD);
   /* t11 lin：conv 历史池 + 每 token 复用的 scratch（行级，不随 prefill 长度增长）*/
   if (g->lin_n > 0 && g->lin_nh > 0) {
@@ -3123,6 +3886,18 @@ int sgl_cuda_mtp_load(sgl_cuda_model *g, int kv_ctx) {
       mtp_alloc(&t->v, KD) || mtp_alloc(&t->attn, (size_t)g->H * D) ||
       mtp_alloc(&t->gate, I) || mtp_alloc(&t->up, I))
     goto fail;
+  /* 链式草稿：本层输出 hidden 两个副本 + 「最后落定位置」的 hidden */
+  if (mtp_alloc(&t->chain_pre, E) || mtp_alloc(&t->chain_post, E) ||
+      mtp_alloc(&t->hlast, E))
+    goto fail;
+  {
+    /* 默认 post：27B 实测每步 2.83 token（pre 2.72）。SGL_MTP_CHAIN=pre 可切回 */
+    const char *cc = getenv("SGL_MTP_CHAIN");
+    t->chain_use_post = (cc && (cc[0] == 'p' || cc[0] == 'P') &&
+                         (cc[1] == 'r' || cc[1] == 'R'))
+                            ? 0
+                            : 1;
+  }
   {
     size_t kv = (size_t)kv_ctx * (size_t)KD;
     if (cudaMalloc((void **)&t->kc, kv * sizeof(float)) != cudaSuccess) goto fail;
@@ -3248,6 +4023,13 @@ int sgl_cuda_mtp_draft(sgl_cuda_model *g, int token, int pos, const float *hidde
     k_rmsnorm_p1<<<1, 256, 256 * sizeof(float), s>>>(t->x, t->post_norm, t->h, 1, E, g->eps);
   else
     k_rmsnorm<<<1, 256, 256 * sizeof(float), s>>>(t->x, t->post_norm, t->h, 1, E, g->eps);
+  /* 投机链式（M_k 形式）：本层输出 hidden 留给下一步当输入。pre = post_norm
+   * 之前（t->x），post = 之后（t->h）。哪个对不确定，SGL_MTP_CHAIN 选，错了
+   * 只会让后续草稿变差、被拒绝，不影响正确性。*/
+  if (t->chain_pre) CK(cudaMemcpyAsync(t->chain_pre, t->x, sizeof(float) * (size_t)E,
+                                       cudaMemcpyDeviceToDevice, s));
+  if (t->chain_post) CK(cudaMemcpyAsync(t->chain_post, t->h, sizeof(float) * (size_t)E,
+                                        cudaMemcpyDeviceToDevice, s));
   lm_head_gemm(g, t->h, g->d_lgb, 1);
   k_argmax<<<1, 256, 0, s>>>(g->d_lgb, g->V, t->d_arg);
   if (cudaMemcpyAsync(out_tok, t->d_arg, sizeof(int), cudaMemcpyDeviceToHost, s) != cudaSuccess)
@@ -3368,6 +4150,263 @@ fail:
   return -1;
 }
 
+/* ================= M2/M6：量化分页 KV 的分配 ================= */
+/* 返回 0 成功；-1 失败（调用方便于降级到 FP32 路径）。
+ * host_resident=1 时额外分配 pinned 权威副本（M6）；0 = 全驻留 VRAM（M2）。*/
+static int kvq_init(sgl_cuda_model *g, long ctx, int nkv, int HK, int D, int host_resident,
+                    int n_slots_want) {
+  sgl_kvq *q = &g->kvq;
+  long n_pages, slots;
+  memset(q, 0, sizeof(*q));
+  if (nkv <= 0 || HK <= 0 || D <= 0) return -1;
+  if ((HK * D) % SGL_KVQ_BLK != 0) {
+    fprintf(stderr, "[kvq] HK*D=%d not a multiple of %d -> quant KV unavailable\n", HK * D,
+            SGL_KVQ_BLK);
+    return -1;
+  }
+  q->nkv = nkv;
+  q->P = SGL_KVQ_P;
+  q->HK = HK;
+  q->D = D;
+  q->nvals = HK * D;
+  q->nblk = q->nvals / SGL_KVQ_BLK;
+  q->tok_stride = (long)q->nvals + 2L * q->nblk * 4L; /* 4bit 打包 + 两组 float scale */
+  q->slot_layer = (long)q->P * q->tok_stride;
+  n_pages = (ctx + q->P - 1) / q->P;
+  q->n_pages = (int)n_pages;
+  slots = (n_slots_want > 0 && n_slots_want < n_pages) ? n_slots_want : n_pages;
+  q->n_slots = (int)slots;
+  q->layer_slots = slots * q->slot_layer;
+
+  if (cudaMalloc((void **)&q->d_pool, (size_t)q->nkv * q->layer_slots) != cudaSuccess) {
+    q->d_pool = NULL;
+    cudaGetLastError();
+    return -1;
+  }
+  if (cudaMalloc((void **)&q->d_pt, sizeof(int) * (size_t)q->n_pages) != cudaSuccess) {
+    cudaFree(q->d_pool);
+    q->d_pool = NULL;
+    cudaGetLastError();
+    return -1;
+  }
+  q->h_pt = (int *)malloc(sizeof(int) * (size_t)q->n_pages);
+  if (!q->h_pt) {
+    cudaFree(q->d_pool);
+    cudaFree(q->d_pt);
+    q->d_pool = NULL;
+    q->d_pt = NULL;
+    return -1;
+  }
+  /* M2：页表恒等（全驻留）。M6：前 n_slots 页先驻留，其余 -1。*/
+  for (long p = 0; p < n_pages; p++) q->h_pt[p] = (p < slots) ? (int)p : -1;
+  if (cudaMemcpy(q->d_pt, q->h_pt, sizeof(int) * (size_t)q->n_pages, cudaMemcpyHostToDevice) !=
+      cudaSuccess) {
+    free(q->h_pt);
+    cudaFree(q->d_pool);
+    cudaFree(q->d_pt);
+    q->h_pt = NULL;
+    q->d_pool = NULL;
+    q->d_pt = NULL;
+    cudaGetLastError();
+    return -1;
+  }
+  cudaMemset(q->d_pool, 0, (size_t)q->nkv * q->layer_slots);
+
+  if (host_resident) {
+    size_t bytes = (size_t)q->nkv * n_pages * q->slot_layer;
+    if (cudaHostAlloc((void **)&q->h_pool, bytes, cudaHostAllocMapped) != cudaSuccess) {
+      fprintf(stderr, "[kvq] pinned host KV for %zu pages failed: %.1f GiB\n", (size_t)n_pages,
+              (double)bytes / 1073741824.0);
+      cudaGetLastError();
+      free(q->h_pt);
+      cudaFree(q->d_pool);
+      cudaFree(q->d_pt);
+      q->h_pt = NULL;
+      q->d_pool = NULL;
+      q->d_pt = NULL;
+      return -1;
+    }
+    memset(q->h_pool, 0, bytes);
+    q->host_slots = 1;
+  }
+  q->on = 1;
+  /* M2：split-KV 的部分和缓冲。只在 decode 且 B 小（并行度不够）时用。
+   * 条目 = Bmax(32) × nkv_H(24...) × nsplit。按 H 真实值算。*/
+  {
+    int Hm = g->H > 0 ? g->H : 1;
+    const char *ne = getenv("SGL_KVQ_NSPLIT");
+    int ns = ne ? atoi(ne) : 32;
+    if (ns < 1) ns = 1;
+    if (ns > 128) ns = 128;
+    q->nsplit = ns;
+    long entries = 32L * Hm * ns;
+    size_t bytes = (size_t)entries * (size_t)(2 + q->D) * sizeof(float);
+    if (bytes < (64ULL << 20)) bytes = (64ULL << 20); /* 最小 64 MiB，避免小 D 不够用 */
+    if (cudaMalloc((void **)&q->d_split, bytes) == cudaSuccess) {
+      q->split_cap = (int)(bytes / ((size_t)(2 + q->D) * sizeof(float)));
+      fprintf(stderr, "[kvq] split-KV buffer %.1f MiB (nsplit=%d, cap=%d entries)\n",
+              (double)bytes / 1048576.0, ns, q->split_cap);
+    } else {
+      q->d_split = NULL;
+      q->split_cap = 0;
+      cudaGetLastError();
+    }
+  }
+  fprintf(stderr,
+          "[kvq] quant paged KV ON: nkv=%d P=%d n_pages=%d n_slots=%d nvals=%d tok_stride=%ld B\n"
+          "[kvq]   VRAM pool %.2f GiB%s | per-token %.2f KiB (FP32 was %.2f KiB)\n",
+          q->nkv, q->P, q->n_pages, q->n_slots, q->nvals, q->tok_stride,
+          (double)(q->nkv * q->layer_slots) / 1073741824.0,
+          q->host_slots ? " + full pinned host copy" : " (all resident)",
+          (double)(q->nkv * q->tok_stride) / 1024.0, (double)(q->nkv * q->nvals * 8) / 1024.0);
+  return 0;
+}
+
+void sgl_cuda_kvq_free(sgl_cuda_model *m) {
+  sgl_kvq *q;
+  if (!m) return;
+  q = &m->kvq;
+  if (q->d_pool) cudaFree(q->d_pool);
+  if (q->d_pt) cudaFree(q->d_pt);
+  if (q->d_split) cudaFree(q->d_split);
+  if (q->h_pool) cudaFreeHost(q->h_pool);
+  if (q->h_pt) free(q->h_pt);
+  memset(q, 0, sizeof(*q));
+}
+
+int sgl_cuda_kvq_enabled(const sgl_cuda_model *m) { return m ? m->kvq.on : 0; }
+
+/* ================= M3: 投机解码 ================= */
+/* 把上一次前向末位的 hidden 存成草稿输入（row<0 = 末行）。*/
+int sgl_cuda_mtp_set_hidden(sgl_cuda_model *m, int row) {
+  const float *src;
+  if (!m || !m->mtp.ok || !m->mtp.hlast) return -1;
+  if (row < 0) row = (m->last_rows > 0) ? m->last_rows - 1 : 0;
+  src = m->mtp.hsrc ? m->h : m->x;
+  if (cudaMemcpyAsync(m->mtp.hlast, src + (size_t)row * (size_t)m->E,
+                      sizeof(float) * (size_t)m->E, cudaMemcpyDeviceToDevice,
+                      m->stream) != cudaSuccess)
+    return -1;
+  return cudaStreamSynchronize(m->stream) == cudaSuccess ? 0 : -1;
+}
+
+int sgl_cuda_spec_begin(sgl_cuda_model *m, int W) {
+  int rows, convd;
+  long s_layer, h_layer;
+  size_t nS, nH;
+  if (!m || W < 1) return -1;
+  if (m->lin_n <= 0 || !m->l_state || !m->l_hist) return -1;
+  rows = W + 1;
+  if (m->snap.S && m->snap.rows >= rows) return 0;
+  if (m->snap.S) {
+    cudaFree(m->snap.S);
+    cudaFree(m->snap.H);
+    m->snap.S = m->snap.H = NULL;
+    m->snap.rows = 0;
+  }
+  convd = 2 * m->lin_nk * m->lin_kd + m->lin_nh * m->lin_vd;
+  s_layer = (long)m->lin_nh * m->lin_kd * m->lin_vd;
+  h_layer = (long)convd * (m->lin_conv_k - 1);
+  nS = (size_t)rows * (size_t)m->lin_n * (size_t)s_layer;
+  nH = (size_t)rows * (size_t)m->lin_n * (size_t)h_layer;
+  if (cudaMalloc((void **)&m->snap.S, nS * sizeof(float)) != cudaSuccess) {
+    m->snap.S = NULL;
+    cudaGetLastError();
+    return -1;
+  }
+  if (cudaMalloc((void **)&m->snap.H, nH * sizeof(float)) != cudaSuccess) {
+    cudaFree(m->snap.S);
+    m->snap.S = NULL;
+    m->snap.H = NULL;
+    cudaGetLastError();
+    return -1;
+  }
+  m->snap.s_layer = s_layer;
+  m->snap.h_layer = h_layer;
+  m->snap.rows = rows;
+  fprintf(stderr, "[spec] snapshot room for %d rows: %.1f MiB (state) + %.1f MiB (hist)\n", rows,
+          (double)nS * 4.0 / 1048576.0, (double)nH * 4.0 / 1048576.0);
+  return 0;
+}
+
+int sgl_cuda_mtp_drafts(sgl_cuda_model *m, int t0, int pos, int W, int *out) {
+  int i, tok, d;
+  float *hp;
+  if (!m || !m->mtp.ok || !out || W < 1) return -1;
+  tok = t0;
+  hp = m->mtp.hlast;
+  for (i = 0; i < W; i++) {
+    if (!hp) return i;
+    if (sgl_cuda_mtp_draft(m, tok, pos + i, hp, &d) != 0) return i;
+    out[i] = d;
+    tok = d;
+    /* 链式：下一步用本层的输出 hidden（而不是主模型的）*/
+    hp = m->mtp.chain_use_post ? m->mtp.chain_post : m->mtp.chain_pre;
+  }
+  return W;
+}
+
+int sgl_cuda_spec_verify(sgl_cuda_model *m, const int *toks, int n, int pos0, int kv_base,
+                         float *logits_rows, int *k_out) {
+  int j, k = 0, rc;
+  if (!m || !toks || n < 2 || !logits_rows) return -1;
+  m->spec_on = m->snap.S ? 1 : 0;
+  rc = sgl_cuda_forward_seg_rows(m, toks, n, pos0, kv_base, logits_rows);
+  m->spec_on = 0;
+  if (rc != 0) return rc;
+  for (j = 0; j + 1 < n; j++) {
+    const float *L = logits_rows + (size_t)j * (size_t)m->V;
+    int best = 0, v;
+    float bv = L[0];
+    for (v = 1; v < m->V; v++)
+      if (L[v] > bv) {
+        bv = L[v];
+        best = v;
+      }
+    if (best == toks[j + 1])
+      k++;
+    else
+      break;
+  }
+  if (k_out) *k_out = k;
+  return 0;
+}
+
+int sgl_cuda_spec_commit(sgl_cuda_model *m, int slot, int k) {
+  int l, rows = k + 1, t;
+  size_t soff, hoff;
+  if (!m || !m->snap.S) return -1;
+  if (rows < 1 || rows > m->snap.rows) return -1;
+  t = rows - 1; /* snapshot[t] = 处理完 t+1 行的状态 */
+  for (l = 0; l < m->L; l++) {
+    int ll = m->linvo ? m->linvo[l] : -1;
+    if (ll < 0) continue;
+    soff = ((size_t)ll * m->lin_slots + (size_t)slot) * (size_t)m->snap.s_layer;
+    hoff = ((size_t)ll * m->lin_slots + (size_t)slot) * (size_t)m->snap.h_layer;
+    size_t ssrc = (size_t)t * (size_t)m->lin_n * (size_t)m->snap.s_layer +
+                  (size_t)ll * (size_t)m->snap.s_layer;
+    size_t hsrc = (size_t)t * (size_t)m->lin_n * (size_t)m->snap.h_layer +
+                  (size_t)ll * (size_t)m->snap.h_layer;
+    if (cudaMemcpyAsync(m->l_state + soff, m->snap.S + ssrc,
+                        sizeof(float) * (size_t)m->snap.s_layer, cudaMemcpyDeviceToDevice,
+                        m->stream) != cudaSuccess)
+      return -1;
+    if (cudaMemcpyAsync(m->l_hist + hoff, m->snap.H + hsrc,
+                        sizeof(float) * (size_t)m->snap.h_layer, cudaMemcpyDeviceToDevice,
+                        m->stream) != cudaSuccess)
+      return -1;
+  }
+  /* 最后落定位置的 hidden → 下一步草稿的输入 */
+  if (m->mtp.ok && m->mtp.hlast) {
+    const float *src = m->mtp.hsrc ? m->h : m->x;
+    if (cudaMemcpyAsync(m->mtp.hlast, src + (size_t)k * (size_t)m->E,
+                        sizeof(float) * (size_t)m->E, cudaMemcpyDeviceToDevice,
+                        m->stream) != cudaSuccess)
+      return -1;
+  }
+  return cudaStreamSynchronize(m->stream) == cudaSuccess ? 0 : -1;
+}
+
 /* t4: transpose-copy helper — HF Conv1D weight is [K,N] row-major; llama's
  * gemm path wants [N,K] (W row n = weight column n). Host-side one-shot. */
 static float *dev_copy_transposed(const float *src, int K, int N, int to_half) {
@@ -3486,8 +4525,18 @@ sgl_cuda_model *sgl_cuda_from_gpt2(const void *gpt2_model) {
     if (auto_e && atoi(auto_e) > 0) {
       size_t fb = 0, tb = 0;
       if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
-        size_t per_tok = (size_t)(g->n_kv_layers ? g->n_kv_layers : g->L) *
-                         (size_t)g->KD * 2ULL * 4ULL;
+        /* M2：量化池已启时按 17 KiB/token 算，而不是 FP32 的 128 KiB */
+        const char *kqe = getenv("SGL_KVQ");
+        int kqw = (kqe && atoi(kqe)) ? 1 : 0;
+        size_t per_tok;
+        if (kqw) {
+          int nvals0 = g->HK * g->D;
+          long tok_stride0 = (long)nvals0 + 2L * (nvals0 / SGL_KVQ_BLK) * 4L;
+          per_tok = (size_t)(g->n_kv_layers ? g->n_kv_layers : g->L) * (size_t)tok_stride0;
+        } else {
+          per_tok = (size_t)(g->n_kv_layers ? g->n_kv_layers : g->L) *
+                    (size_t)g->KD * 2ULL * 4ULL;
+        }
         size_t reserve = 896ULL << 20; /* prefill 工作区峰值 ~405MB + logits/碎片 */
         size_t fit = fb > reserve ? (fb - reserve) / per_tok : 0;
         size_t cur = (size_t)g->ctx;
@@ -3640,6 +4689,31 @@ int sgl_cuda_copy_kv(sgl_cuda_model *g, int src_base, int dst_base, int len) {
   if (src_base == dst_base) return 0;
   if (src_base < 0 || dst_base < 0 || src_base + len > g->ctx || dst_base + len > g->ctx)
     return -1;
+  if (g->kvq.on) {
+    /* M2：量化池的前缀复用。逐页搬（源/目都同偏移时才能一次搬一页）。
+     * 请求段通常 64 对齐（seg_len 是 1024 的倍数），所以这里按页走。*/
+    sgl_kvq *q = &g->kvq;
+    if ((src_base % q->P) != 0 || (dst_base % q->P) != 0 || (len % q->P) != 0) {
+      fprintf(stderr, "[kvq] copy_kv unaligned (%d->%d len %d, P=%d) -> skip reuse\n", src_base,
+              dst_base, len, q->P);
+      return -1;
+    }
+    for (int l = 0; l < g->L; l++) {
+      int ll = g->kvo[l];
+      if (ll < 0) continue;
+      unsigned char *base = q->d_pool + (long)ll * q->layer_slots;
+      for (int p = 0; p < len / q->P; p++) {
+        int sp = (src_base / q->P) + p, dp = (dst_base / q->P) + p;
+        int ss = q->h_pt[sp], ds = q->h_pt[dp];
+        if (ss < 0 || ds < 0) return -1; /* 未驻留：不支持（M6 后续补）*/
+        if (cudaMemcpyAsync(base + (long)ds * q->slot_layer, base + (long)ss * q->slot_layer,
+                            (size_t)q->slot_layer, cudaMemcpyDeviceToDevice,
+                            g->stream) != cudaSuccess)
+          return -1;
+      }
+    }
+    return cudaStreamSynchronize(g->stream) == cudaSuccess ? 0 : -1;
+  }
   size_t bytes = (size_t) len * g->KD * sizeof(float); /* 同层内行连续：一次 1-D 拷贝 */
   for (int l = 0; l < g->L; l++) {
     size_t off = (size_t)g->kvo[l] * g->ctx * g->KD;
@@ -3702,7 +4776,19 @@ long sgl_cuda_estimate_vram_mb(const void *llama_model, int ctx, int rows) {
   bytes += (double)n_full * ((2.0 + q_gate) * QD * E + 2.0 * KD * E + E * QD + 3.0 * I * E) * psz;
   bytes += (double)n_lin * ((lin_rowN + 96.0) * E + E * vald + 3.0 * I * E) * psz;
   bytes += (double)L * (6.0 * E + 2.0 * I) * 4.0;        /* norms + biases fp32 */
-  bytes += 2.0 * n_full * ctx * KD * 4.0;                /* KV pool (lin layers have none) */
+  /* M2：SGL_KVQ=1 时 KV 是 4-bit 分页池（每 token 约 17 KiB），不再是 FP32 128 KiB */
+  {
+    const char *kqe = getenv("SGL_KVQ");
+    int kqw = (kqe && atoi(kqe)) ? 1 : 0;
+    if (kqw && m->n_kv_head > 0 && m->head_dim > 0) {
+      int nvals = m->n_kv_head * m->head_dim;
+      int nblk = nvals / 128;
+      long tok_stride = (long)nvals + 2L * nblk * 4L;
+      bytes += (double)n_full * ctx * (double)tok_stride;
+    } else {
+      bytes += 2.0 * n_full * ctx * KD * 4.0;            /* KV pool (lin layers have none) */
+    }
+  }
   bytes += (4.0 * E + 2.0 * KD + 2.0 * I) * rows * 4.0;  /* activation workspace */
   if (fp16) bytes += ei * rows * 2.0;                    /* cublas fp16 input mirror */
   if (w8) bytes += ei * rows * 9.0;                      /* int8 A + int32 C + scales */
@@ -3844,6 +4930,7 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
   double t_fwd0 = prof_on() ? sgl_hnow() : 0.0;
   if (n <= 0 || pos0 + n > g->ctx) return -1;
   if (kv_base + pos0 + n > g->ctx) return -1;
+  g->last_rows = n; /* M3：投机首次开跑时靠它取 prefill 末位 hidden */
   if (sgl_cuda_reserve(g, n) != 0) return -1;
   if (sgl_cuda_ensure_io(g, n) != 0) return -1;
 
@@ -3964,12 +5051,21 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
       }
       if (prof) cudaEventRecord(g->pf0[l], g->stream);
       if (path == 2) {
+        float *ss = NULL, *sh = NULL;
+        long sr = 0, hr = 0;
+        if (g->spec_on && g->snap.S && g->snap.rows >= n) {
+          ss = g->snap.S + (long)ll2 * g->snap.s_layer;
+          sh = g->snap.H + (long)ll2 * g->snap.h_layer;
+          sr = (long)g->lin_n * g->snap.s_layer;
+          hr = (long)g->lin_n * g->snap.h_layer;
+        }
         k_lin_persist_reg<128, 128><<<nh2, 512, shb, g->stream>>>(
             g->l_qkvz_all, g->l_conv[l], g->l_hist, g->l_state, g->l_ba_all,
             g->l_alog[l], g->l_dtb[l], g->l_norm[l], g->l_o_all, n, nk2, nh2, K2,
             g->lin_ratio, gw2, g->eps,
             (long)(((size_t)ll2 * g->lin_slots + slot2) * (size_t)nh2 * kd2 * vd2),
-            (long)(((size_t)ll2 * g->lin_slots + slot2) * (size_t)convd2 * (K2 - 1)));
+            (long)(((size_t)ll2 * g->lin_slots + slot2) * (size_t)convd2 * (K2 - 1)),
+            ss, sh, sr, hr);
         CK(cudaGetLastError());
       } else if (path == 1) {
         k_lin_layer_persist<<<nh2, 128, shb, g->stream>>>(
@@ -4125,7 +5221,16 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
      * sides (src pitch = KD packed, dst pitch = KD in ctx), so the whole
      * scatter is ONE 2D memcpy instead of 2n tiny async copies per layer.
      * (8192-token prefill did 393k WDDM submits and took 174s; now ~48.) */
-    {
+    if (g->kvq.on) {
+      /* M2/M6：量化写入。grid = n × 每 token 量化块数 */
+      sgl_kvq *q = &g->kvq;
+      int bpb = 2 * (q->nvals / SGL_KVQ_BLK);
+      int ll = g->kvo[l];
+      k_kvq_write<<<n * bpb, SGL_KVQ_BLK, 0, g->stream>>>(
+          q->d_pool + (long)ll * q->layer_slots, q->d_pt, g->k, g->v, n, pos0, kv_base,
+          q->HK, q->D, q->P, q->slot_layer, q->layer_slots, q->tok_stride, NULL, NULL);
+      CK(cudaGetLastError());
+    } else {
       float *kcl = g->kc + (long)g->kvo[l] * g->ctx * KD;
       float *vcl = g->vc + (long)g->kvo[l] * g->ctx * KD;
       size_t row = (size_t)HK * D, pitch = (size_t)KD * sizeof(float);
@@ -4146,7 +5251,28 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
       int two_pass = (tp && atoi(tp)) ? 1 : 0;
       float sc = 1.0f / sqrtf((float)D);
       int qstride = g->QD > 0 ? g->QD : E; /* t11：显式 head_dim 时每行 QD（非 E）*/
-      if (prof && g->L <= SGL_PROF_MAXL) {
+      if (g->kvq.on) {
+        /* M2：分页 + 4-bit 反量化 attention。D%32==0 时走 flash 版（单遍、
+         * 向量化读取），否则退回两遍的通用版。*/
+        sgl_kvq *q = &g->kvq;
+        int ll = g->kvo[l];
+        if (prof && g->L <= SGL_PROF_MAXL) cudaEventRecord(g->pf0[l], g->stream);
+        if (D % 32 == 0 && D / 32 <= 16) {
+          int nw = n * H;
+          int nb = (nw + KVQ_FLASH_WARPS - 1) / KVQ_FLASH_WARPS;
+          k_attn_q_flash<<<nb, 32 * KVQ_FLASH_WARPS, 0, g->stream>>>(
+              g->q, q->d_pool + (long)ll * q->layer_slots, q->d_pt, g->attn, pos0, kv_base,
+              n, H, q->HK, q->D, sc, g->sliding_window, q->P, q->nvals, q->slot_layer,
+              q->tok_stride);
+        } else {
+          k_attn_q<<<n * H, 256, 0, g->stream>>>(
+              g->q, q->d_pool + (long)ll * q->layer_slots, q->d_pt, g->attn, pos0, kv_base,
+              n, H, q->HK, q->D, sc, g->sliding_window, q->P, q->nvals, q->slot_layer,
+              q->tok_stride);
+        }
+        CK(cudaGetLastError());
+        if (prof && g->L <= SGL_PROF_MAXL) cudaEventRecord(g->pf1[l], g->stream);
+      } else if (prof && g->L <= SGL_PROF_MAXL) {
         cudaEventRecord(g->pf0[l], g->stream);
         attn_dispatch(g, l, n, pos0, kv_base, sc, two_pass, force_long, qstride);
         cudaEventRecord(g->pf1[l], g->stream);
@@ -4488,16 +5614,65 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
       k_rope_rows<<<(int)(((long)B * HK * D / 2 + 255) / 256), 256, 0, s>>>(g->k, B * HK, D, g->d_pk, g->freqs);
     }
     CK(cudaGetLastError());
-    k_kv_write<<<(int)((B * HK * D + 255) / 256), 256, 0, s>>>(
-        g->kc + (long)g->kvo[l] * g->ctx * KD, g->vc + (long)g->kvo[l] * g->ctx * KD,
-        g->k, g->v, g->d_base, g->d_lens, HK, D, B);
-    CK(cudaGetLastError());
-    if (maxu > SGL_ATTN_SHORT_MAX) {
+    if (g->kvq.on) {
+      sgl_kvq *q = &g->kvq;
+      int bpb = 2 * (q->nvals / SGL_KVQ_BLK);
+      int ll = g->kvo[l];
+      k_kvq_write<<<B * bpb, SGL_KVQ_BLK, 0, s>>>(
+          q->d_pool + (long)ll * q->layer_slots, q->d_pt, g->k, g->v, B, 0, 0, q->HK, q->D,
+          q->P, q->slot_layer, q->layer_slots, q->tok_stride, g->d_base, g->d_lens);
+      CK(cudaGetLastError());
+      int nw0 = B * H;
+      int ns0 = q->nsplit;
+      int use_split = 0;
+      if (q->d_split && ns0 > 1 && nw0 * ns0 <= q->split_cap) {
+        /* 并行度：不切时 nw/4 个 block，切后 nw*ns/4。上下文长（maxu 大）
+         * 且 nw < 256 才值得（否则本来就填满了 GPU）。*/
+        if (nw0 < 256 && maxu > 1024) use_split = 1;
+      }
+      if (use_split) {
+        int tot = nw0 * ns0;
+        { /* 只在开关变化时打一行，不吵 */
+          static int last_key = -1;
+          int key = use_split * 1000 + nw0;
+          if (key != last_key) {
+            last_key = key;
+            fprintf(stderr, "[kvq] decode split-KV: B=%d H=%d nw=%d nsplit=%d maxu=%d -> %d blocks\n",
+                    B, H, nw0, ns0, maxu, (tot + KVQ_FLASH_WARPS - 1) / KVQ_FLASH_WARPS);
+          }
+        }
+        k_attn_q_split_partial<<<(tot + KVQ_FLASH_WARPS - 1) / KVQ_FLASH_WARPS,
+                                  32 * KVQ_FLASH_WARPS, 0, s>>>(
+            g->q, q->d_pool + (long)ll * q->layer_slots, q->d_pt, g->d_base, g->d_lens, B, H,
+            q->HK, q->D, 1.0f / sqrtf((float)D), g->sliding_window, q->P, q->nvals,
+            q->slot_layer, q->tok_stride, ns0, q->d_split);
+        CK(cudaGetLastError());
+        k_attn_q_split_merge<<<(nw0 + KVQ_FLASH_WARPS - 1) / KVQ_FLASH_WARPS,
+                                32 * KVQ_FLASH_WARPS, 0, s>>>(
+            g->attn, q->d_split, B, H, q->D, ns0);
+        CK(cudaGetLastError());
+      } else {
+        k_attn_q_batch_flash<<<(nw0 + KVQ_FLASH_WARPS - 1) / KVQ_FLASH_WARPS,
+                                32 * KVQ_FLASH_WARPS, 0, s>>>(
+            g->q, q->d_pool + (long)ll * q->layer_slots, q->d_pt, g->attn, g->d_base, g->d_lens,
+            B, H, q->HK, q->D, 1.0f / sqrtf((float)D), g->sliding_window, q->P, q->nvals,
+            q->slot_layer, q->tok_stride);
+        CK(cudaGetLastError());
+      }
+    } else if (maxu > SGL_ATTN_SHORT_MAX) {
+      k_kv_write<<<(int)((B * HK * D + 255) / 256), 256, 0, s>>>(
+          g->kc + (long)g->kvo[l] * g->ctx * KD, g->vc + (long)g->kvo[l] * g->ctx * KD,
+          g->k, g->v, g->d_base, g->d_lens, HK, D, B);
+      CK(cudaGetLastError());
       k_attn_long_batch<<<B * H, 256, 0, s>>>(
           g->q, g->kc + (long)g->kvo[l] * g->ctx * KD, g->vc + (long)g->kvo[l] * g->ctx * KD,
           g->attn, g->d_base, g->d_lens, B, H, HK, D, 1.0f / sqrtf((float)D),
           g->sliding_window);
     } else {
+      k_kv_write<<<(int)((B * HK * D + 255) / 256), 256, 0, s>>>(
+          g->kc + (long)g->kvo[l] * g->ctx * KD, g->vc + (long)g->kvo[l] * g->ctx * KD,
+          g->k, g->v, g->d_base, g->d_lens, HK, D, B);
+      CK(cudaGetLastError());
       k_attn_batch<<<B * H, 256, (size_t)maxu * sizeof(float), s>>>(
           g->q, g->kc + (long)g->kvo[l] * g->ctx * KD, g->vc + (long)g->kvo[l] * g->ctx * KD,
           g->attn, g->d_base, g->d_lens, B, H, HK, D, 1.0f / sqrtf((float)D),
