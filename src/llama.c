@@ -1338,6 +1338,16 @@ static int llama_forward_emb_impl(sgl_llama *m, const int *tokens, const float *
     for (int t = 0; t < n; t++)
       for (int k = 0; k < E; k++)
         m->x[(size_t)t * E + k] += m->up[(size_t)t * E + k];
+    {
+      /* 与 GPU 侧 SGL_CUDA_DBG 对拍：[gpu L%d] 打第 0 行前 4 个，[gpu lin L%d] 打末行前 2 个 */
+      static int dbg = -1;
+      if (dbg < 0) { const char *e = getenv("SGL_LLAMA_DBG"); dbg = e ? atoi(e) : 0; }
+      if (dbg > 0 && l % dbg == 0) {
+        const float *xl = m->x + (size_t)(n - 1) * E;
+        printf("[cpu L%d] x=[%.7g, %.7g, %.7g, %.7g] last=[%.7g,%.7g]\n", l, m->x[0], m->x[1],
+               m->x[2], m->x[3], xl[0], xl[1]);
+      }
+    }
   }
 
   rmsn(m, m->x, m->final_norm.data, m->h, n, E, m->rms_eps);
