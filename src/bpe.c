@@ -354,6 +354,23 @@ sgl_tokenizer *sgl_tokenizer_load_dir(const char *dir) {
   sgl_xfree(buf);
   if (!j) return t;
   int eos = sgl_json_get_int(j, "eos_token_id", -1);
+  /* t11：Qwen/DashScope 系的 tokenizer_config 里 eos 是**字符串或对象**
+   *（"eos_token": "<|im_end|>" 或 {"content":"<|im_end|>"}），不是数字。
+   * 之前只读数字 → eos 落到 -1 → 永远检测不到停止 → 模型一直往下胡写
+   *（“Hello!!!!!!!!” 循环、finish_reason 恒为 length）。*/
+  if (eos < 0) {
+    const sgl_json *et = sgl_json_get(j, "eos_token");
+    const char *es = NULL;
+    if (et && et->type == SGL_JSON_STRING) es = et->str;
+    else if (et && et->type == SGL_JSON_OBJECT) es = sgl_json_get_str(et, "content", NULL);
+    if (es && *es) {
+      int id = sm_get(&t->vocab, es);
+      for (int i = 0; id < 0 && i < t->n_added; i++)
+        if (t->added_tokens[i] && strcmp(t->added_tokens[i], es) == 0 && t->added_ids[i] >= 0)
+          id = t->added_ids[i];
+      if (id >= 0) eos = id;
+    }
+  }
   sgl_json_free(j);
   if (eos >= 0 && eos != t->eos_id) {
     SGL_INFO("tokenizer_config: eos %d -> %d", t->eos_id, eos);

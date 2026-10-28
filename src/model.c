@@ -19,7 +19,8 @@ struct sgl_model {
 };
 
 /* 读配置判型：DeepSeek（MLA+MoE）→ 2，llama 用 hidden_size → 1，gpt2 用 n_embd → 0。
- * 配置来自 config.json 或 GGUF 元数据（后者常见于只下载了一个 .gguf 的目录）。*/
+ * 配置来自 config.json 或 GGUF 元数据（后者常见于只下载了一个 .gguf 的目录）。
+ * t11：VLM 包装检查点（qwen3_5 等）顶层没有 hidden_size，在 text_config 里 → llama。*/
 static int detect_kind(const char *dir) {
   if (sgl_deepseek_detect(dir) == 1) return 2;
   size_t sz = 0;
@@ -30,7 +31,11 @@ static int detect_kind(const char *dir) {
   if (!j) return -1;
   int kind = -1;
   if (sgl_json_get(j, "hidden_size")) kind = 1;
-  else if (sgl_json_get(j, "n_embd")) kind = 0;
+  else {
+    const sgl_json *tc = sgl_json_get(j, "text_config");
+    if (tc && tc->type == SGL_JSON_OBJECT && sgl_json_get(tc, "hidden_size")) kind = 1;
+  }
+  if (kind < 0 && sgl_json_get(j, "n_embd")) kind = 0;
   sgl_json_free(j);
   return kind;
 }

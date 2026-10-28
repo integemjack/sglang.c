@@ -27,6 +27,29 @@
 int sgl_cuda_http_serve(const char *dir, int port, const char *host);
 #endif
 
+/* t11 调试：崩溃时打回溯（无 gdb 环境下定位段错误用，-g 编译后 addr2line 可解） */
+#if !defined(_WIN32)
+#include <signal.h>
+#include <execinfo.h>
+#include <unistd.h>
+static void t11_crash_handler(int sig) {
+  void *bt[40];
+  int n = backtrace(bt, 40);
+  char msg[64];
+  snprintf(msg, sizeof(msg), "\n=== FATAL sig=%d backtrace (%d frames) ===\n", sig, n);
+  write(2, msg, strlen(msg));
+  backtrace_symbols_fd(bt, n, 2);
+  _exit(128 + sig);
+}
+static void t11_install_crash_handler(void) {
+  signal(SIGSEGV, t11_crash_handler);
+  signal(SIGABRT, t11_crash_handler);
+  signal(SIGBUS, t11_crash_handler);
+}
+#else
+static void t11_install_crash_handler(void) {}
+#endif
+
 typedef struct {
   FILE *out;
   int first;
@@ -233,6 +256,7 @@ static int sglc_probe_cuda_vram(long *mb_out) {
 #endif
 
 int main(int argc, char **argv) {
+  t11_install_crash_handler();
   const char *model_dir = NULL, *prompt = "The meaning of life is";
   const char *host = "127.0.0.1";
   const char *device = "auto"; /* --device：auto / cuda / mlx / cpu */

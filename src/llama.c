@@ -32,6 +32,17 @@ static void w8_quant(const float *w, int8_t **q8, float **s8, int64_t N, int64_t
   sgl_quant_rows_i8(w, *q8, *s8, (int)N, (int)K);
 }
 
+/* t11 流式 int8：大矩阵取到 f32 后立刻量化并 drop owned 缓冲。
+ * 返回 0 = 正常（含张量缺失跳过），-1 = 量化异常。 */
+static int w8_stream_mat(sgl_llama *m, sgl_tensor *t, int8_t **q8, float **s8,
+                         int64_t N, int64_t K) {
+  if (!t->data || N <= 0 || K <= 0) return 0;
+  if (!m->w8) return 0;
+  w8_quant(t->data, q8, s8, N, K);
+  sgl_st_drop(m->st, t);
+  return 0;
+}
+
 static char *path_join_(const char *a, const char *b) {
   size_t n = strlen(a) + strlen(b) + 2;
   char *p = (char *)sgl_xmalloc(n);
@@ -149,6 +160,20 @@ sgl_llama *sgl_llama_load(const char *dir) {
   sgl_xfree(buf);
   if (!cfg) return NULL;
 
+  /* t11 qwen3_5（Qwen3.8 等，VLM 包装）：文本参数都在 text_config 里。
+   * 顶层存在 text_config.hidden_size 时，之后所有读取切到 text_config 上
+   *（model_type=qwen3_5、rope_parameters、layer_types、linear_* 都在其中）。 */
+  sgl_json *cfg_root = cfg;
+  int is_vlm_wrap = 0; /* t11：text_config 嵌套 = VLM 包装，权重在 model.language_model.* 下 */
+  {
+    sgl_json *tc = sgl_json_get(cfg, "text_config");
+    if (tc && tc->type == SGL_JSON_OBJECT && sgl_json_get(tc, "hidden_size")) {
+      cfg = tc;
+      is_vlm_wrap = 1;
+      SGL_INFO("llama config: nested text_config detected (VLM wrapper)");
+    }
+  }
+
   sgl_llama *m = (sgl_llama *)sgl_xcalloc(1, sizeof(*m));
   m->n_layer = sgl_json_get_int(cfg, "num_hidden_layers", 0);
   m->n_head = sgl_json_get_int(cfg, "num_attention_heads", 0);
@@ -156,6 +181,16 @@ sgl_llama *sgl_llama_load(const char *dir) {
   m->n_embd = sgl_json_get_int(cfg, "hidden_size", 0);
   m->n_inter = sgl_json_get_int(cfg, "intermediate_size", 4 * m->n_embd);
   m->n_ctx = sgl_json_get_int(cfg, "max_position_embeddings", 2048);
+  /* t11：ctx 緩冲（x/h/q/k/v/gate/up/qg ≈ ctx×88KB/f32）随 max_position_embeddings 线性膨胀，
+   * 262144 的长上下文 config 会直接炸内存——默认钳到 32768，SGL_CTX 环境变量可改。 */
+  {
+    const char *e = getenv("SGL_CTX");
+    if (e && atoi(e) > 0) m->n_ctx = atoi(e);
+    else if (m->n_ctx > 32768) {
+      SGL_INFO("ctx %d capped to 32768 (set SGL_CTX to override)", m->n_ctx);
+      m->n_ctx = 32768;
+    }
+  }
   m->vocab = sgl_json_get_int(cfg, "vocab_size", 0);
   m->rms_eps = (float)sgl_json_get_num(cfg, "rms_norm_eps", 1e-5);
   m->rope_theta = sgl_json_get_num(cfg, "rope_theta", 10000.0);
@@ -241,7 +276,12 @@ sgl_llama *sgl_llama_load(const char *dir) {
     /* ---- G13 Qwen3-Next full_attention 的真实特性 ---- */
     {
       const char *mt = sgl_json_get_str(cfg, "model_type", "");
-      int qnext = !strcmp(mt, "qwen3_next");
+      /* t11：qwen3_5（Qwen3.8，dense + gated deltanet）与 qwen3_next 同套
+       * full 层特性：(1+w) 归一化 / q_proj 2×输出门控 / partial rotary。
+       * 检查点可能不带 model_type（text_config 内），用 attn_output_gate
+       *（该家族独有）兑底。*/
+      int qnext = !strcmp(mt, "qwen3_next") || !strcmp(mt, "qwen3_5") ||
+                  sgl_json_get(cfg, "attn_output_gate") != NULL;
       /* (c) 所有 RMSNorm 是 (1+w)*x/sqrt(var+eps)（Qwen3NextRMSNorm）*/
       m->norm_p1 = qnext;
       /* (a) q_proj 输出 2*q_dim，半幅 sigmoid 门控 attn 输出 */
@@ -331,27 +371,50 @@ sgl_llama *sgl_llama_load(const char *dir) {
       m->layer_window[l] = (kind == 1) ? m->sliding_window : 0;
     }
   }
-  sgl_json_free(cfg);
-  if (m->n_layer <= 0 || m->n_head <= 0 || m->n_embd <= 0 || m->vocab <= 0 ||
-      m->n_kv_head <= 0 || m->n_embd % m->n_head) {
-    SGL_ERROR("llama config invalid");
-    sgl_llama_free(m);
-    return NULL;
+  /* t11：qwen3_5（VLM 包装）的文本权重在 model.language_model.* 下。
+   *（is_vlm_wrap 由 text_config 存在性决定，与 model_type 字段位置无关）*/
+  sgl_json_free(cfg_root);
+  {
+    /* t11：显式 head_dim（qwen3 / qwen3_5：D≠E/H，如 5120/24→256）时
+     * n_embd % n_head 的旧检查不适用，只要 q_dim/kv_dim 自洽即可。*/
+    int hd_explicit = (m->head_dim > 0 && m->q_dim != m->n_embd);
+    if (m->n_layer <= 0 || m->n_head <= 0 || m->n_embd <= 0 || m->vocab <= 0 ||
+        m->n_kv_head <= 0 || (!hd_explicit && m->n_embd % m->n_head)) {
+      SGL_ERROR("llama config invalid");
+      sgl_llama_free(m);
+      return NULL;
+    }
   }
   SGL_INFO("Llama config: L=%d H=%d KVH=%d E=%d I=%d D=%d ctx=%d vocab=%d eps=%g theta=%g tie=%d",
            m->n_layer, m->n_head, m->n_kv_head, m->n_embd, m->n_inter, m->head_dim,
            m->n_ctx, m->vocab, m->rms_eps, m->rope_theta, m->tie_embeddings);
 
-  m->st = sgl_st_open_dir(dir); /* P0-1: 支持 model.safetensors.index.json 多分片 */
+  m->st = sgl_st_open_dir(dir); /* P0-1: 支持 model.safetensors.index.json 多分片（t11：或散分片扫描） */
   if (!m->st) {
     sgl_llama_free(m);
     return NULL;
   }
+  if (is_vlm_wrap) sgl_st_set_prefix(m->st, "model.language_model.");
+
+  /* t11 流式 int8：SGL_W8=1 时大矩阵取到 f32 后立刻量化并 drop，
+   * 宿存峰值从 ~4.8B 参数×4B 降到 int8 + 单张量瞬态（27B 模型 ~130GB → ~30GB）。
+   * LoRA 需要在 f32 上合并，两者互斥（SGL_LORA 存在时不流式）。*/
+  {
+    const char *e = getenv("SGL_W8");
+    if (e && atoi(e) != 0 && !getenv("SGL_LORA")) {
+      m->w8 = 1;
+      SGL_INFO("t11: streaming int8 load (SGL_W8) enabled");
+    }
+  }
+  SGL_INFO("t11 dbg: loading wte");
 
   int64_t E = m->n_embd, K = m->kv_dim, I = m->n_inter, V = m->vocab;
+  SGL_INFO("t11 dbg: entering layer loop");
   int64_t QD = (int64_t)m->n_head * m->head_dim; /* q/o width: E unless explicit head_dim (qwen3: 2048) */
   m->wte = sgl_st_get(m->st, "model.embed_tokens.weight", 2, (int64_t[]){V, E});
+  SGL_INFO("t11 dbg: wte done %lld", (long long)(m->wte.data ? m->wte.shape[0] : -1));
   m->final_norm = sgl_st_get(m->st, "model.norm.weight", 1, (int64_t[]){E});
+  SGL_INFO("t11 dbg: final_norm done");
   {
     sgl_tensor lm = sgl_st_get(m->st, "lm_head.weight", 2, (int64_t[]){V, E});
     if (lm.data) {
@@ -389,6 +452,14 @@ sgl_llama *sgl_llama_load(const char *dir) {
     L->v_w = sgl_st_get(m->st, name, 2, (int64_t[]){K, E});
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", l);
     L->o_w = sgl_st_get(m->st, name, 2, (int64_t[]){E, QD});
+    /* t11 流式：全注意力层的大矩阵量化后立刻释放 f32（linear 层这些张量缺失，自动跳过）*/
+    if (m->w8) {
+      if (w8_stream_mat(m, &L->q_w, &L->q8, &L->sq8, qw, E) +
+          w8_stream_mat(m, &L->k_w, &L->k8, &L->sk8, K, E) +
+          w8_stream_mat(m, &L->v_w, &L->v8, &L->sv8, K, E) +
+          w8_stream_mat(m, &L->o_w, &L->o8, &L->so8, E, QD) < 0)
+        return NULL;
+    }
     /* qwen2: separate q/k/v biases (HF) or fused qkv bias (vLLM layout) */
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.bias", l);
     {
@@ -448,6 +519,12 @@ sgl_llama *sgl_llama_load(const char *dir) {
       L->up_w = sgl_st_get(m->st, name, 2, (int64_t[]){I, E});
       snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", l);
       L->down_w = sgl_st_get(m->st, name, 2, (int64_t[]){E, I});
+      if (m->w8) { /* t11 流式：dense SwiGLU 三矩阵 */
+        if (w8_stream_mat(m, &L->gate_w, &L->g8, &L->sg8, I, E) +
+            w8_stream_mat(m, &L->up_w, &L->u8, &L->su8, I, E) +
+            w8_stream_mat(m, &L->down_w, &L->d8, &L->sd8, E, I) < 0)
+          return NULL;
+      }
     }
     /* qwen2 / G13: qk-norm（G13 的 Qwen3-Next 同样有，宽度 head_dim）*/
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", l);
@@ -461,7 +538,8 @@ sgl_llama *sgl_llama_load(const char *dir) {
       if (kn.data) L->k_norm = kn;
     }
     if (!L->inp_norm.data || !L->post_norm.data ||
-        (!L->is_moe && (!L->gate_w.data || !L->up_w.data || !L->down_w.data))) {
+        (!L->is_moe && !((L->gate_w.data || L->g8) && (L->up_w.data || L->u8) &&
+                          (L->down_w.data || L->d8)))) { /* t11：流式 int8 后张量为空、量化槽非空即存在 */
       SGL_ERROR("layer %d weights missing", l);
       sgl_llama_free(m);
       return NULL;
@@ -470,10 +548,77 @@ sgl_llama *sgl_llama_load(const char *dir) {
     if (m->layer_kind && m->layer_kind[l] == 2) {
       int keyd = m->lin_nk * m->lin_kd, vald = m->lin_nh * m->lin_vd;
       int convd = 2 * keyd + vald;
+      if (l == 0) SGL_INFO("t11 dbg: layer 0 linear_attn loading");
       snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkvz.weight", l);
       L->lin_qkvz_w = sgl_st_get(m->st, name, 2, (int64_t[]){2 * keyd + 2 * vald, E});
       snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_ba.weight", l);
       L->lin_ba_w = sgl_st_get(m->st, name, 2, (int64_t[]){2 * m->lin_nh, E});
+      /* t11 qwen3_5（Qwen3.8）：in_proj 拆成四份 —— qkv[2keyd+vald]、z[vald]、b[nh]、a[nh]
+       *（HF Qwen3_5GatedDeltaNet：qkv 连续 [q|k|v]，无组内交错）。这里在加载期拼回
+       * Qwen3-Next 融合布局（qkvz 按 k-head 组 [q|k|v|z]、ba 按 [b|a]），lin_attn_step 零改动。*/
+      if (!L->lin_qkvz_w.data || !L->lin_ba_w.data) {
+        int nk = m->lin_nk, nh = m->lin_nh, kd = m->lin_kd, vd = m->lin_vd, r = m->lin_ratio;
+        sgl_tensor qkv_t, z_t, b_t, a_t;
+        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", l);
+        qkv_t = sgl_st_get(m->st, name, 2, (int64_t[]){2 * keyd + vald, E});
+        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", l);
+        z_t = sgl_st_get(m->st, name, 2, (int64_t[]){vald, E});
+        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", l);
+        b_t = sgl_st_get(m->st, name, 2, (int64_t[]){nh, E});
+        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", l);
+        a_t = sgl_st_get(m->st, name, 2, (int64_t[]){nh, E});
+        if (!qkv_t.data || !z_t.data || !b_t.data || !a_t.data) {
+          SGL_ERROR("layer %d linear_attn in_proj missing (neither fused qkvz/ba nor split qkv/z/b/a)", l);
+          sgl_llama_free(m);
+          return NULL;
+        }
+        int64_t fq = 2 * keyd + 2 * vald, fb = 2 * nh;
+        float *qkvz = (float *)sgl_xmalloc((size_t)fq * (size_t)E * sizeof(float));
+        float *ba = (float *)sgl_xmalloc((size_t)fb * (size_t)E * sizeof(float));
+        int gw = 2 * kd + 2 * r * vd; /* 融合布局每 k-head 组的行宽 */
+        for (int g = 0; g < nk; g++) {
+          /* t11 fix：行偏移要乘行宽 E（之前少了 *E，组 1..n 全部写串到组 0 内部，
+           * 导致 in_proj_qkvz 权重错位——CPU/GPU 同时退化、lin 层输出全零的元凶）*/
+          float *dst = qkvz + (size_t)g * gw * E;
+          memcpy(dst, qkv_t.data + (size_t)g * kd * E,
+                 sizeof(float) * (size_t)kd * E); /* q_g */
+          memcpy(dst + (size_t)kd * E, qkv_t.data + ((size_t)keyd + (size_t)g * kd) * E,
+                 sizeof(float) * (size_t)kd * E); /* k_g */
+          memcpy(dst + (size_t)2 * kd * E,
+                 qkv_t.data + ((size_t)2 * keyd + (size_t)g * r * vd) * E,
+                 sizeof(float) * (size_t)r * vd * E); /* v 组内 r 个 v-head */
+          memcpy(dst + (size_t)(2 * kd + r * vd) * E, z_t.data + (size_t)g * r * vd * E,
+                 sizeof(float) * (size_t)r * vd * E); /* z 同上 r 个 head */
+        }
+        for (int g = 0; g < nk; g++)
+          for (int j = 0; j < r; j++) {
+            int h = g * r + j;
+            memcpy(ba + (size_t)(g * 2 * r + j) * E, b_t.data + (size_t)h * E,
+                   sizeof(float) * (size_t)E);
+            memcpy(ba + (size_t)(g * 2 * r + r + j) * E, a_t.data + (size_t)h * E,
+                   sizeof(float) * (size_t)E);
+          }
+        L->lin_qkvz_w = sgl_tensor_from_data(2, (int64_t[]){fq, E}, qkvz);
+        L->lin_ba_w = sgl_tensor_from_data(2, (int64_t[]){fb, E}, ba);
+        L->lin_synth = 1;
+        /* t11：四个拆分张量的 f32 转换缓冲（~340MB/层）用完即放，
+         * 否则 st_close 前一直挂在 owned 里，48 层叠 ~15GB。 */
+        sgl_st_drop(m->st, &qkv_t);
+        sgl_st_drop(m->st, &z_t);
+        sgl_st_drop(m->st, &b_t);
+        sgl_st_drop(m->st, &a_t);
+        if (m->w8) {
+          /* 合成缓冲直接量化后释放（st_drop 管不到堆合成缓冲）*/
+          w8_quant(qkvz, &L->q8, &L->sq8, fq, E);
+          sgl_xfree(qkvz);
+          L->lin_qkvz_w = sgl_tensor_null();
+          L->lin_synth = 0; /* 缓冲已释放，free 时不再 xfree */
+        }
+      } else if (m->w8) {
+        /* t11：融合布局检查点（qwen3_next）在流式模式下也直接量化 qkvz */
+      }
+      /* t11 流式：qkvz（复用 q8 槽）与 out_proj（复用 o8 槽）量化后释放；
+       * ba 仅 96×E 留 f32。在下方完整性检查之后执行。*/
       snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", l);
       L->lin_conv_w = sgl_st_get(m->st, name, 3, (int64_t[]){convd, 1, m->lin_conv});
       if (!L->lin_conv_w.data) /* 允许 2D [convd,K] 简化布局 */
@@ -495,16 +640,25 @@ sgl_llama *sgl_llama_load(const char *dir) {
         L->lin_dt_bias = (float *)sgl_xmalloc(sizeof(float) * (size_t)m->lin_nh);
         memcpy(L->lin_dt_bias, dtb.data, sizeof(float) * (size_t)m->lin_nh);
       }
-      if (!L->lin_qkvz_w.data || !L->lin_ba_w.data || !L->lin_conv_w.data ||
-          !L->lin_norm_w.data || !L->lin_out_w.data || !L->lin_a_log || !L->lin_dt_bias) {
+      if (!((L->lin_qkvz_w.data || L->q8) && L->lin_ba_w.data && L->lin_conv_w.data &&
+            L->lin_norm_w.data && (L->lin_out_w.data || L->o8) && L->lin_a_log &&
+            L->lin_dt_bias)) { /* t11：流式后看量化槽 */
         SGL_ERROR("layer %d linear_attn weights missing", l);
         sgl_llama_free(m);
         return NULL;
       }
       L->lin_idx = m->n_lin++;
+      /* t11 流式（在完整性检查后）：qkvz 复用 q8 槽、out_proj 复用 o8 槽。
+       *（合成路径的 qkvz 已在上方量化释放，st_drop 对 null 张量无操作）*/
+      if (m->w8) {
+        if (w8_stream_mat(m, &L->lin_qkvz_w, &L->q8, &L->sq8, 2 * keyd + 2 * vald, E) != 0 ||
+            w8_stream_mat(m, &L->lin_out_w, &L->o8, &L->so8, E, vald) != 0)
+          return NULL;
+      }
     } else {
-      /* full/sliding：标准注意力权重必备 */
-      if (!L->q_w.data || !L->k_w.data || !L->v_w.data || !L->o_w.data) {
+      /* full/sliding：标准注意力权重必备（t11：流式 int8 后看量化槽）*/
+      if (!((L->q_w.data || L->q8) && (L->k_w.data || L->k8) && (L->v_w.data || L->v8) &&
+            (L->o_w.data || L->o8))) {
         SGL_ERROR("layer %d weights missing", l);
         sgl_llama_free(m);
         return NULL;
@@ -608,20 +762,22 @@ sgl_llama *sgl_llama_load(const char *dir) {
              m->n_lin, m->n_lin_slots, m->lin_nh, m->lin_nk, m->lin_kd, m->lin_vd, m->lin_conv);
   }
 
-  /* W8: quantize all projection weights after load (env SGL_W8=1) */
+  /* W8: quantize all projection weights after load (env SGL_W8=1)
+   * t11：流式加载时已在加载点量化过，这里只处理旧路径（无 SGL_W8 提前读到的场景）*/
   {
     const char *env = getenv("SGL_W8");
     if (env && atoi(env) != 0) {
-      m->w8 = 1;
+      if (!m->w8) m->w8 = 1;
       clock_t tq = clock();
       for (int l = 0; l < m->n_layer; l++) {
         sgl_llama_layer *Lq = &m->layers[l];
         if (Lq->lin_idx >= 0) continue; /* G9: linear 层不参与 W8（无 qkv/o 权重）*/
         if (Lq->is_moe) continue;        /* G13: MoE 层无 dense gate/up/down，不量化 (走 f32) */
-        w8_quant(Lq->q_w.data, &Lq->q8, &Lq->sq8, E, E);
+        if (Lq->q8 || Lq->d8) continue;  /* t11：流式已量化 */
+        w8_quant(Lq->q_w.data, &Lq->q8, &Lq->sq8, m->q_gate ? 2 * m->q_dim : m->q_dim, E);
         w8_quant(Lq->k_w.data, &Lq->k8, &Lq->sk8, K, E);
         w8_quant(Lq->v_w.data, &Lq->v8, &Lq->sv8, K, E);
-        w8_quant(Lq->o_w.data, &Lq->o8, &Lq->so8, E, E);
+        w8_quant(Lq->o_w.data, &Lq->o8, &Lq->so8, E, m->q_dim); /* t11: o 列是 q_dim（显式 head_dim 时 ≠E）*/
         w8_quant(Lq->gate_w.data, &Lq->g8, &Lq->sg8, I, E);
         w8_quant(Lq->up_w.data, &Lq->u8, &Lq->su8, I, E);
         w8_quant(Lq->down_w.data, &Lq->d8, &Lq->sd8, E, I);
@@ -650,6 +806,10 @@ void sgl_llama_free(sgl_llama *m) {
     sgl_xfree(L->sq8); sgl_xfree(L->sk8); sgl_xfree(L->sv8); sgl_xfree(L->so8);
     sgl_xfree(L->sg8); sgl_xfree(L->su8); sgl_xfree(L->sd8);
     sgl_xfree(L->lin_a_log); sgl_xfree(L->lin_dt_bias); /* G9 */
+    if (L->lin_synth) { /* t11：qkvz/ba 合成堆缓冲 */
+      sgl_xfree(L->lin_qkvz_w.data);
+      sgl_xfree(L->lin_ba_w.data);
+    }
   }
   sgl_xfree(m->x); sgl_xfree(m->h); sgl_xfree(m->q); sgl_xfree(m->k); sgl_xfree(m->v);
   sgl_xfree(m->attn); sgl_xfree(m->gate); sgl_xfree(m->up); sgl_xfree(m->scores);
@@ -811,7 +971,9 @@ static int lin_attn_step(sgl_llama *m, const sgl_llama_layer *L, const float *hr
   int slot = lin_slot_get(m, ll, seq_key, pos);
   if (slot < 0) return -1;
   /* 1) 投影 */
-  sgl_matmul_nt(hrow, L->lin_qkvz_w.data, NULL, m->ls_qkvz, 1, 2 * keyd + 2 * vald, m->n_embd);
+  /* t11 流式：qkvz/out_proj 的 int8 走 W8A16 dp4a（L->q8/o8 复用槽）*/
+  proj_nt(m, hrow, &L->lin_qkvz_w, L->q8, L->sq8, NULL, m->ls_qkvz, 1,
+          2 * keyd + 2 * vald, m->n_embd);
   sgl_matmul_nt(hrow, L->lin_ba_w.data, NULL, m->ls_ba, 1, 2 * nh, m->n_embd);
   /* 2) 拼 mixed_qkv [q|k|v]（conv 在非交错布局上操作，同 HF）*/
   int gw = 2 * kd + 2 * ratio * vd; /* 每 k-head 组宽 */
@@ -886,8 +1048,8 @@ static int lin_attn_step(sgl_llama *m, const sgl_llama_layer *L, const float *hr
       oh[d] = oh[d] * inv * L->lin_norm_w.data[d] * (zg / (1.0f + expf(-zg)));
     }
   }
-  /* 7) out_proj */
-  sgl_matmul_nt(out, L->lin_out_w.data, NULL, orow, 1, m->n_embd, vald);
+  /* 7) out_proj（t11 流式：int8 复用 o8 槽）*/
+  proj_nt(m, out, &L->lin_out_w, L->o8, L->so8, NULL, orow, 1, m->n_embd, vald);
   m->lin_pos[(size_t)ll * m->n_lin_slots + slot] = pos + 1;
   return 0;
 }
@@ -990,11 +1152,12 @@ static int mlp_rows(sgl_llama *m, sgl_llama_layer *L, const float *h, int rows, 
       if (moe_row(m, L, h + (size_t)t * E, out + (size_t)t * E) != 0) return -1;
     return 0;
   }
-  sgl_matmul_nt(h, L->gate_w.data, NULL, m->gate, rows, m->n_inter, E);
-  sgl_matmul_nt(h, L->up_w.data, NULL, m->up, rows, m->n_inter, E);
+  /* t11：流式 int8 后 gate/up/down 的 f32 张量为空，统一走 proj_nt（W8A16/f32 分派）*/
+  proj_nt(m, h, &L->gate_w, L->g8, L->sg8, NULL, m->gate, rows, m->n_inter, E);
+  proj_nt(m, h, &L->up_w, L->u8, L->su8, NULL, m->up, rows, m->n_inter, E);
   sgl_silu_inplace(m->gate, rows * m->n_inter);
   for (size_t i = 0; i < (size_t)rows * m->n_inter; i++) m->gate[i] *= m->up[i];
-  sgl_matmul_nt(m->gate, L->down_w.data, NULL, out, rows, E, m->n_inter);
+  proj_nt(m, m->gate, &L->down_w, L->d8, L->sd8, NULL, out, rows, E, m->n_inter);
   return 0;
 }
 

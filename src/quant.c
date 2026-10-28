@@ -1,4 +1,4 @@
-﻿/* sgl quant 实现：int8 权重/激活/KV 量化 */
+/* sgl quant 实现：int8 权重/激活/KV 量化 */
 #include "sgl/quant.h"
 
 #include <stdlib.h>
@@ -32,6 +32,7 @@ float sgl_quant_row_i8(const float *x, int8_t *out, int n) {
 }
 
 void sgl_quant_rows_i8(const float *x, int8_t *out, float *scales, int rows, int dim) {
+#pragma omp parallel for schedule(static)
   for (int r = 0; r < rows; r++)
     scales[r] = sgl_quant_row_i8(x + (size_t)r * dim, out + (size_t)r * dim, dim);
 }

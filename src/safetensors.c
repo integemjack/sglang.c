@@ -17,6 +17,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <dirent.h>
+#endif
+
 #include "sgl/alloc.h"
 #include "sgl/gguf.h"
 #include "sgl/json.h"
@@ -47,9 +51,11 @@ struct sgl_st_ctx {
   st_shard sh[SGL_ST_MAX_SHARDS];
   int n_sh;
   sgl_json *root; /* index.json 解析结果（整个文档）*/
-  sgl_json *wmap; /* root.weight_map；NULL = 单文件模式 */
+  sgl_json *wmap; /* root.weight_map；NULL = 单文件/扫描模式 */
   char *dir;
   int from_index;
+  char prefix[128]; /* t11：名字回退前缀（qwen3_5 的 model.language_model.）*/
+  int has_prefix;
   /* GGUF 权重源（目录里只有 .gguf 时）：sgl_st_get 走反量化路径。
    * 上层 llama/deepseek 不用区分权重格式。*/
   sgl_gguf *gg;
@@ -421,10 +427,60 @@ static sgl_tensor shard_get(st_shard *c, const char *name, int expect_ndim,
   const uint16_t *src = (const uint16_t *)(c->data + s);
   if (is_fp8) {
     const unsigned char *p8 = (const unsigned char *)(c->data + s);
-    for (int64_t i = 0; i < numel; i++) buf[i] = fp8_to_f32(p8[i], is_fp8_e5);
+    int block_done = 0;
+    /* t11：DeepSeek/Qwen FP8 块状缩放 <name>_scale_inv [N/128, K/128]（同分片）。
+     * 实测 Qwen3.8-27B-FP8：每块 absmax 饱和在 e4m3 最大值 448，
+     * w = fp8 × scale（scale BF16）。非 2D 或无 scale 张量时按逐元素解。 */
+    if (ndim == 2 && dims[0] % 128 == 0 && dims[1] % 128 == 0) {
+      char sn[768];
+      snprintf(sn, sizeof(sn), "%s_scale_inv", name);
+      const sgl_json *se = sgl_json_get(c->header, sn);
+      if (se) {
+        const char *sdt = sgl_json_get_str(se, "dtype", "");
+        const sgl_json *sshape = sgl_json_get(se, "shape");
+        const sgl_json *soff = sgl_json_get(se, "data_offsets");
+        int64_t rn = -1, cn = -1;
+        if (sshape && sshape->type == SGL_JSON_ARRAY && sshape->count == 2) {
+          rn = (int64_t)sshape->items[0]->num;
+          cn = (int64_t)sshape->items[1]->num;
+        }
+        int s32 = !strcmp(sdt, "F32"), s16 = !strcmp(sdt, "BF16");
+        if ((s32 || s16) && rn == dims[0] / 128 && cn == dims[1] / 128 && soff &&
+            soff->type == SGL_JSON_ARRAY && soff->count == 2) {
+          size_t ss = (size_t)soff->items[0]->num;
+          if (ss + (size_t)(rn * cn) * (s32 ? 4 : 2) <= c->data_len) {
+            float *scl = (float *)sgl_xmalloc((size_t)(rn * cn) * sizeof(float));
+            if (s32) {
+              memcpy(scl, c->data + ss, (size_t)(rn * cn) * sizeof(float));
+            } else {
+              const uint16_t *sw = (const uint16_t *)(c->data + ss);
+              for (int64_t i = 0; i < rn * cn; i++) scl[i] = bf16_to_f32(sw[i]);
+            }
+            int64_t K2 = dims[1];
+#pragma omp parallel for schedule(static)
+            for (int64_t n = 0; n < dims[0]; n++) {
+              const float *sr = scl + (n >> 7) * cn;
+              float *dst = buf + n * K2;
+              const unsigned char *srow = p8 + n * K2;
+              for (int64_t k = 0; k < K2; k++)
+                dst[k] = fp8_to_f32(srow[k], is_fp8_e5) * sr[k >> 7];
+            }
+            sgl_xfree(scl);
+            block_done = 1;
+          }
+        }
+        if (!block_done)
+          SGL_ERROR("tensor '%s' scale_inv present but unusable (dtype=%s shape=%lldx%lld)",
+                    name, sdt, (long long)rn, (long long)cn);
+      }
+    }
+    if (!block_done)
+      for (int64_t i = 0; i < numel; i++) buf[i] = fp8_to_f32(p8[i], is_fp8_e5);
   } else if (is_bf16)
+#pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < numel; i++) buf[i] = bf16_to_f32(src[i]);
   else
+#pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < numel; i++) buf[i] = f16_to_f32(src[i]);
   c->owned[c->n_owned++] = buf;
   return sgl_tensor_from_data(ndim, dims, buf);
@@ -573,6 +629,79 @@ sgl_st_ctx *sgl_st_open_dir(const char *dir) {
     }
   }
 
+  /* 3.5) t11：目录里只有散分片（无 index.json，如 Qwen 官方 per-layer 导出
+   * layers-N.safetensors）：全部 mmap 打开，sgl_st_get 按名字逐分片查。*/
+  {
+    char **names = NULL;
+    int n_names = 0;
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    snprintf(p, sizeof(p), "%s\\*.safetensors", dir);
+    HANDLE h = FindFirstFileA(p, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+      int cap = 0;
+      do {
+        if (n_names == cap) {
+          cap = cap ? cap * 2 : 16;
+          names = (char **)sgl_xrealloc(names, sizeof(char *) * (size_t)cap);
+        }
+        names[n_names++] = xstrdup_(fd.cFileName);
+      } while (FindNextFileA(h, &fd));
+      FindClose(h);
+    }
+#else
+    DIR *dd = opendir(dir);
+    if (dd) {
+      struct dirent *de;
+      int cap = 0;
+      while ((de = readdir(dd)) != NULL) {
+        size_t nl = strlen(de->d_name);
+        if (nl < 13 || strcmp(de->d_name + nl - 12, ".safetensors")) continue;
+        if (n_names == cap) {
+          cap = cap ? cap * 2 : 16;
+          names = (char **)sgl_xrealloc(names, sizeof(char *) * (size_t)cap);
+        }
+        names[n_names++] = xstrdup_(de->d_name);
+      }
+      closedir(dd);
+    }
+#endif
+    if (n_names > 0) {
+      /* 排序保证 layers-10 在 layers-2 后面（仅日志好看，查找不依赖顺序）*/
+      for (int i = 0; i < n_names; i++)
+        for (int j = i + 1; j < n_names; j++)
+          if (strcmp(names[i], names[j]) > 0) {
+            char *t = names[i]; names[i] = names[j]; names[j] = t;
+          }
+      sgl_st_ctx *c = ctx_new();
+      c->dir = xstrdup_(dir);
+      for (int i = 0; i < n_names; i++) {
+        if (c->n_sh >= SGL_ST_MAX_SHARDS) {
+          SGL_ERROR("too many shards (>%d)", SGL_ST_MAX_SHARDS);
+          ctx_free(c);
+          for (int k = 0; k < n_names; k++) sgl_xfree(names[k]);
+          sgl_xfree(names);
+          return NULL;
+        }
+        char sp[1600];
+        snprintf(sp, sizeof(sp), "%s/%s", dir, names[i]);
+        if (shard_open(&c->sh[c->n_sh], sp) != 0) {
+          ctx_free(c);
+          for (int k = 0; k < n_names; k++) sgl_xfree(names[k]);
+          sgl_xfree(names);
+          return NULL;
+        }
+        c->sh[c->n_sh].name = xstrdup_(names[i]);
+        c->n_sh++;
+      }
+      for (int k = 0; k < n_names; k++) sgl_xfree(names[k]);
+      sgl_xfree(names);
+      SGL_INFO("safetensors: %d loose shard(s) scanned in %s (no index.json)", c->n_sh, dir);
+      load_quant_cfg(c, dir);
+      return c;
+    }
+  }
+
   /* 4) 没有 safetensors：退到 GGUF（llama.cpp 的量化格式）*/
   {
     sgl_gguf *gg = sgl_gguf_open_dir(dir);
@@ -592,7 +721,8 @@ sgl_st_ctx *sgl_st_open_dir(const char *dir) {
 void sgl_st_close(sgl_st_ctx *c) { ctx_free(c); }
 
 /* 直接按名字取（safetensors 原生张量，不涉及 AWQ/GPTQ 解包）。
- * index 模式下张量不在 weight_map 里时返回 null（交给 sgl_st_get 去试量化路径）。*/
+ * index 模式下张量不在 weight_map 里时返回 null（交给 sgl_st_get 去试量化路径）。
+ * t11 扫描模式（无 index.json 的散分片）：逐分片查 header，命中即用。*/
 static sgl_tensor st_get_plain(sgl_st_ctx *c, const char *name, int expect_ndim,
                               const int64_t *expect_shape) {
   if (c->wmap) {
@@ -604,7 +734,33 @@ static sgl_tensor st_get_plain(sgl_st_ctx *c, const char *name, int expect_ndim,
     return sgl_tensor_null();
   }
   if (c->n_sh == 0) return sgl_tensor_null();
-  return shard_get(&c->sh[0], name, expect_ndim, expect_shape);
+  if (c->n_sh == 1) return shard_get(&c->sh[0], name, expect_ndim, expect_shape);
+  for (int i = 0; i < c->n_sh; i++)
+    if (sgl_json_get(c->sh[i].header, name))
+      return shard_get(&c->sh[i], name, expect_ndim, expect_shape);
+  return sgl_tensor_null();
+}
+
+void sgl_st_set_prefix(sgl_st_ctx *c, const char *pfx) {
+  if (!c || !pfx || !*pfx) return;
+  snprintf(c->prefix, sizeof(c->prefix), "%s", pfx);
+  c->has_prefix = 1;
+  SGL_INFO("safetensors: name fallback prefix '%s'", c->prefix);
+}
+
+void sgl_st_drop(sgl_st_ctx *c, sgl_tensor *t) {
+  if (!c || !t || !t->data) return;
+  for (int i = 0; i < c->n_sh; i++) {
+    st_shard *s = &c->sh[i];
+    for (int j = 0; j < s->n_owned; j++)
+      if (s->owned[j] == (void *)t->data) {
+        sgl_xfree(s->owned[j]);
+        s->owned[j] = s->owned[--s->n_owned]; /* swap-remove，顺序无意义 */
+        *t = sgl_tensor_null();
+        return;
+      }
+  }
+  *t = sgl_tensor_null(); /* 非 owned（f32 零拷贝）：只置空 */
 }
 
 /* 读 config.json 的 quantization_config（AWQ/GPTQ）。没有文件/没有量化信息时 q 保持 NONE。*/
@@ -646,6 +802,13 @@ sgl_tensor sgl_st_get(sgl_st_ctx *c, const char *name, int expect_ndim,
     return sgl_tensor_from_data(nd, sh, buf);
   }
   sgl_tensor t = st_get_plain(c, name, expect_ndim, expect_shape);
+  if (sgl_tensor_is_null(t) && c->has_prefix && !strncmp(name, "model.", 6)) {
+    /* t11：VLM 包装检查点（qwen3_5）——model.X 在 model.language_model.X 下
+     *（把开头的 model. 换成 model.language_model.；lm_head 等裸名不受影响）*/
+    char pn[640];
+    snprintf(pn, sizeof(pn), "%s%s", c->prefix, name + 6);
+    t = st_get_plain(c, pn, expect_ndim, expect_shape);
+  }
   if (!sgl_tensor_is_null(t)) return t;
   /* AWQ/GPTQ：<prefix>.weight 由 <prefix>.qweight/.qzeros/.scales(/g_idx) 现场解开 */
   if (c->q.method != SGL_Q_NONE && expect_ndim <= 2) {

@@ -1,4 +1,4 @@
-﻿/* sgl jinja 实现：Jinja2 子集解释器（chat_template 专用）
+/* sgl jinja 实现：Jinja2 子集解释器（chat_template 专用）
  *
  * 三个阶段：词法切分（文本 / {{ }} / {% %}，含 {{- -}} 空白控制）→ AST → 渲染。
  * 值模型 jval 支持 undefined/null/bool/number/string/list/dict/namespace，
@@ -502,8 +502,21 @@ static int lex(arena *a, const char *src, size_t len, mtok **out, int *n_out) {
 }
 
 /* ============================ AST ============================ */
-enum { N_TEXT, N_OUT, N_SET, N_FOR, N_IF };
+enum { N_TEXT, N_OUT, N_SET, N_FOR, N_IF, N_MACRO };
 typedef struct jnode jnode;
+
+/* t11：{% macro name(a, b=expr) %}body{% endmacro %}
+ * Qwen3.8/Qwen3-Next 等 VLM 模板用宏来渲染 content（文本/图片分段），
+ * 之前不支持宏→宏调用返回 undef→用户消息整段丢失（chat 接口只会重复旧文本）。*/
+typedef struct jmacro {
+  const char *name;
+  int nparams;
+  const char **pnames;
+  const char **pdef;    /* 默认值表达式源文本，NULL = 无默认 */
+  size_t *pdeflen;
+  jnode **body;
+  int nbody;
+} jmacro;
 typedef struct {
   const char *cond;
   size_t clen;
@@ -526,12 +539,16 @@ struct jnode {
   int nebody;
   jbranch *br;
   int nbr;
+  jmacro *mac;   /* N_MACRO：宏定义 */
 };
 
 typedef struct {
   mtok *t;
   int n, i;
   arena *a;
+  jmacro **macros;  /* 解析期间收集的宏定义 */
+  int nmacros;
+  int mac_cap;
 } tps;
 
 static void stmt_kw(const mtok *m, const char **kw, size_t *kwlen) {
@@ -693,6 +710,87 @@ static jnode **parse_nodes(tps *p, const char *const *stops, int nstops, int *n_
           }
           if (p->i < p->n) p->i++; /* endfor */
         }
+      } else if (kw_is(kw, kwlen, "macro")) {
+        /* t11: macro NAME(p1, p2=expr, ...) body endmacro */
+        nd = node_new(p, N_MACRO);
+        if (!nd) return NULL;
+        jmacro *mc = (jmacro *)a_alloc(p->a, sizeof(jmacro));
+        if (!mc) return NULL;
+        const char *q = kw + kwlen;
+        const char *me = m->s + m->n;
+        while (q < me && isspace((unsigned char)*q)) q++;
+        const char *ns0 = q;
+        while (q < me && (isalnum((unsigned char)*q) || *q == '_')) q++;
+        mc->name = a_strndup(p->a, ns0, (size_t)(q - ns0));
+        while (q < me && isspace((unsigned char)*q)) q++;
+        int cap = 8;
+        mc->pnames = (const char **)a_alloc(p->a, sizeof(char *) * (size_t)cap);
+        mc->pdef = (const char **)a_alloc(p->a, sizeof(char *) * (size_t)cap);
+        mc->pdeflen = (size_t *)a_alloc(p->a, sizeof(size_t) * (size_t)cap);
+        if (!mc->pnames || !mc->pdef || !mc->pdeflen) return NULL;
+        mc->nparams = 0;
+        if (q < me && *q == '(') {
+          q++;
+          while (q < me && *q != ')') {
+            while (q < me && (isspace((unsigned char)*q) || *q == ',')) q++;
+            if (q >= me || *q == ')') break;
+            const char *pn = q;
+            while (q < me && (isalnum((unsigned char)*q) || *q == '_')) q++;
+            if (q == pn) { q++; continue; }
+            if (mc->nparams == cap) {
+              int nc = cap * 2;
+              const char **np = (const char **)a_alloc(p->a, sizeof(char *) * (size_t)nc);
+              const char **ndf = (const char **)a_alloc(p->a, sizeof(char *) * (size_t)nc);
+              size_t *ndl = (size_t *)a_alloc(p->a, sizeof(size_t) * (size_t)nc);
+              if (!np || !ndf || !ndl) return NULL;
+              memcpy(np, mc->pnames, sizeof(char *) * (size_t)cap);
+              memcpy(ndf, mc->pdef, sizeof(char *) * (size_t)cap);
+              memcpy(ndl, mc->pdeflen, sizeof(size_t) * (size_t)cap);
+              mc->pnames = np; mc->pdef = ndf; mc->pdeflen = ndl; cap = nc;
+            }
+            mc->pnames[mc->nparams] = a_strndup(p->a, pn, (size_t)(q - pn));
+            while (q < me && isspace((unsigned char)*q)) q++;
+            if (q < me && *q == '=') {
+              q++;
+              while (q < me && isspace((unsigned char)*q)) q++;
+              const char *ds = q;
+              int depth = 0;
+              while (q < me) {
+                if (*q == '(' || *q == '[' || *q == '{') depth++;
+                else if (*q == ')' && depth == 0) break;
+                else if (*q == ')' || *q == ']' || *q == '}') depth--;
+                else if (*q == ',' && depth == 0) break;
+                q++;
+              }
+              const char *de = q;
+              while (de > ds && isspace((unsigned char)de[-1])) de--;
+              mc->pdef[mc->nparams] = ds;
+              mc->pdeflen[mc->nparams] = (size_t)(de - ds);
+            } else {
+              mc->pdef[mc->nparams] = NULL;
+              mc->pdeflen[mc->nparams] = 0;
+            }
+            mc->nparams++;
+          }
+        }
+        p->i++;
+        static const char *stm[] = {"endmacro"};
+        int nb = 0;
+        jnode **bd = parse_nodes(p, stm, 1, &nb);
+        if (!bd && nb < 0) return NULL;
+        mc->body = bd;
+        mc->nbody = nb;
+        if (p->i < p->n) p->i++; /* endmacro */
+        nd->mac = mc;
+        if (p->nmacros == p->mac_cap) {
+          int nc = p->mac_cap ? p->mac_cap * 2 : 8;
+          jmacro **nl = (jmacro **)a_alloc(p->a, sizeof(jmacro *) * (size_t)nc);
+          if (!nl) return NULL;
+          if (p->nmacros) memcpy(nl, p->macros, sizeof(jmacro *) * (size_t)p->nmacros);
+          p->macros = nl;
+          p->mac_cap = nc;
+        }
+        p->macros[p->nmacros++] = mc;
       } else if (kw_is(kw, kwlen, "set")) {
         nd = node_new(p, N_SET);
         if (!nd) return NULL;
@@ -742,7 +840,15 @@ typedef struct {
   sb *out;
   int err;
   char msg[256];
+  jmacro **macros;  /* t11：可供调用的宏 */
+  int nmacros;
+  int depth;        /* t11：宏递归/嵌套深度（防爆栈）*/
 } rctx;
+
+static jval *eval_text(rctx *c, const char *s, size_t len);
+static void run_nodes(rctx *c, jnode **ns, int n);
+
+static void run_nodes(rctx *c, jnode **ns, int n);
 
 static void scope_push(rctx *c, const char *name, jval *v) {
   sc *s = (sc *)a_alloc(c->a, sizeof(sc));
@@ -1183,6 +1289,43 @@ static jval *ex_primary(ex *e) {
       for (long i = b; (st > 0 ? i < en2 : i > en2); i += st) v_push(a, l, v_num(a, (double)i));
       return l;
     }
+    /* t11：宏调用——把宏体渲染到临时缓冲，作为字符串值返回 */
+    for (int mi = 0; mi < e->c->nmacros; mi++) {
+      jmacro *mc = e->c->macros[mi];
+      if (!mc || !mc->name || strcmp(mc->name, name) != 0) continue;
+      if (e->c->depth > 32) {
+        ex_fail(e, "macro recursion too deep");
+        return v_undef(a);
+      }
+      rctx *c = e->c;
+      sb tmp;
+      sb_init(&tmp);
+      sb *saved_out = c->out;
+      sc *saved_vars = c->vars;
+      c->out = &tmp;
+      c->depth++;
+      for (int pi = 0; pi < mc->nparams; pi++) {
+        jval *pv = NULL;
+        for (int ai = 0; ai < nargs; ai++)
+          if (kw_names[ai] && !strcmp(kw_names[ai], mc->pnames[pi])) { pv = args[ai]; break; }
+        if (!pv && pi < nargs && !kw_names[pi]) pv = args[pi];
+        if (!pv && mc->pdef[pi] && mc->pdeflen[pi]) pv = eval_text(c, mc->pdef[pi], mc->pdeflen[pi]);
+        if (!pv) pv = v_undef(a);
+        scope_push(c, mc->pnames[pi], pv);
+        if (c->err) break;
+      }
+      if (!c->err) run_nodes(c, mc->body, mc->nbody);
+      c->depth--;
+      c->out = saved_out;
+      c->vars = saved_vars;
+      if (c->err) {
+        sb_free(&tmp);
+        return v_undef(a);
+      }
+      char *rs = a_strndup(a, tmp.p ? tmp.p : "", tmp.len);
+      sb_free(&tmp);
+      return v_str(a, rs ? rs : "");
+    }
     /* 未知函数：按无参返回 undef */
     return v_undef(a);
   }
@@ -1549,7 +1692,6 @@ static jval *eval_text(rctx *c, const char *s, size_t len) {
 }
 
 /* ============================ 渲染 ============================ */
-static void run_nodes(rctx *c, jnode **ns, int n);
 
 static jval *make_loop(arena *a, int i, int n) {
   jval *l = v_dict(a, 0);
@@ -1568,6 +1710,7 @@ static void run_node(rctx *c, jnode *nd) {
   arena *a = c->a;
   switch (nd->k) {
     case N_TEXT: sb_put(c->out, nd->text, nd->tlen); break;
+    case N_MACRO: break; /* t11：宏定义本身不输出（已在调用处渲染）*/
     case N_OUT: {
       jval *v = eval_text(c, nd->expr, nd->elen);
       if (!c->err) sb_puts(c->out, v_tostr(a, v));
@@ -1660,6 +1803,8 @@ struct sgl_jinja {
   size_t src_len;
   jnode **nodes;
   int n;
+  jmacro **macros;  /* t11：模板里定义的宏 */
+  int nmacros;
   const char *bos;
   const char *eos;
 };
@@ -1679,7 +1824,7 @@ sgl_jinja *sgl_jinja_from_text(const char *tpl, size_t len) {
     sgl_jinja_free(j);
     return NULL;
   }
-  tps p = {toks, ntoks, 0, &j->a};
+  tps p = {toks, ntoks, 0, &j->a, NULL, 0, 0};
   int nn = 0;
   j->nodes = parse_nodes(&p, NULL, 0, &nn);
   if (!j->nodes && nn < 0) {
@@ -1688,6 +1833,8 @@ sgl_jinja *sgl_jinja_from_text(const char *tpl, size_t len) {
     return NULL;
   }
   j->n = nn;
+  j->macros = p.macros; /* t11 */
+  j->nmacros = p.nmacros;
   if (j->a.oom) {
     sgl_jinja_free(j);
     return NULL;
@@ -1773,6 +1920,8 @@ int sgl_jinja_render(const sgl_jinja *j, const sgl_json *messages, int add_gener
   memset(&c, 0, sizeof(c));
   c.a = &a;
   c.out = &o;
+  c.macros = j->macros; /* t11：让宏调用可见 */
+  c.nmacros = j->nmacros;
 
   jval *msgs = messages ? json_to_val(&a, messages) : v_list(&a);
   scope_push(&c, "messages", msgs);

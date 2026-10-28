@@ -258,7 +258,6 @@ if(SGL_CUDA)
       endif()
     endif()
     message(STATUS "nvcc host: ${MSVC_CCBIN}")
-    set(SGL_CUDA_OBJ ${CMAKE_CURRENT_BINARY_DIR}/cuda_backend.obj)
     set(SGL_NVCC_HOST_FLAGS -ccbin "${MSVC_CCBIN}")
     set(SGL_NVCC_ARCH_FLAGS "")
     foreach(_a ${SGL_CUDA_ARCH})
@@ -270,8 +269,6 @@ if(SGL_CUDA)
     # 非 MSVC：host 编译器由 nvcc 自己在 PATH 里找 g++/clang++；产物 .o 要 -fPIC
     #（Ubuntu 的 gcc 默认 -fPIE，PIC 目标同样能链进 PIE 可执行文件）。
     # 额外嵌一份 PTX：sm_75 的 cubin 不能直接跑在 sm_80+ 上，驱动可 JIT 这份 PTX。
-    set(SGL_CUDA_OBJ ${CMAKE_CURRENT_BINARY_DIR}/cuda_backend.o)
-    set(SGL_NVCC_HOST_FLAGS "")
     set(SGL_NVCC_ARCH_FLAGS "")
     foreach(_a ${SGL_CUDA_ARCH})
       # 一个 --generate-code 里要带两个 code 必须用方括号（否则 nvcc 报
@@ -281,17 +278,33 @@ if(SGL_CUDA)
     endforeach()
     set(SGL_NVCC_EXTRA_FLAGS -Xcompiler -fPIC)
   endif()
-  add_custom_command(
-    OUTPUT ${SGL_CUDA_OBJ}
-    COMMAND ${NVCC_EXE} -c ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_backend.cu
-            -I${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${SGL_NVCC_HOST_FLAGS}
-            ${SGL_NVCC_ARCH_FLAGS}
-            ${SGL_NVCC_EXTRA_FLAGS}
-            -O2 -o ${SGL_CUDA_OBJ}
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_backend.cu
-    COMMENT "nvcc cuda_backend.cu (sm_${SGL_CUDA_ARCH})"
-    VERBATIM)
+  # 每个 .cu 各自一条 nvcc 命令（cuda_backend.cu = llama/gpt2；cuda_deepseek.cu = MLA+MoE）。
+  # 之前只有一份，CUDA 源多起来后既有硬编码必须改成循环。
+  set(SGL_CUDA_SRCS cuda_backend cuda_deepseek)
+  set(SGL_CUDA_OBJS "")
+  foreach(_cu ${SGL_CUDA_SRCS})
+    if(MSVC)
+      set(_obj ${CMAKE_CURRENT_BINARY_DIR}/${_cu}.obj)
+    else()
+      set(_obj ${CMAKE_CURRENT_BINARY_DIR}/${_cu}.o)
+    endif()
+    set(SGL_CUDA_OBJ ${_obj})
+    add_custom_command(
+      OUTPUT ${_obj}
+      COMMAND ${NVCC_EXE} -c ${CMAKE_CURRENT_SOURCE_DIR}/src/${_cu}.cu
+              -I${CMAKE_CURRENT_SOURCE_DIR}/include
+              ${SGL_NVCC_HOST_FLAGS}
+              ${SGL_NVCC_ARCH_FLAGS}
+              ${SGL_NVCC_EXTRA_FLAGS}
+              -O2 -o ${_obj}
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/${_cu}.cu
+              ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl/cuda.h
+              ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl/cuda_deepseek.h
+              ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl/deepseek.h
+      COMMENT "nvcc ${_cu}.cu (sm_${SGL_CUDA_ARCH})"
+      VERBATIM)
+    list(APPEND SGL_CUDA_OBJS ${_obj})
+  endforeach()
   # sgl_cuda = 与 CPU 库 sgl 同一份源（含 http.c / scheduler.c / radix.c）+ nvcc 后端对象。
   # 这样 sglc.exe 可以只链 sgl_cuda 一个库，就把 CPU 引擎和 GPU 引擎都编进同一个可执行文件
   # （--device auto：有显卡跑 GPU，没显卡回落 CPU，不再需要 cuda_http.exe 这个额外程序）。
@@ -302,7 +315,7 @@ if(SGL_CUDA)
     list(APPEND SGL_CORE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/dot_avx2_msvc.c) # G18: MSVC 的 AVX2 内积（单独 /arch:AVX2 编译 + CPUID 分派）
     list(REMOVE_DUPLICATES SGL_CORE_SRC)
   endif()
-  add_library(sgl_cuda STATIC ${SGL_CORE_SRC} ${SGL_CUDA_OBJ})
+  add_library(sgl_cuda STATIC ${SGL_CORE_SRC} ${SGL_CUDA_OBJS})
   # dot_avx2_msvc.c 单独开 /arch:AVX2（MSVC 没有函数级 target 属性）
   if(MSVC)
     set_source_files_properties(src/dot_avx2_msvc.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
@@ -332,6 +345,12 @@ if(SGL_CUDA)
   endif()
   add_executable(cuda_test tests/cuda_test.c)
   target_link_libraries(cuda_test PRIVATE sgl_cuda)
+  # 迷你 qwen3_5（hybrid + q_gate）CPU vs GPU 逐层数值对比
+  add_executable(cuda_qwen35_test tests/cuda_qwen35_test.c)
+  target_link_libraries(cuda_qwen35_test PRIVATE sgl_cuda)
+  # DeepSeek（MLA + MoE）的 GPU 前向：与 CPU 引擎对比（不是 ctest，需要真显卡）
+  add_executable(cuda_deepseek_test tests/cuda_deepseek_test.c)
+  target_link_libraries(cuda_deepseek_test PRIVATE sgl_cuda)
   add_executable(cuda_cli apps/cuda_cli.c)
   target_link_libraries(cuda_cli PRIVATE sgl_cuda)
   add_executable(long_vcpu tests/long_vcpu.c)  # t2 acceptance: 8K prefill GPU vs CPU
@@ -367,7 +386,7 @@ if(SGL_CUDA)
       message(FATAL_ERROR "cublas.lib not found under ${CUDA_TOOLKIT_DIR}/lib (arch ${SGL_WIN_CUDA_ARCH_DIR})")
     endif()
     message(STATUS "CUDA libs: ${SGL_WIN_CUDA_LIBDIR}")
-    foreach(t cuda_test cuda_cli long_vcpu cuda_perf cuda_http sglc)
+    foreach(t cuda_test cuda_qwen35_test cuda_deepseek_test cuda_cli long_vcpu cuda_perf cuda_http sglc)
       target_link_libraries(${t} PRIVATE
           "${SGL_WIN_CUDA_LIBDIR}/cudart_static.lib"
           "${SGL_WIN_CUDA_LIBDIR}/cublas.lib")
@@ -416,7 +435,7 @@ if(SGL_CUDA)
     # 才报 "undefined reference to __cxa_guard_acquire"。
     set(SGL_CUDA_RUNTIME_LIBS ${SGL_CUDART_STATIC} ${SGL_CUBLAS_LIB} stdc++ pthread dl rt m)
     message(STATUS "CUDA link libs: ${SGL_CUDA_RUNTIME_LIBS}")
-    foreach(t cuda_test cuda_cli long_vcpu cuda_perf cuda_http sglc)
+    foreach(t cuda_test cuda_qwen35_test cuda_deepseek_test cuda_cli long_vcpu cuda_perf cuda_http sglc)
       target_link_libraries(${t} PRIVATE ${SGL_CUDA_RUNTIME_LIBS})
     endforeach()
   endif()

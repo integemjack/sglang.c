@@ -1,4 +1,4 @@
-﻿/* sgl cuda_http.c - GPU HTTP inference server (MSVC build, links sgl_cuda)
+/* sgl cuda_http.c - GPU HTTP inference server (MSVC build, links sgl_cuda)
  * endpoints: GET /health, POST /generate, POST /v1/completions,
  *            POST /v1/chat/completions (chatml template; stream via SSE)
  * engine: KV-segment scheduler on GPU - each request gets a segment of
@@ -173,6 +173,7 @@ typedef struct {
   char gpu_err[256];  /* G5: why the GPU engine is unavailable (degraded mode) */
   int degraded;       /* G5: 1 = serving without GPU; every generate gets 503 */
   int last_prompt_tokens; /* P1: 最近一次因单段容量被拒的 prompt token 数（给错误文案用）*/
+  int pfx_ok; /* t11：hybrid 模型关闭前缀复用（见启动处）*/
 } engine;
 
 static engine E;
@@ -433,7 +434,11 @@ static int submit2(const char *text, int max_new, const sgl_sampling_params *sp,
                    float *img_feats, int n_img) {
   /* t11: cap prompt length before the O(n^2)-ish BPE merge — a pathological
    * 200KB single-char body used to park encode for minutes (server hang). */
-  if (!text || strlen(text) > 65536) { sgl_xfree(img_feats); return -1; }
+  /* t11: 上限是【字节】不是 token。之前 64KB 对中文太小——1 个汉字 3 字节，
+   * 64KB 只装得下约 2.2 万汉字（≈1.4 万 token），一到大上下文就提前 503。
+   * 真正的隐患是病态输入的长 BPE 合并（海量单字符），所以保留一个字节上限，
+   * 但放到 1MB（≈ 33 万汉字），足够 256K 上下文的普通文本。*/
+  if (!text || strlen(text) > (size_t)(1u << 20)) { sgl_xfree(img_feats); return -1; }
   /* t5: no more 503 when full — park in a wait queue; the worker drains it
    * into freed slots every pass. Hard cap only guards against unbounded
    * queue growth (128 waiting). */
@@ -496,7 +501,7 @@ SGL_THREAD_SIG(worker) {
          * G15: ① 行数不再只算 prompt，而是「这个段里确实有有效 KV 的行」（含生成 token，
          * 多轮对话/续写直接受益）；② 带图的请求也登记了（只登到 text 末：视觉行依赖
          * 图片，位置在 text 之后，不归这段登记管）。*/
-        if (E.gpu && r->reached_run && r->seg == i && r->n_prompt >= PFX_MIN)
+        if (E.gpu && E.pfx_ok && r->reached_run && r->seg == i && r->n_prompt >= PFX_MIN)
           pfx_register_req(i, r);
         req_free(r);
         E.reqs[i] = NULL;
@@ -545,7 +550,7 @@ SGL_THREAD_SIG(worker) {
        * 全命中时留最后一个 token 重算一遍（那一行 KV 值不变），否则本轮得
        * 不到 logits。带图的请求也参与（能命中 text 部分，视觉行照旧算）。*/
       int off = 0;
-      if (E.gpu && r->n_prompt >= PFX_MIN) {
+      if (E.gpu && r->n_prompt >= PFX_MIN && E.pfx_ok) {
         int src_seg = -1;
         int hit = pfx_match(r->prompt, r->n_prompt, &src_seg);
         if (hit >= r->n_prompt) hit = r->n_prompt - 1;
@@ -567,14 +572,32 @@ SGL_THREAD_SIG(worker) {
       } else if (E.gpu) {
         g_pfx_misses++;
       }
+      /* t11：告诉引擎本序列用哪个线性注意力递归状态槽（= 段号）。
+       * 递归状态不能像 KV 那样按位置重建，不设就会全用槽 0 而互相覆盖。*/
+      sgl_cuda_set_lin_slot(E.gpu, i);
+      if (getenv("SGL_HTTP_DBG"))
+        fprintf(stderr, "[pf] id=%d seg=%d slot=%d nprompt=%d off=%d\n",
+                r->id, i, i, r->n_prompt, off);
       if (r->n_prompt + r->n_img > r->seg_len) {
         rc = -2; /* prompt (+visual tokens) exceeds its KV segment capacity */
         pfx_flush_all(); /* G15(b): 现场已经不干净（本请求要的比一段还长），
                           * 把租让全丢掉，别让后续请求命中半截。*/ 
       } else {
         rc = 0;
+        /* t11：真正分块 prefill。原来 chunk = 整段剩余 prompt，激活工作区要
+         * 按「整段的同时行数」分配（约 405 KiB/行）——想要 32K 上下文就要
+         * 13 GiB 工作区，必然 OOM。现在每次最多 SGL_PREFILL_CHUNK 行（默认
+         * 1024，约 405 MiB 工作区），KV 按 base+pos0 累加、递归状态不清零
+         * （只有 pos0==0 的那一块才清），结果与一次算完等价。*/
+        static int pch = 0;
+        if (pch <= 0) {
+          const char *ce = getenv("SGL_PREFILL_CHUNK");
+          pch = (ce && atoi(ce) > 0) ? atoi(ce) : 1024;
+          if (pch > 8192) pch = 8192;
+        }
         while (off < r->n_prompt && rc == 0) {
           int chunk = r->n_prompt - off;
+          if (chunk > pch) chunk = pch;
           /* only the last chunk needs the lm_head pass + logits D2H */
           float *dst = (off + chunk >= r->n_prompt && r->n_img == 0) ? r->logits : NULL;
           rc = sgl_cuda_forward_seg(E.gpu, r->prompt + off, chunk, off, base, dst);
@@ -668,7 +691,7 @@ SGL_THREAD_SIG(worker) {
         E.tot_decode++;
       }
       /* 2b) batch forward last token of each still-running seq */
-      int bt[MAX_CONC], bb[MAX_CONC], bl[MAX_CONC];
+      int bt[MAX_CONC], bb[MAX_CONC], bl[MAX_CONC], bs[MAX_CONC];
       int nb = 0;
       request *br[MAX_CONC];
       for (int b = 0; b < B; b++) {
@@ -684,10 +707,18 @@ SGL_THREAD_SIG(worker) {
         bt[nb] = r->gen[r->n_gen - 1];
         bb[nb] = r->seg * E.seg_len;
         bl[nb] = r->n_prompt + r->n_img + r->n_gen - 1;
+        bs[nb] = r->seg;   /* t11：本行的线性注意力状态槽 */
         br[nb] = r;
         nb++;
       }
       if (nb > 0) {
+        sgl_cuda_set_decode_slots(E.gpu, bs, nb);
+        if (getenv("SGL_HTTP_DBG")) {
+          fprintf(stderr, "[dec] nb=%d", nb);
+          for (int q = 0; q < nb; q++)
+            fprintf(stderr, " | tok=%d base=%d len=%d slot=%d", bt[q], bb[q], bl[q], bs[q]);
+          fprintf(stderr, "\n");
+        }
         int rc = sgl_cuda_decode_batch(E.gpu, bt, bb, bl, nb, batch_logits);
         if (rc != 0) {
           for (int b = 0; b < nb; b++) br[b]->state = R_FAIL;
@@ -708,6 +739,15 @@ SGL_THREAD_SIG(worker) {
     }
     /* end of pass: release lock before looping (Enter at top) */
     LeaveCriticalSection(&E.lock);
+    /* t11：让出 CPU。worker 每轮 decode 只前进 1 个 token，释放锁后立刻重抢，
+     * 等待中的 HTTP 线程（wait_done）几乎永远抢不到锁 → SSE 流式变成
+     * “生成完毕才一次性吐完”（实测首字延迟 = 全部生成时间）。这里给等待者
+     * 一个 200μs 窗口（33 tok/s 下每 token 多 0.2ms，可忽略）。*/
+#ifndef _WIN32
+    { struct timespec _ts = {0, 200000}; nanosleep(&_ts, NULL); }
+#else
+    Sleep(0);
+#endif
   }
   free(batch_logits);
   SGL_THREAD_RETURN;
@@ -1151,10 +1191,19 @@ static request *find_req(int id) {
 
 /* wait until request id reaches DONE/FAIL; optionally stream SSE meanwhile */
 static int wait_done(SOCKET fd, int id, char **text, request **out_r) {
+  static int dbgw = -1;
+  unsigned long long t_w0 = GetTickCount64();
+  int nwake = 0;
   for (;;) {
     EnterCriticalSection(&E.lock);
+    if (dbgw < 0) { const char *e = getenv("SGL_HTTP_DBG"); dbgw = e ? atoi(e) : 0; }
     request *r = find_req(id);
     if (!r) { LeaveCriticalSection(&E.lock); return -1; }
+    if (dbgw > 0 && (nwake < 8 || (r->state == R_DONE)))
+      fprintf(stderr, "[wait] t=%llums #%d id=%d state=%d gen=%d streamed=%d streaming=%d\n",
+              GetTickCount64() - t_w0, nwake, id, r->state, r->n_gen, r->n_streamed,
+              r->streaming);
+    nwake++;
     if (r->state == R_DONE) {
       /* t5 fix: fast requests reach DONE before wait_done ever entered its
        * streaming loop — flush any un-streamed tokens first so the SSE client
@@ -1606,11 +1655,25 @@ int sgl_cuda_http_serve(const char *dir, int port, const char *host) {
     int conc = ACTIVE_CONC;
     if (ec) { int c = atoi(ec); if (c >= 1 && c <= MAX_CONC) conc = c; }
     int rows = want / conc;
+    /* t11：工作区不再按「整段」预留——prefill 已分块（SGL_PREFILL_CHUNK），
+     * 峰值行数就是块大小；用 want/conc 会估出 26GB 工作区把合法的
+     * 大上下文配置错判成显存不足（ctx=65536 时 need 61GB）。*/
+    {
+      const char *pc = getenv("SGL_PREFILL_CHUNK");
+      int pch = (pc && atoi(pc) > 0) ? atoi(pc) : 1024;
+      if (pch > 8192) pch = 8192;
+      if (pch < 256) pch = 256;
+      if (rows > pch) rows = pch;
+    }
     long need = sgl_cuda_estimate_vram_mb(E.cpu, want, rows);
     long avail = sgl_cuda_avail_vram_mb();
     printf("[engine] vram precheck: need ~%ldMB, free %ldMB (ctx=%d rows=%d)\n", need, avail, want, rows);
     fflush(stdout);
-    if (need > 0 && avail > 0 && avail < need + 192) {
+    if (need > 0 && avail > 0 && avail + 3072 < need) {
+      /* t11：估算口径偏保守（实测 ctx=4096 时估 ~32.4GB、实际 29.6GB）。
+       * Linux 上 cudaMalloc 失败是干净的（不像 Windows WDDM 会静默溢到
+       * 系统内存），所以只在明显不够（差 3GB 以上）时提前降级，其余交给
+       * 真实分配判定——否则 48K/64K 这种合法大上下文配置会被误杀。*/
       snprintf(E.gpu_err, sizeof(E.gpu_err),
                "insufficient VRAM: model needs ~%ldMB, %ldMB free (lower SGL_CUDA_CTX or use SGL_CUDA_FP16=1/SGL_CUDA_W8=1)",
                need, avail);
@@ -1631,10 +1694,18 @@ int sgl_cuda_http_serve(const char *dir, int port, const char *host) {
   if (E.degraded) E.seg_len = 0;
   char tpath[1024];
   snprintf(tpath, sizeof(tpath), "%s/tokenizer.json", dir);
-  E.tok = sgl_tokenizer_load(tpath);
+  /* t11：必须走 load_dir——它会在 tokenizer_config.json 里解析 eos_token（字符串/
+   * 对象形式，如 Qwen 的 "<|im_end|>"）并覆盖。直接 load 则 eos 恒为 -1，
+   * 导致生成永远不停止（“Hello!!!!!!!!” 循环）。*/
+  E.tok = sgl_tokenizer_load_dir(dir);
+  if (!E.tok) E.tok = sgl_tokenizer_load(tpath); /* 退路：无 tokenizer_config */
   if (!E.tok) return 2;
   E.vocab = E.cpu->vocab;
   E.eos = sgl_tokenizer_eos_id(E.tok);
+  /* t11：线性注意力（hybrid）模型不能做前缀复用——KV 能按位置拷贝，但递归状态
+   * （gated-deltanet 的 state + conv 历史）没有中间快照，命中前缀后跳过那段 prefill
+   * 就等于用错的 state 继续。多轮对话/固定 system prompt 时必然失真，所以禁用。*/
+  E.pfx_ok = (sgl_cuda_lin_slots(E.gpu) <= 0);
   /* P0-2: 模型自带 chat_template（tokenizer_config.json）；P1: 响应体里的 model 字段 */
   E.jinja = sgl_jinja_load_dir(dir);
   {
@@ -1731,8 +1802,17 @@ int sgl_cuda_http_serve(const char *dir, int port, const char *host) {
    *       失败 —— capture 前先跑一次 plain step 预热。
    * SGL_CUDA_GRAPH=0 仍可显式关闭。 */
   if (E.gpu) {
-    int warmed = sgl_cuda_prewarm(E.gpu, E.seg_len, ACTIVE_CONC);
-    printf("[engine] prewarm: ws rows=%d, decode graphs %d/%d\n", E.seg_len, warmed, ACTIVE_CONC);
+    /* t11：prewarm 只为「预先把工作区撑到位、避免 decode graph 反复失效」，
+     * 它的行数应跟 prefill 分块大小一致，而不是 seg_len。
+     * 之前传 seg_len（大上下文时 18432）→ 要 12GB 工作区直接 OOM，
+     * 把显存吃干后长 prompt 的 prefill 全部失败（503）。*/
+    const char *pc = getenv("SGL_PREFILL_CHUNK");
+    int pch = (pc && atoi(pc) > 0) ? atoi(pc) : 1024;
+    if (pch > 8192) pch = 8192;
+    int warm_rows = E.seg_len < pch ? E.seg_len : pch;
+    int warmed = sgl_cuda_prewarm(E.gpu, warm_rows, ACTIVE_CONC);
+    printf("[engine] prewarm: ws rows=%d (seg=%d chunk=%d), decode graphs %d/%d\n",
+           warm_rows, E.seg_len, pch, warmed, ACTIVE_CONC);
   }
   printf("[engine] loaded in %.1fs; ctx=%d seg=%d conc=%d eos=%d%s\n",
          (double)clock() / CLOCKS_PER_SEC - t0, E.gpu ? sgl_cuda_ctx(E.gpu) : 0,

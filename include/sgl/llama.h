@@ -1,4 +1,4 @@
-﻿/* sgl/llama.h — Llama 系模型（Llama/TinyLlama/Qwen 同构：RoPE/RMSNorm/SwiGLU/GQA）
+/* sgl/llama.h — Llama 系模型（Llama/TinyLlama/Qwen 同构：RoPE/RMSNorm/SwiGLU/GQA）
  * 对应 sglang srt/models/llama.py 的 CPU 单流路径（prefill + 增量 decode）。
  * KV 池：分页 + 引用计数（与 gpt2 相同语义，页大小 = kv_dim）。 */
 #ifndef SGL_LLAMA_H
@@ -26,6 +26,7 @@ typedef struct {
   sgl_tensor lin_out_w;                      /* [E, value_dim] */
   float *lin_a_log, *lin_dt_bias;            /* [nvh]（堆拷贝，sgl_xfree）*/
   int lin_idx;                               /* 递归状态池的层内序号；非 linear = -1 */
+  int lin_synth;                             /* t11：1 = lin_qkvz_w/lin_ba_w 是合成堆缓冲（free 时释放）*/
   /* ---- G13 Qwen3-Next full_attention 真实特性 ---- */
   sgl_tensor router_w;                       /* [n_experts, E] MoE 路由器（is_moe 层）*/
   sgl_tensor exp_gate_up;                    /* [n_experts, 2*moe_inter, E] 专家 gate|up 融合 */

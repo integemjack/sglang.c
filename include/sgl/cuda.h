@@ -1,4 +1,4 @@
-﻿/* sgl/cuda.h — CUDA 后端（M9 v1）：llama 系模型的 GPU 单流前向
+/* sgl/cuda.h — CUDA 后端（M9 v1）：llama 系模型的 GPU 单流前向
  * 权重在加载时上传设备；KV 连续存储（不分页，v1）；采样在主机。
  * 复用 llama.c 的加载器（sgl_llama*）作为权重源与配置来源。 */
 #ifndef SGL_CUDA_H
@@ -53,6 +53,14 @@ int sgl_cuda_vocab(const sgl_cuda_model *m);
  * logits_out needs B*vocab floats. */
 int sgl_cuda_decode_batch(sgl_cuda_model *m, const int *tokens, const int *base_pos,
                           const int *lens, int B, float *logits_out);
+
+/* t11: hybrid（linear attention）模型的每请求递归状态槽。
+ * 递归状态（state+conv hist）不能像 KV 那样按位置寻址，所以每个并发序列必须
+ * 用独立的槽：prefill/decode 前告诉引擎“本序列用哪个槽”（一般 = 段号 seg）。 */
+void sgl_cuda_set_lin_slot(sgl_cuda_model *m, int slot);
+/* 一次为 batch 的每一行设槽（decode 内部逐行前向时用），B > 32 会被截断 */
+void sgl_cuda_set_decode_slots(sgl_cuda_model *m, const int *slots, int B);
+int sgl_cuda_lin_slots(const sgl_cuda_model *m);
 
 /* G3: 预热 + 预捕获。把激活工作区一次性撑到 rows（服务端 = 最大 prefill 块），
  * batch 镜像撑到 max_b，然后为 B=1..max_b 各捕获一张 decode graph。返回捕获成功
