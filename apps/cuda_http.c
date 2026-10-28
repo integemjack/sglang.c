@@ -108,7 +108,10 @@ static unsigned long long sgl_tick_ms(void) {
 #include "sgl/safetensors.h"
 #include "sgl/sampling.h"
 
-#define MAX_CONC 8
+/* M0: 从 8 提到 32 —— batch GDN 已经把 hybrid 模型的 B>1 decode 真正并行化
+ * （实测聚合 36.8 → 141.6 tok/s @B=8），并发上限不再由 kernel 串行决定。
+ * 需配合 SGL_LIN_SLOTS >= 并发数（每个请求一个 GDN 递归状态槽）。*/
+#define MAX_CONC 32
 #define MAX_NEW_CAP 512
 
 static int ACTIVE_CONC = 8; /* effective concurrency, SGL_HTTP_CONC overrides */

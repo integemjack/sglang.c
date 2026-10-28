@@ -88,6 +88,7 @@ struct sgl_cuda_model {
   int use_w8;   /* t8: SGL_CUDA_W8=1 -> int8 hidden projections (dp4a decode) */
  int emb_h;    /* t11：embed/lm_head 存 fp16（w8 模式默认）*/
   __half *wte_h;            /* [V,E] embed table; lm_head aliases when tied */
+  __half *wte_h_host;       /* M0: 若非 NULL，embed 在 mapped pinned host（wte_h 是其设备别名）*/
   __half *lm_head_h;        /* [V,E] (aliases wte_h when tied embeddings) */
   __half **qw_h, **kw_h, **vw_h, **ow_h;
   __half **gw_h, **uw_h, **dw_h;
@@ -618,6 +619,145 @@ __global__ void k_lin_gnorm(float *o, const float *z, const float *nw, int nh, i
   int h = blockIdx.x;
   float *oh = o + (long)h * vd;
   const float *zh = z + (long)(h / ratio) * gw + 2 * kd + (long)ratio * vd + (long)(h % ratio) * vd;
+  (void)nh;
+  float ss = 0;
+  for (int i = threadIdx.x; i < vd; i += blockDim.x) ss += (double)oh[i] * oh[i];
+  red[threadIdx.x] = ss;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  float inv = rsqrtf(red[0] / vd + eps);
+  for (int d = threadIdx.x; d < vd; d += blockDim.x)
+    oh[d] = oh[d] * inv * nw[d] * (zh[d] / (1.0f + __expf(-zh[d])));
+}
+
+/* ---- M0: 批量 GDN 四个 kernel（B 行 = B 个独立请求，各用自己的 state slot）----
+ * 起因：下面 path=0 的四个 kernel 都是「单 token、单 slot、slot 偏移由 host 传」，
+ * 所以 hybrid 模型的 B>1 decode 只能 for(b) 串行跑完 64 层。实测（5090，ctx=2048，
+ * lin_slots=16）聚合吞吐恒 36.8 tok/s 与并发完全无关，每请求严格按 1/N 衰减：
+ *   conc=1 36.75, conc=2 18.42, conc=4 9.22, conc=8 4.59 tok/s —— 0% 并行度。
+ *
+ * batch 版把「行」放进 grid.y，slot 从 device 数组 dslot[b] 读 → 一次 launch
+ * 处理全部 B 行；slot 偏移在 kernel 内算，host 不再参与，因此也能进 CUDA graph。
+ *
+ * 刻意用 path=0（逐 token 四段）而不是 path=2 的融合 kernel：融合版假设「n 个
+ * token 属于同一序列、同一条递归链」，而 batch decode 是 B 个不同序列各 1 个
+ * token，递归互不相关，语义不同。
+ * hbase/hstride 事先算好「层偏移」与「槽步长」：
+ *   hoff = hbase + slot*hstride,  hbase = ll*lin_slots*convd*(K-1),
+ *   hstride = convd*(K-1);  sbase = ll*lin_slots*nh*kd*vd, sstride = nh*kd*vd。*/
+
+/* conv：grid(ceil(convd/128), B)；qkvz [B][rowN]，io [B][convd] */
+__global__ void k_lin_conv_b(const float *cw, float *hist, const float *qkvz,
+                             float *io, int nk, int kd, int nh, int vd,
+                             int ratio, int K, const int *dslot,
+                             long hbase, long hstride, int rowN) {
+  int b = blockIdx.y;
+  int keyd = nk * kd;
+  int convd = 2 * keyd + nh * vd;
+  int gw = 2 * kd + 2 * ratio * vd;
+  const float *qv = qkvz + (long)b * rowN;
+  float *oi = io + (long)b * (long)convd;
+  float *hof = hist + hbase + (long)(dslot ? dslot[b] : 0) * hstride;
+  for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < convd;
+       c += gridDim.x * blockDim.x) {
+    long src;
+    if (c < keyd) src = (long)(c / kd) * gw + (c % kd);
+    else if (c < 2 * keyd) { int g = (c - keyd) / kd; src = (long)g * gw + kd + ((c - keyd) % kd); }
+    else { int g = (c - 2 * keyd) / (ratio * vd); src = (long)g * gw + 2 * kd + ((c - 2 * keyd) % (ratio * vd)); }
+    float x = qv[src];
+    const float *wc = cw + (long)c * K;
+    float *hc = hof + (long)c * (K - 1);
+    float acc = wc[K - 1] * x;
+    for (int j = 0; j < K - 1; j++) acc += wc[j] * hc[j];
+    for (int j = 0; j + 1 < K - 1; j++) hc[j] = hc[j + 1];
+    hc[K - 2] = x;
+    oi[c] = acc / (1.0f + __expf(-acc));
+  }
+}
+
+/* q/k l2norm：grid(2*nk, B) */
+__global__ void k_lin_l2norm_b(const float *conv, float *qn, float *kn,
+                               int nk, int kd, int convd) {
+  extern __shared__ float red[];
+  int b = blockIdx.y;
+  int keyd = nk * kd;
+  int g = blockIdx.x / 2, is_q = blockIdx.x % 2;
+  const float *base = conv + (long)b * convd;
+  const float *src = base + (is_q ? 0 : (long)keyd) + (long)g * kd;
+  float *dst = (is_q ? qn : kn) + (long)b * keyd + (long)g * kd;
+  float ss = 0;
+  for (int i = threadIdx.x; i < kd; i += blockDim.x) ss += src[i] * src[i];
+  red[threadIdx.x] = ss;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  float inv = rsqrtf(red[0] + 1e-6f);
+  if (is_q) inv /= sqrtf((float)kd);
+  for (int i = threadIdx.x; i < kd; i += blockDim.x) dst[i] = src[i] * inv;
+}
+
+/* 递归主体：grid(nh*ntile, B)；v 已按 convd 行步长偏移（传 conv_io 首地址）*/
+__global__ void k_lin_step_b(float *S, const float *qn, const float *kn,
+                             const float *v, const float *z, const float *ba,
+                             const float *alog, const float *dtb, float *o,
+                             int nh, int kd, int vd, int ratio,
+                             const int *dslot, long sbase, long sstride,
+                             int ntile, int keyd, int convd) {
+  int b = blockIdx.y;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int cpb = blockDim.x >> 5;
+  int h = blockIdx.x / ntile;
+  int tile = blockIdx.x - h * ntile;
+  int d = tile * cpb + warp;
+  if (d >= vd) return;
+  int vald = nh * vd;
+  int g = h / ratio, r2 = 2 * ratio;
+  long soff = sbase + (long)(dslot ? dslot[b] : 0) * sstride;
+  const float *qh = qn + (long)b * keyd + (long)g * kd;
+  const float *kh = kn + (long)b * keyd + (long)g * kd;
+  /* v 段从 conv_io 的第 2*keyd 通道开始（与单 token 版传 l_conv_io+2*keyd 对齐）*/
+  const float *vb = v + (long)b * convd + (long)2 * keyd;
+  (void)z;
+  float bval = ba[(long)g * r2 + (h % ratio)];
+  float aval = ba[(long)g * r2 + ratio + (h % ratio)];
+  float beta = 1.0f / (1.0f + __expf(-bval));
+  float ax = aval + dtb[h];
+  float sp = ax > 20.0f ? ax : log1pf(__expf(ax));
+  float alpha = __expf(-__expf(alog[h]) * sp);
+  float *row = S + soff + (long)h * kd * vd + (long)d * kd;
+  float mem = 0;
+  for (int i = lane; i < kd; i += 32) {
+    float s = row[i] * alpha;
+    row[i] = s;
+    mem += s * kh[i];
+  }
+  for (int off = 16; off > 0; off >>= 1) mem += __shfl_xor_sync(0xffffffffu, mem, off);
+  float delta = (vb[(long)h * vd + d] - mem) * beta;
+  float oo = 0;
+  for (int i = lane; i < kd; i += 32) {
+    float s = row[i] + kh[i] * delta;
+    row[i] = s;
+    oo += s * qh[i];
+  }
+  for (int off = 16; off > 0; off >>= 1) oo += __shfl_xor_sync(0xffffffffu, oo, off);
+  if (lane == 0) o[(long)b * (long)vald + (long)h * vd + d] = oo;
+}
+
+/* gated RMSNorm：grid(nh, B) */
+__global__ void k_lin_gnorm_b(float *o, const float *z, const float *nw,
+                              int nh, int vd, int kd, int ratio, int gw,
+                              float eps, int rowN, int vald) {
+  extern __shared__ float red[];
+  int b = blockIdx.y;
+  int h = blockIdx.x;
+  float *oh = o + (long)b * vald + (long)h * vd;
+  const float *zh = z + (long)b * rowN + (long)(h / ratio) * gw + 2 * kd +
+                    (long)ratio * vd + (long)(h % ratio) * vd;
   (void)nh;
   float ss = 0;
   for (int i = threadIdx.x; i < vd; i += blockDim.x) ss += (double)oh[i] * oh[i];
@@ -1714,6 +1854,31 @@ static float *dev_copy(const float *src, size_t n) {
 }
 
 /* t1: fp32 host weights -> fp16 device upload (convert on host, one memcpy) */
+/* ---- M0-显存：embed_tokens 放在 mapped pinned host 内存 ----
+ * 动机：embed 每 token 只查 1 行（E=5120，fp16 = 10 KiB），却常驻 VRAM 占
+ * 2.54 GB（248320×5120×2B）。实测 GPU 直读 mapped host 51.2 GB/s，一次 10 KiB
+ * 只 0.2 µs，完全可忽略。腾出的 2.54 GB 正好让 32 个 GDN 递归状态槽
+ * （1.81 GB）+ conv 历史（188 MB）入住 —— 之前 32 槽因差 335 MB 直接崩。
+ * 失败（无 UVA / 不可映射）时返回 NULL，调用方回退到显存。*/
+static __half *host_map_h(const float *src, size_t n) {
+  __half *h = NULL;
+  if (cudaHostAlloc((void **)&h, n * sizeof(__half), cudaHostAllocMapped) != cudaSuccess)
+    return NULL;
+  if (src)
+    for (size_t i = 0; i < n; i++) h[i] = __float2half(src[i]);
+  else
+    memset(h, 0, n * sizeof(__half));
+  return h;
+}
+
+/* device-visible alias of a mapped host buffer (UVA: same address on our setup) */
+static __half *map_dev_ptr(__half *h) {
+  void *d = NULL;
+  if (!h) return NULL;
+  if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess || !d) return h;
+  return (__half *)d;
+}
+
 static __half *dev_copy_h(const float *src, size_t n) {
   __half *d = NULL;
   cudaError_t e = cudaMalloc(&d, n * sizeof(__half));
@@ -2081,12 +2246,27 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
 
   if (g->use_fp16) {
     /* t1 fp16 upload: weights as __half, fp32 activations everywhere else */
-    CT("upload wte (fp16) V=%d E=%d", m->vocab, m->n_embd);
-    g->wte_h = dev_copy_h(m->wte.data, (size_t)m->vocab * m->n_embd);
+    int tied = (m->lm_head.data == m->wte.data);
+    /* M0-显存：untied 时 embed 走 mapped host（每 token 只查 1 行，实测直读
+     * 51 GB/s、一行 10 KiB 仅 0.2 µs），腾出 2.54 GB 给 32 个 GDN 状态槽。
+     * tied 时 wte_h 同时是 lm_head（每 token 全读），必须留在显存。
+     * SGL_EMB_DEV=1 可强制回显存（对照实验 / 无 UVA 环境）。*/
+    g->wte_h = NULL;
+    g->wte_h_host = NULL;
+    if (!tied && !getenv("SGL_EMB_DEV")) {
+      g->wte_h_host = host_map_h(m->wte.data, (size_t)m->vocab * m->n_embd);
+      if (g->wte_h_host) {
+        g->wte_h = map_dev_ptr(g->wte_h_host);
+        printf("[cuda] embed on mapped host: frees %.2f GiB VRAM\n",
+               (double)m->vocab * m->n_embd * 2.0 / 1073741824.0);
+      }
+    }
+    if (!g->wte_h) CT("upload wte (fp16) V=%d E=%d", m->vocab, m->n_embd);
+    if (!g->wte_h) g->wte_h = dev_copy_h(m->wte.data, (size_t)m->vocab * m->n_embd);
     CT("upload final_norm");
     g->final_norm = dev_copy(m->final_norm.data, (size_t)m->n_embd);
     /* tied embeddings: the half lm_head aliases the half embed table */
-    if (m->lm_head.data == m->wte.data) {
+    if (tied) {
       g->lm_head_h = g->wte_h;
     } else {
       g->lm_head_h = dev_copy_h(m->lm_head.data, (size_t)m->vocab * m->n_embd);
@@ -2178,9 +2358,9 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
     else
       cudaMemset(g->l_state, 0, ssz * sizeof(float));
   }
-  if (cudaMalloc((void **)&g->d_lin_slot, sizeof(int)) == cudaSuccess) {
-    int z = 0;
-    cudaMemcpy(g->d_lin_slot, &z, sizeof(int), cudaMemcpyHostToDevice);
+  if (cudaMalloc((void **)&g->d_lin_slot, sizeof(int) * 32) == cudaSuccess) {
+    int z32[32] = {0};
+    cudaMemcpy(g->d_lin_slot, z32, sizeof(int) * 32, cudaMemcpyHostToDevice);
     cudaHostAlloc((void **)&g->h_lin_slot, sizeof(int), cudaHostAllocDefault);
     *g->h_lin_slot = 0;
     cudaHostAlloc((void **)&g->h_dec_slots, sizeof(int) * 32, cudaHostAllocDefault);
@@ -2385,14 +2565,19 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
     if (!g->l_state) goto fail;
     if (cudaMalloc((void **)&g->l_hist, hs * sizeof(float)) != cudaSuccess) goto fail;
     cudaMemset(g->l_hist, 0, hs * sizeof(float));
-    if (cudaMalloc((void **)&g->l_qkvz, (size_t)(convd + g->lin_nh * g->lin_vd) * sizeof(float)) != cudaSuccess)
+    /* M0: 这几个 scratch 改成按「最大 batch 行数」分配。batch decode 时 GDN 的
+     * 中间结果（conv/l2norm/step/gnorm）按行存 [B][...]；原先只有 1 行，
+     * B>1 会直接越界（实测 B=2 就 illegal memory access）。
+     * 32 行 × rowN 合计约 4.7 MB，可忽略。*/
+    const size_t lrows = 32;
+    if (cudaMalloc((void **)&g->l_qkvz, lrows * (size_t)(convd + g->lin_nh * g->lin_vd) * sizeof(float)) != cudaSuccess)
       goto fail; /* rowN = 2keyd+2vald = convd + nh*vd */
-    if (cudaMalloc((void **)&g->l_conv_io, (size_t)convd * sizeof(float)) != cudaSuccess) goto fail;
-    if (cudaMalloc((void **)&g->l_qn, (size_t)g->lin_nk * g->lin_kd * sizeof(float)) != cudaSuccess ||
-        cudaMalloc((void **)&g->l_kn, (size_t)g->lin_nk * g->lin_kd * sizeof(float)) != cudaSuccess ||
-        cudaMalloc((void **)&g->l_o, (size_t)g->lin_nh * g->lin_vd * sizeof(float)) != cudaSuccess)
+    if (cudaMalloc((void **)&g->l_conv_io, lrows * (size_t)convd * sizeof(float)) != cudaSuccess) goto fail;
+    if (cudaMalloc((void **)&g->l_qn, lrows * (size_t)g->lin_nk * g->lin_kd * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **)&g->l_kn, lrows * (size_t)g->lin_nk * g->lin_kd * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **)&g->l_o, lrows * (size_t)g->lin_nh * g->lin_vd * sizeof(float)) != cudaSuccess)
       goto fail;
-    g->lin_scratch_cap = convd;
+    g->lin_scratch_cap = (int)lrows;
     CT("lin state pool %d layers x %d slots (state %.1f MB + hist %.1f MB)",
        g->lin_n, g->lin_slots,
        (size_t)g->lin_n * g->lin_slots * g->lin_nh * g->lin_kd * g->lin_vd * 4.0 / 1048576,
@@ -2580,7 +2765,8 @@ void sgl_cuda_free(sgl_cuda_model *g) {
   /* tied embeddings: lm_head aliases wte, free once */
   if (g->lm_head && g->lm_head != g->wte) cudaFree(g->lm_head);
   /* t1 fp16 mirrors (lm_head_h aliases wte_h when tied) */
-  if (g->wte_h) cudaFree(g->wte_h);
+  if (g->wte_h_host) cudaFreeHost(g->wte_h_host);
+  else if (g->wte_h) cudaFree(g->wte_h);
   if (g->lm_head_h && g->lm_head_h != g->wte_h) cudaFree(g->lm_head_h);
   cudaFree(g->ha);
   cudaFree(g->freqs); cudaFree(g->kc); cudaFree(g->vc);
@@ -3361,9 +3547,10 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
   int E = g->E, H = g->H, HK = g->HK, D = g->D, KD = g->KD;
   cudaStream_t s = g->stream;
 
-  /* t11 v1：qwen3_5 hybrid（lin 层/q_gate）逐行复用 fwd_seg_llama（n=1）。
-   * B>1 串行——不进 graph（graph 禁用由 capture 前置判断保证）。*/
-  if (g->lin_n > 0 || g->q_gate) {
+  /* B==1：hybrid（lin 层/q_gate）走 fwd_seg_llama（n=1）—— 数值基准路径，不动。
+   * B>1：走下面的批量路径（M0），每层一次 launch 处理 B 行；原先这里是
+   * for(b) 串行跑 B 遍 64 层，实测聚合吞吐与并发无关（恒 36.8 tok/s）。*/
+  if ((g->lin_n > 0 || g->q_gate) && B == 1) {
     for (int b = 0; b < B; b++) {
       /* fwd_seg_llama 约定：KV 写 (kv_base + pos0)、rope 用 pos0 ——
        * 所以 pos0 是【序列内相对位置】= h_lens[b]，kv_base 是绝对页。
@@ -3401,6 +3588,11 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
     return 0;
   }
 
+  /* M0: batch decode 的每行 slot 送进 device —— batch GDN kernel 内按 b 取，
+   * host 不再参与（这正是原先无法批量、也无法进 graph 的原因）。*/
+  if (g->lin_n > 0 && g->d_lin_slot && g->h_dec_slots)
+    CK(cudaMemcpyAsync(g->d_lin_slot, g->h_dec_slots, sizeof(int) * (size_t)B,
+                       cudaMemcpyHostToDevice, s));
   if (g->use_fp16)
     k_embed_h<<<(int)((B * (long)E + 255) / 256), 256, 0, s>>>(g->wte_h, g->d_tok, g->x, B, E);
   else
@@ -3408,17 +3600,105 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
   CK(cudaGetLastError());
 
   for (int l = 0; l < g->L; l++) {
-    k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln1[l], g->h, B, E, g->eps);
+    int is_lin = (g->lkind && g->lkind[l] == 2);
+    if (g->norm_p1)
+      k_rmsnorm_p1<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln1[l], g->h, B, E, g->eps);
+    else
+      k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln1[l], g->h, B, E, g->eps);
     CK(cudaGetLastError());
-    PROJ(g, g->h, g->qw[l], g->qw_h ? g->qw_h[l] : NULL, g->qw8 ? &g->qw8[l] : NULL, g->qb[l],
-         g->q, B, E, E);
+    if (is_lin) {
+      /* M0: 批量 gated deltanet —— B 行各自用自己的 slot，一次 launch 算完。
+       * 单 token 版靠 host 传 slot 偏移，这里改成 kernel 内从 d_lin_slot[b] 取。*/
+      int nk2 = g->lin_nk, kd2 = g->lin_kd, nh2 = g->lin_nh, vd2 = g->lin_vd;
+      int keyd2 = nk2 * kd2, vald2 = nh2 * vd2;
+      int convd2 = 2 * keyd2 + vald2;
+      int gw2 = 2 * kd2 + 2 * g->lin_ratio * vd2;
+      int rowN2 = 2 * keyd2 + 2 * vald2;
+      int K2 = g->lin_conv_k;
+      int ntile2 = (vd2 + 3) / 4;
+      int ll2 = g->linvo[l];
+      long sbase = (long)ll2 * g->lin_slots * vald2 * kd2;
+      long sstride = (long)vald2 * kd2;
+      long hbase = (long)ll2 * g->lin_slots * convd2 * (K2 - 1);
+      long hstride = (long)convd2 * (K2 - 1);
+      PROJ(g, g->h, g->qw[l], g->qw_h ? g->qw_h[l] : NULL, g->qw8 ? &g->qw8[l] : NULL,
+           NULL, g->l_qkvz_all, B, rowN2, E);
+      CK(cudaGetLastError());
+      k_lin_conv_b<<<dim3((convd2 + 127) / 128, B), 128, 0, s>>>(
+          g->l_conv[l], g->l_hist, g->l_qkvz_all, g->l_conv_io, nk2, kd2, nh2, vd2,
+          g->lin_ratio, K2, g->d_lin_slot, hbase, hstride, rowN2);
+      k_lin_l2norm_b<<<dim3(2 * nk2, B), 256, 256 * sizeof(float), s>>>(
+          g->l_conv_io, g->l_qn, g->l_kn, nk2, kd2, convd2);
+      k_lin_step_b<<<dim3(nh2 * ntile2, B), 128, 0, s>>>(
+          g->l_state, g->l_qn, g->l_kn, g->l_conv_io, g->l_qkvz_all,
+          g->l_ba[l], g->l_alog[l], g->l_dtb[l], g->l_o_all, nh2, kd2, vd2,
+          g->lin_ratio, g->d_lin_slot, sbase, sstride, ntile2, keyd2, convd2);
+      k_lin_gnorm_b<<<dim3(nh2, B), 256, 256 * sizeof(float), s>>>(
+          g->l_o_all, g->l_qkvz_all, g->l_norm[l], nh2, vd2, kd2, g->lin_ratio,
+          gw2, g->eps, rowN2, vald2);
+      CK(cudaGetLastError());
+      PROJ(g, g->l_o_all, g->ow[l], g->ow_h ? g->ow_h[l] : NULL,
+           g->ow8 ? &g->ow8[l] : NULL, NULL, g->h, B, E, vald2);
+      CK(cudaGetLastError());
+      k_residual<<<(int)(((long)B * E + 255) / 256), 256, 0, s>>>(g->x, g->h, (long)B * E);
+      CK(cudaGetLastError());
+      /* lin 层的 MLP 与 full 层相同 */
+      if (g->norm_p1)
+        k_rmsnorm_p1<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln2[l], g->h, B, E, g->eps);
+      else
+        k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln2[l], g->h, B, E, g->eps);
+      PROJ(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, g->gw8 ? &g->gw8[l] : NULL,
+           NULL, g->gate, B, g->I, E);
+      PROJ(g, g->h, g->uw[l], g->uw_h ? g->uw_h[l] : NULL, g->uw8 ? &g->uw8[l] : NULL,
+           NULL, g->up, B, g->I, E);
+      CK(cudaGetLastError());
+      k_silu_mul<<<(int)(((long)B * g->I + 255) / 256), 256, 0, s>>>(g->gate, g->up,
+                                                                    (long)B * g->I);
+      PROJ(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, g->dw8 ? &g->dw8[l] : NULL,
+           NULL, g->h, B, E, g->I);
+      CK(cudaGetLastError());
+      k_residual<<<(int)(((long)B * E + 255) / 256), 256, 0, s>>>(g->x, g->h, (long)B * E);
+      CK(cudaGetLastError());
+      continue;
+    }
+    /* full/sliding 层 —— 对齐 fwd_seg_llama 的完整流程：q_gate
+     * （attn_output_gate=True）/ qk per-head norm / partial rope（factor 0.25，
+     * rot_dim=64）/ o_proj 的 K 是 QD 而非 E。
+     * M0 之前这段只服务过非 hybrid 模型；Qwen3.8 走它时上面四项全缺，
+     * 实测输出退化成垃圾 token（状态本身对，只是 full 层算错）。*/
+    {
+      float *qdst = g->q;
+      int qN2 = g->QD > 0 ? g->QD : E;
+      if (g->q_gate) { qdst = g->q2; qN2 = 2 * qN2; }
+      PROJ(g, g->h, g->qw[l], g->qw_h ? g->qw_h[l] : NULL, g->qw8 ? &g->qw8[l] : NULL,
+           g->qb[l], qdst, B, qN2, E);
+      if (g->q_gate) {
+        k_qgate_split<<<(int)(((long)B * H * D + 255) / 256), 256, 0, s>>>(
+            g->q2, g->q, g->qgate, B, H, D);
+        CK(cudaGetLastError());
+      }
+    }
     PROJ(g, g->h, g->kw[l], g->kw_h ? g->kw_h[l] : NULL, g->kw8 ? &g->kw8[l] : NULL, g->kb[l],
          g->k, B, KD, E);
     PROJ(g, g->h, g->vw[l], g->vw_h ? g->vw_h[l] : NULL, g->vw8 ? &g->vw8[l] : NULL, g->vb[l],
          g->v, B, KD, E);
     CK(cudaGetLastError());
-    k_rope_rows<<<(int)(((long)B * H * D / 2 + 255) / 256), 256, 0, s>>>(g->q, B * H, D, g->d_pq, g->freqs);
-    k_rope_rows<<<(int)(((long)B * HK * D / 2 + 255) / 256), 256, 0, s>>>(g->k, B * HK, D, g->d_pk, g->freqs);
+    if (g->qn && g->qn[l])
+      k_hrmsnorm<<<B * H, D, D * sizeof(float), s>>>(g->q, g->qn[l], B, H, D, 1e-6f,
+                                                     g->norm_p1);
+    if (g->kn && g->kn[l])
+      k_hrmsnorm<<<B * HK, D, D * sizeof(float), s>>>(g->k, g->kn[l], B, HK, D, 1e-6f,
+                                                      g->norm_p1);
+    if (g->rot_dim && g->rot_dim < D && g->pinvf) {
+      int hf2 = g->rot_dim / 2;
+      k_rope_p_rows<<<(int)(((long)B * H * hf2 + 255) / 256), 256, 0, s>>>(
+          g->q, B * H, D, g->d_pq, g->pinvf + (size_t)l * hf2, g->rot_dim);
+      k_rope_p_rows<<<(int)(((long)B * HK * hf2 + 255) / 256), 256, 0, s>>>(
+          g->k, B * HK, D, g->d_pk, g->pinvf + (size_t)l * hf2, g->rot_dim);
+    } else {
+      k_rope_rows<<<(int)(((long)B * H * D / 2 + 255) / 256), 256, 0, s>>>(g->q, B * H, D, g->d_pq, g->freqs);
+      k_rope_rows<<<(int)(((long)B * HK * D / 2 + 255) / 256), 256, 0, s>>>(g->k, B * HK, D, g->d_pk, g->freqs);
+    }
     CK(cudaGetLastError());
     k_kv_write<<<(int)((B * HK * D + 255) / 256), 256, 0, s>>>(
         g->kc + (long)g->kvo[l] * g->ctx * KD, g->vc + (long)g->kvo[l] * g->ctx * KD,
@@ -3436,11 +3716,19 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
           g->sliding_window);
     }
     CK(cudaGetLastError());
+    if (g->q_gate) {
+      k_qgate_apply<<<(int)(((long)B * g->QD + 255) / 256), 256, 0, s>>>(
+          g->attn, g->qgate, (long)B * g->QD);
+      CK(cudaGetLastError());
+    }
     PROJ(g, g->attn, g->ow[l], g->ow_h ? g->ow_h[l] : NULL, g->ow8 ? &g->ow8[l] : NULL, NULL,
-         g->h, B, E, E);
+         g->h, B, E, g->QD > 0 ? g->QD : E);
     CK(cudaGetLastError());
     k_residual<<<(int)(((long)B * E + 255) / 256), 256, 0, s>>>(g->x, g->h, (long)B * E);
-    k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln2[l], g->h, B, E, g->eps);
+    if (g->norm_p1)
+      k_rmsnorm_p1<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln2[l], g->h, B, E, g->eps);
+    else
+      k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln2[l], g->h, B, E, g->eps);
     PROJ(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, g->gw8 ? &g->gw8[l] : NULL, NULL,
          g->gate, B, g->I, E);
     PROJ(g, g->h, g->uw[l], g->uw_h ? g->uw_h[l] : NULL, g->uw8 ? &g->uw8[l] : NULL, NULL,
@@ -3453,7 +3741,10 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
     k_residual<<<(int)(((long)B * E + 255) / 256), 256, 0, s>>>(g->x, g->h, (long)B * E);
     CK(cudaGetLastError());
   }
-  k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->final_norm, g->h, B, E, g->eps);
+  if (g->norm_p1)
+    k_rmsnorm_p1<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->final_norm, g->h, B, E, g->eps);
+  else
+    k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->final_norm, g->h, B, E, g->eps);
   CK(cudaGetLastError());
   /* lm_head as ONE GEMM over all B rows (h rows are contiguous) */
   gemm_nt_any(g, g->h, g->lm_head, g->lm_head_h, NULL, g->d_lgb, B, g->V, E);
@@ -3677,10 +3968,12 @@ int sgl_cuda_decode_batch(sgl_cuda_model *g, const int *tokens, const int *base_
   CK(cudaMemcpyAsync(g->d_pk, g->h_pk, sizeof(int) * (size_t)B * HK,
                      cudaMemcpyHostToDevice, g->stream));
   if (decode_step_launch(g, B, maxu) != 0) return -1;
-  /* t11：hybrid（lin 层/q_gate）的 decode_step_launch 已经把每行 logits 写进
-   * h_lgb（pinned host）；这里再用 d_lgb 去 D2H 会把它整块覆盖成上次残留的
-   * 旧值 —— 并发请求拿到别人的 / 陈旧的 logits，只有偶尔碰对。*/
-  if (!(g->lin_n > 0 || g->q_gate)) {
+  /* t11：只有「hybrid 且 B==1」走 fwd_seg_llama 串行路径时，它内部已把每行
+   * logits D2H 到 h_lgb（pinned host），这里再拷会盖成残留旧值。
+   * M0：B>1 的批量路径（以及所有非 hybrid 模型）写的是 device 侧 d_lgb，
+   * 必须照常 D2H —— 之前无条件跳过，导致并发请求拿到 prewarm 残留的 logits
+   * （现象：输出退化成 “Paris Paris Paris…”，但速度指标看起来正常）。*/
+  if (!((g->lin_n > 0 || g->q_gate) && B == 1)) {
     CK(cudaMemcpyAsync(g->h_lgb, g->d_lgb, sizeof(float) * (size_t)B * g->V,
                        cudaMemcpyDeviceToHost, g->stream));
     CK(cudaStreamSynchronize(g->stream));
