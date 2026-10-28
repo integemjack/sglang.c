@@ -108,9 +108,18 @@ static void test_name_map(void) {
  * GGUF 内嵌元数据建起来，而且与同模型的 tokenizer.json 路径编出同样的 token 序列。*/
 static int test_tokenizer_from_gguf(void) {
   const char *single = getenv("SGL_TEST_GGUF_SINGLE");
-  if (!single) {
+  if (!single || !*single) {
     printf("SKIP: SGL_TEST_GGUF_SINGLE not set\n");
     return 0;
+  }
+  /* CMake 总会设这个变量（指向 models/gguf-quants/Q2_K），夹具不在时（CI）要跳过而不是失败 */
+  {
+    sgl_gguf *probe_g = sgl_gguf_open_dir(single);
+    if (!probe_g) {
+      printf("SKIP: no .gguf found in %s\n", single);
+      return 0;
+    }
+    sgl_gguf_close(probe_g);
   }
   sgl_tokenizer *t = sgl_tokenizer_load_dir(single);
   check(t != NULL, "从 GGUF 元数据加载 tokenizer");

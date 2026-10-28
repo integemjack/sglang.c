@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 #include "sgl/cuda.h"
 #include "sgl/llama.h"
@@ -13,9 +17,16 @@
 #include "sgl/bpe.h"
 
 static double now_sec(void) {
+#ifdef _WIN32
+  LARGE_INTEGER f, c;
+  QueryPerformanceFrequency(&f);
+  QueryPerformanceCounter(&c);
+  return (double)c.QuadPart / (double)f.QuadPart;
+#else
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
 }
 
 int main(int argc, char **argv) {

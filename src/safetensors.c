@@ -17,7 +17,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h> /* FindFirstFileA：列目录里的散分片 */
+#else
 #include <dirent.h>
 #endif
 

@@ -130,12 +130,14 @@ jobs:
           grep -q 'MLX(' mlx_ref.log || { echo "::error::MLX reference did not run on Metal"; exit 1; }
           ls -la models/llava-rand/_ref_*.npy
 
+      # 只给 Linux/macOS：windows-x64 的 flavor 也是 cpu，但它走下面的 MSVC 步骤
+      #（之前这两步在 Windows 上也跑，没有 MSVC 环境时 CMake 抓到 runner 上的 MinGW gcc）
       - name: Configure (Ninja, CPU)
-        if: startsWith(matrix.flavor, 'cpu')
+        if: startsWith(matrix.gen, 'ninja') && startsWith(matrix.flavor, 'cpu')
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Build (Ninja, CPU)
-        if: startsWith(matrix.flavor, 'cpu')
+        if: startsWith(matrix.gen, 'ninja') && startsWith(matrix.flavor, 'cpu')
         run: cmake --build build -j
 
       - name: Configure (Ninja, CUDA)

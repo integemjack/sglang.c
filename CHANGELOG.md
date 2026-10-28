@@ -2,6 +2,21 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — CI 修复（2026-10-29）
+
+本地复现（Linux 用全新 checkout + CI 同款夹具串行 ctest；Windows 用 VS2022 BuildTools 的
+MSVC + CUDA 13.3、MinGW gcc 16），四个问题各自独立：
+- **Windows 编译**：`safetensors.c` 列散分片用了 `FindFirstFileA` 却没 include `<windows.h>`；
+  `cuda_backend.cu` 的 `mtp_now` 与 `tests/cuda_qwen35_test.c` 用了 POSIX 的 `clock_gettime`
+  （改走 QueryPerformanceCounter）。另给 nvcc 的 MSVC host 加 `-Xcompiler=/utf-8`：`.cu` 现在有中文注释，
+  GBK 代码页的机器上 cl 会吞掉 `*/` 后的代码。
+- **workflow**：`Configure/Build (Ninja, CPU)` 只按 flavor 判断，windows-x64 也跑了这两步（没有 MSVC 环境，
+  CMake 抓到 runner 上的 MinGW）；改为只给 `ninja*` 生成器。
+- **`test_gguf`**：CMake 总会设 `SGL_TEST_GGUF_SINGLE`，CI 没有 `models/gguf-quants` 夹具时它直接失败；
+  改为找不到 .gguf 就 SKIP（与同文件其它用例一致）。四个 CPU 测试任务的 exit 8 都是它。
+- **`test_jinja`（Windows）**：runner 的 `core.autocrlf=true` 把 `tests/ref_chat_*.txt` 转成 CRLF，
+  与按字节比对的渲染结果对不上。加 `.gitattributes` 让这些参考文件不做换行转换。
+
 ## [Unreleased] — Qwen3.8 GPU：GDN 门控修复 + M3 MTP 投机解码（2026-10-29）
 
 详细数据见 [docs/DESIGN_1M_32C.md](docs/DESIGN_1M_32C.md) §17。

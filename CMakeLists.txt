@@ -264,7 +264,9 @@ if(SGL_CUDA)
       list(APPEND SGL_NVCC_ARCH_FLAGS
            --generate-code=arch=compute_${_a},code=sm_${_a})
     endforeach()
-    set(SGL_NVCC_EXTRA_FLAGS "")
+    # .cu 里有中文注释：cl 默认按系统代码页读，GBK(936) 机器上多字节序列会吞掉 */，
+    # 后面的代码整段丢失（C4819 + 一串 "expected a declaration"）
+    set(SGL_NVCC_EXTRA_FLAGS -Xcompiler=/utf-8)
   else()
     # 非 MSVC：host 编译器由 nvcc 自己在 PATH 里找 g++/clang++；产物 .o 要 -fPIC
     #（Ubuntu 的 gcc 默认 -fPIE，PIC 目标同样能链进 PIE 可执行文件）。
@@ -328,7 +330,7 @@ if(SGL_CUDA)
   target_include_directories(sgl_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb) # G8: image.c 在 SGL_CORE_SRC 里，stb 头要能找到
   if(MSVC)
-    # /utf-8 只给 C 源（nvcc 不认该旗标；.cu 已纯 ASCII，头文件带 BOM）
+    # /utf-8 只给 C 源（nvcc 本身不认该旗标；.cu 的走 SGL_NVCC_EXTRA_FLAGS 的 -Xcompiler）
     target_compile_options(sgl_cuda PUBLIC /O2 "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>")
     target_compile_definitions(sgl_cuda PUBLIC _CRT_SECURE_NO_WARNINGS)
   else()

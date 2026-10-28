@@ -4189,13 +4189,10 @@ int sgl_cuda_mtp_fill_kv(sgl_cuda_model *g, const int *toks, int n, int pos0,
   return cudaStreamSynchronize(s) == cudaSuccess ? 0 : -1;
 }
 
-/* 便捷计时（单调秒），MTP 诊断用。sgl_hnow 定义在文件后半段，这里需要
- * 前面的声明。*/
-static double mtp_now(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
+/* 便捷计时（单调秒），MTP 诊断用。sgl_hnow（Windows 走 QueryPerformanceCounter）
+ * 定义在文件后半段，这里先声明。*/
+static double sgl_hnow(void);
+static double mtp_now(void) { return sgl_hnow(); }
 
 /* MTP 自验证：teacher-forced 接受率。
  *
