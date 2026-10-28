@@ -1076,7 +1076,7 @@ GDN kernel 直接读了 `in_proj_ba` **权重**的前 2·nh 个数 —— 门控
 | W=4 pre + 每步改坏一个草稿 | 36–48 | 1.98 | 312/270/152/66/4 | 123–493 |
 
 - 2.83 token/步过了 §10 的 2.4，但低于 §16.3 按 teacher-forced α=0.894 推的 4.05：
-  服务里链式草稿的真实 α 约 0.7。
+  服务里链式草稿的真实 α 约 0.7。一部分是 MTP KV 没回填，修后 3.16（§17.4）。
 - `max_tokens` 越界（一步收 k+1 个不看余量，`gen[]` 定长）与 `ignore_eos` 不一致已修。
 
 ### 17.3 为什么不是逐字一致
@@ -1091,7 +1091,27 @@ GDN kernel 直接读了 `in_proj_ba` **权重**的前 2·nh 个数 —— 门控
   走 `decode_step_launch`（`k_lin_step_b`、decode attention），两边的归约顺序不同。要逐位一致需要让
   verify 与 decode 共用同一套 kernel，代价可能吃掉部分加速，所以验收标准放宽为「只在近 tie 处分叉」。
 
-### 17.4 验收时顺带修掉的旁路问题
+### 17.4 接受率缺口：MTP 自有 KV 没回填
+
+按草稿位置拆 k 分布，服务里第 1 个草稿（用的就是主模型真 hidden，与 teacher-forced 同配置）只有
+0.785。原因是 §16.5 要求的「prefill 顺带填 MTP 的 prompt KV」没做：草稿只给拟出的位置写 KV，
+prompt 段是上个请求的残留；被接受的草稿行也一直留着链式 hidden 算的 KV。
+
+`sgl_cuda_mtp_fill_kv` 按块（≤64 行）批量算 MTP 的 K/V（fc → ln1 → k/v → k_norm → rope，不跑
+attention/MLP，每块约 62 MB 权重读）：prefill 每块之后回填 prompt 行，verify 之后用真 hidden 重写
+被接受的 k 行。W=4 post，同 4 个 prompt：
+
+| | d1 | d2 | d3 | d4 | token/步 | decode tok/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 回填前 | 0.785 | 0.662 | 0.621 | 0.656 | 2.83 | 52–81 |
+| **回填后** | **0.818** | **0.743** | **0.707** | **0.764** | **3.16** | **53–84** |
+
+分 prompt 的 d1：code 0.88（同 prompt teacher-forced 0.894）/ list 0.90 / prose 0.82 / zh 0.72，
+token/步 3.85 / 3.85 / 3.03 / 2.41 —— 剩下的差距是 prompt 难度，不是实现。
+另一个效果：MTP KV 不再带上个请求的残留，同一请求重发的投机输出从「每次不同」变成逐字相同。
+前缀缓存命中的 `[0, hit)` 行没有主模型 hidden，仍沿用旧值（只影响草稿质量）。
+
+### 17.5 验收时顺带修掉的旁路问题
 
 - `k_rope_p` 上界多乘了 `heads_per_tok`（调用方传的 n 已是头行数），末块补齐线程会旋转缓冲区之外的头：
   `rows*H*half` 不是 256 的倍数时越界（27B 的 k 头 HK=4、half=32，奇数行即触发；`SGL_PREFILL_CHUNK=1`

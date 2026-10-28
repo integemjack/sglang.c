@@ -82,6 +82,11 @@ typedef struct {
   float *chain_pre, *chain_post;
   int chain_use_post;         /* SGL_MTP_CHAIN=post 时用 chain_post */
   float *hlast;               /* [E] 「最后一个已落定位置」的 hidden（草稿输入）*/
+  /* sgl_cuda_mtp_fill_kv 的多行 scratch（每块 ≤ fill_cap 行）与跨块衔接的 hidden */
+  int fill_cap;
+  float *fe, *fhid, *fpin, *fx, *fh, *fk, *fv; /* [cap][E]×5、[cap][2E]、[cap][KD]×2 */
+  int *ftok;                  /* [cap] */
+  float *hprev;               /* [E] 上一块最后一行的 hidden（下一块第 0 行用）*/
 } sgl_mtp;
 
 /* ================= M3: 投机解码的 GDN 状态快照 =================
@@ -430,6 +435,15 @@ __global__ void k_embed_h(const __half *wte, const int *tok, float *x, int n, in
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= n * E) return;
   x[idx] = __half2float(wte[(long)tok[idx / E] * E + idx % E]);
+}
+
+/* out[r] = [a[r] | b[r]]（各 E 宽）：MTP 的 proj_in 按行拼接 */
+__global__ void k_cat2_rows(const float *a, const float *b, float *out, int n, int E) {
+  long idx = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (idx >= (long)n * 2 * E) return;
+  long r = idx / (2 * E);
+  int c = (int)(idx % (2 * E));
+  out[idx] = c < E ? a[r * E + c] : b[r * E + (c - E)];
 }
 
 /* t4 gpt2: x[t] = wte[tok[t]] + wpe[pos0+t] (absolute positions, fp32) */
@@ -3925,6 +3939,8 @@ fail:
 }
 
 int sgl_cuda_mtp_ready(const sgl_cuda_model *g) { return g ? g->mtp.ok : 0; }
+const float *sgl_cuda_mtp_hprev(const sgl_cuda_model *g) { return g ? g->mtp.hprev : NULL; }
+const float *sgl_cuda_mtp_hlast(const sgl_cuda_model *g) { return g ? g->mtp.hlast : NULL; }
 
 /* 一步草稿：给定位置 pos 的 hidden（device [E] 单行）与该位置的 token，
  * 预测 pos+1 的 token。
@@ -4034,6 +4050,92 @@ int sgl_cuda_mtp_draft(sgl_cuda_model *g, int token, int pos, const float *hidde
   k_argmax<<<1, 256, 0, s>>>(g->d_lgb, g->V, t->d_arg);
   if (cudaMemcpyAsync(out_tok, t->d_arg, sizeof(int), cudaMemcpyDeviceToHost, s) != cudaSuccess)
     return -1;
+  return cudaStreamSynchronize(s) == cudaSuccess ? 0 : -1;
+}
+
+int sgl_cuda_mtp_fill_kv(sgl_cuda_model *g, const int *toks, int n, int pos0,
+                         const float *hprev) {
+  sgl_mtp *t;
+  int E, KD, HK, D, cap, b0;
+  const float *src;
+  cudaStream_t s;
+  if (!g || !toks || n < 1) return -1;
+  t = &g->mtp;
+  if (!t->ok || pos0 < 0 || pos0 + n > t->ctx) return -1;
+  E = g->E; KD = g->KD; HK = g->HK; D = g->D;
+  s = g->stream;
+  src = t->hsrc ? g->h : g->x;
+  /* 块 ≤ ws_cap 行（IMMA scratch 的上限）；64 行时 scratch 约 6 MiB */
+  cap = g->ws_cap < 64 ? g->ws_cap : 64;
+  if (cap < 1) return -1;
+  if (t->fill_cap < cap) {
+    cudaFree(t->fe); cudaFree(t->fhid); cudaFree(t->fpin); cudaFree(t->fx);
+    cudaFree(t->fh); cudaFree(t->fk); cudaFree(t->fv); cudaFree(t->ftok);
+    t->fill_cap = 0;
+    if (mtp_alloc(&t->fe, (size_t)cap * E) || mtp_alloc(&t->fhid, (size_t)cap * E) ||
+        mtp_alloc(&t->fpin, (size_t)cap * 2 * E) || mtp_alloc(&t->fx, (size_t)cap * E) ||
+        mtp_alloc(&t->fh, (size_t)cap * E) || mtp_alloc(&t->fk, (size_t)cap * KD) ||
+        mtp_alloc(&t->fv, (size_t)cap * KD) ||
+        cudaMalloc((void **)&t->ftok, sizeof(int) * (size_t)cap) != cudaSuccess)
+      return -1;
+    t->fill_cap = cap;
+  }
+  if (!t->hprev && mtp_alloc(&t->hprev, E)) return -1;
+
+  for (b0 = 0; b0 < n; b0 += cap) {
+    int nb = n - b0 < cap ? n - b0 : cap;
+    size_t rowb = sizeof(float) * (size_t)E;
+    /* 全局第 i 行配 hidden[pos0+i-1] = 前向的第 i-1 行；第 0 行配 hprev */
+    if (b0 == 0) {
+      CK(cudaMemcpyAsync(t->fhid, hprev ? hprev : src, rowb, cudaMemcpyDeviceToDevice, s));
+      if (nb > 1)
+        CK(cudaMemcpyAsync(t->fhid + E, src, rowb * (size_t)(nb - 1), cudaMemcpyDeviceToDevice, s));
+    } else {
+      CK(cudaMemcpyAsync(t->fhid, src + (size_t)(b0 - 1) * E, rowb * (size_t)nb,
+                         cudaMemcpyDeviceToDevice, s));
+    }
+    CK(cudaMemcpyAsync(t->ftok, toks + b0, sizeof(int) * (size_t)nb, cudaMemcpyHostToDevice, s));
+    {
+      int eb = (int)(((long)nb * E + 255) / 256);
+      if (g->wte_h)
+        k_embed_h<<<eb, 256, 0, s>>>(g->wte_h, t->ftok, t->fe, nb, E);
+      else
+        k_embed<<<eb, 256, 0, s>>>(g->wte, t->ftok, t->fe, nb, E);
+    }
+    /* 与 sgl_cuda_mtp_draft 的前半段相同，只到 K/V 为止 */
+    if (g->norm_p1) {
+      k_rmsnorm_p1<<<nb, 256, 256 * sizeof(float), s>>>(t->fe, t->enorm, t->fh, nb, E, g->eps);
+      k_rmsnorm_p1<<<nb, 256, 256 * sizeof(float), s>>>(t->fhid, t->hnorm, t->fx, nb, E, g->eps);
+    } else {
+      k_rmsnorm<<<nb, 256, 256 * sizeof(float), s>>>(t->fe, t->enorm, t->fh, nb, E, g->eps);
+      k_rmsnorm<<<nb, 256, 256 * sizeof(float), s>>>(t->fhid, t->hnorm, t->fx, nb, E, g->eps);
+    }
+    k_cat2_rows<<<(int)(((long)nb * 2 * E + 255) / 256), 256, 0, s>>>(t->fh, t->fx, t->fpin, nb, E);
+    PROJ(g, t->fpin, NULL, NULL, &t->fc8, NULL, t->fx, nb, E, 2 * E);
+    if (g->norm_p1)
+      k_rmsnorm_p1<<<nb, 256, 256 * sizeof(float), s>>>(t->fx, t->ln1, t->fh, nb, E, g->eps);
+    else
+      k_rmsnorm<<<nb, 256, 256 * sizeof(float), s>>>(t->fx, t->ln1, t->fh, nb, E, g->eps);
+    PROJ(g, t->fh, NULL, NULL, &t->k8, NULL, t->fk, nb, KD, E);
+    PROJ(g, t->fh, NULL, NULL, &t->v8, NULL, t->fv, nb, KD, E);
+    CK(cudaGetLastError());
+    k_hrmsnorm<<<nb * HK, D, D * sizeof(float), s>>>(t->fk, t->kn, nb, HK, D, 1e-6f, g->norm_p1);
+    if (g->rot_dim && g->rot_dim < D && g->pinvf) {
+      int half = g->rot_dim / 2;
+      k_rope_p<<<(int)(((long)nb * HK * half + 255) / 256), 256, 0, s>>>(
+          t->fk, nb * HK, D, HK, pos0 + b0, g->pinvf, g->rot_dim);
+    } else {
+      k_rope<<<(int)(((long)nb * HK * D / 2 + 255) / 256), 256, 0, s>>>(
+          t->fk, nb * HK, D, HK, pos0 + b0, g->freqs);
+    }
+    CK(cudaGetLastError());
+    CK(cudaMemcpyAsync(t->kc + (size_t)(pos0 + b0) * KD, t->fk, sizeof(float) * (size_t)nb * KD,
+                       cudaMemcpyDeviceToDevice, s));
+    CK(cudaMemcpyAsync(t->vc + (size_t)(pos0 + b0) * KD, t->fv, sizeof(float) * (size_t)nb * KD,
+                       cudaMemcpyDeviceToDevice, s));
+  }
+  CK(cudaMemcpyAsync(t->hprev, src + (size_t)(n - 1) * E, sizeof(float) * (size_t)E,
+                     cudaMemcpyDeviceToDevice, s));
   return cudaStreamSynchronize(s) == cudaSuccess ? 0 : -1;
 }
 

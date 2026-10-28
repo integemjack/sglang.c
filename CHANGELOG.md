@@ -12,9 +12,13 @@
   质量变好；decode 35.5 tok/s 不变。`SGL_LLAMA_DBG=N` 让 CPU 逐层打印，与 GPU 的 `SGL_CUDA_DBG` 对拍。
 - **M3 投机解码接进 GPU 服务**（`SGL_SPEC_W=4`，只对单请求贪心）：MTP 链式草稿 → 一次 W+1 行
   verify → 最长前缀 → GDN 逐行快照回滚。默认 `SGL_MTP_CHAIN=post`。27B 单流 decode
-  **52–81 tok/s（off 35.5，1.5–2.3x）**，2.83 token/步。输出只在近 tie token 处与 off 分叉
+  **53–84 tok/s（off 35.5，1.5–2.4x）**，3.16 token/步（含下面的 MTP KV 回填）。输出只在近 tie token 处与 off 分叉
   （verify 与 decode 舍入不同，不保证逐位一致）；强制错误草稿（`SGL_SPEC_CORRUPT=1`）与正常投机
   分叉点相同，回滚正确。`SGL_SPEC_STATS=1` 逐步打印 k。
+- **MTP 自有 KV 回填**（`sgl_cuda_mtp_fill_kv`）：prefill 每块之后填 prompt 行，verify 之后用真 hidden
+  重写被接受的草稿行。之前 prompt 段是上个请求的残留，第 1 个草稿接受率只有 0.785。回填后各位置
+  0.82 / 0.74 / 0.71 / 0.76，**3.16 token/步、decode 53–84 tok/s**；code prompt 的 d1 = 0.88，
+  与 teacher-forced 0.894 一致。同一请求重发的投机输出也从「每次不同」变成逐字相同。
 - 投机路径的两个 bug：一步收 k+1 个 token 时不看 `max_tokens` 余量（越过定长 `gen[]`）、
   无视 `ignore_eos`。
 - **M2 量化 KV 池（`SGL_KVQ=1`，默认关）一并入库**：之前未提交的工作，与 M3 在同一批改动里；

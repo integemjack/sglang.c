@@ -499,6 +499,17 @@ static char *decode_gen(request *r) {
 
 static int spec_try_step(request *r, int W); /* M3，定义在 worker 之后 */
 
+/* SGL_SPEC_W（1..8 才算开；0 = 关）。prefill 据此决定要不要回填 MTP 的 KV */
+static int spec_w_env(void) {
+  static int w = -1;
+  if (w < 0) {
+    const char *sw = getenv("SGL_SPEC_W");
+    w = sw ? atoi(sw) : 0;
+    if (w < 0 || w > 8) w = 0;
+  }
+  return w;
+}
+
 SGL_THREAD_SIG(worker) {
   (void)arg;
   float *batch_logits = (float *)malloc(sizeof(float) * (size_t)MAX_CONC * E.vocab);
@@ -608,12 +619,21 @@ SGL_THREAD_SIG(worker) {
           pch = (ce && atoi(ce) > 0) ? atoi(ce) : 1024;
           if (pch > 8192) pch = 8192;
         }
+        /* M3：投机要用 MTP 自有 KV，prompt 段得逐块回填（只算 K/V，开销远小于 prefill）。
+         * 前缀命中时 [0, off) 没有主模型 hidden 可用，那几行沿用旧值，只影响草稿质量。*/
+        int mtp_fill = spec_w_env() > 0 && sgl_cuda_mtp_ready(E.gpu);
+        int first_chunk = 1;
         while (off < r->n_prompt && rc == 0) {
           int chunk = r->n_prompt - off;
           if (chunk > pch) chunk = pch;
           /* only the last chunk needs the lm_head pass + logits D2H */
           float *dst = (off + chunk >= r->n_prompt && r->n_img == 0) ? r->logits : NULL;
           rc = sgl_cuda_forward_seg(E.gpu, r->prompt + off, chunk, off, base, dst);
+          if (rc == 0 && mtp_fill &&
+              sgl_cuda_mtp_fill_kv(E.gpu, r->prompt + off, chunk, off,
+                                   first_chunk ? NULL : sgl_cuda_mtp_hprev(E.gpu)) != 0)
+            mtp_fill = 0;
+          first_chunk = 0;
       E.tot_prefill += chunk;
           off += chunk;
         }
@@ -876,6 +896,9 @@ static int spec_try_step(request *r, int W) {
     }
   }
   if (stop_at >= 0) k = stop_at;
+  /* 被接受的草稿行，MTP KV 里是链式 hidden 算的；用 verify 的真 hidden 重写
+   *（commit 会改 hlast，所以要在它之前：此刻 hlast 仍是 hidden[pos-1]）*/
+  if (k > 0) sgl_cuda_mtp_fill_kv(E.gpu, toks, k + 1, pos, sgl_cuda_mtp_hlast(E.gpu));
   if (sgl_cuda_spec_commit(E.gpu, r->seg, k) != 0) return 0;
   spec_steps++;
   spec_toks += k + 1;

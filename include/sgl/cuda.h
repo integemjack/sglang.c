@@ -118,6 +118,19 @@ int sgl_cuda_mtp_set_hidden(sgl_cuda_model *m, int row);
  * 尚未存在的 token 没有 hidden。返回实际生成的个数（<= W）。*/
 int sgl_cuda_mtp_drafts(sgl_cuda_model *m, int t0, int pos, int W, int *out);
 
+/* 回填 MTP 自有 KV 的 [pos0, pos0+n) 行，必须紧跟在算出这 n 行的主模型前向之后调用
+ * （读它留在 g->x / g->h 的 hidden）。第 i 行的输入是 (toks[i], hidden[pos0+i-1])：
+ * i>=1 取前向第 i-1 行，i=0 取 hprev（device [E]；NULL = 第 0 行自己，用于 pos0==0）。
+ * 草稿只给拟出的位置写 KV，且用的是链式 hidden；不回填时 prompt 段是上个请求的残留，
+ * 被接受的草稿行也一直是链式值。结束时把第 n-1 行 hidden 存进内部 hprev，
+ * 供下一块 prefill 用（sgl_cuda_mtp_hprev）。返回 0 成功。*/
+int sgl_cuda_mtp_fill_kv(sgl_cuda_model *m, const int *toks, int n, int pos0,
+                         const float *hprev);
+/* 上一次 fill_kv 最后一行的 hidden（device [E]），没调过时返回 NULL */
+const float *sgl_cuda_mtp_hprev(const sgl_cuda_model *m);
+/* 当前草稿输入 hidden（device [E]，= 最后落定位置的主模型 hidden）*/
+const float *sgl_cuda_mtp_hlast(const sgl_cuda_model *m);
+
 /* 一次验证：对 toks[0..n-1]（= [t0, 草稿...]）在 pos0 处做带因果掩码的前向，
  * 每行一份 logits（host，[n][V]），同时开启逐行状态快照。
  * 回写 *k_out = 最长匹配前缀长度（第 j 行的 argmax == toks[j+1] 则 j 计入）。*/
