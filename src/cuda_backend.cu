@@ -2475,8 +2475,18 @@ static void gemm_w4_launch(sgl_cuda_model *g, const float *A, const sgl_w4w *W,
  * G2: M>1 goes to the int8 tensor-core (IMMA) path; M==1 and the shapes IMMA
  * cannot take stay on the hand dp4a GEMV, which is the faster of the two at
  * batch 1 (weight bandwidth bound, one row of activations). */
+/* P2 诊断（SGL_PROF_NOGEMM=1）：整个 PROJ 不发射任何 kernel，用来量
+ * 「一步 decode 里 GEMM 之外到底占多少」。配合 SGL_CUDA_PROF=1 读 total。
+ * 输出是垃圾（C 保持旧值），纯计时用。*/
+static int prof_nogemm(void) {
+  static int v = -1;
+  if (v < 0) { const char *e = getenv("SGL_PROF_NOGEMM"); v = e ? atoi(e) : 0; }
+  return v;
+}
+
 #define PROJ(g, A, Wf, Wh, W8, bias, C, M, N, K)                                   \
   do {                                                                             \
+    if (prof_nogemm()) break;                                                      \
     if ((g)->use_w4 && (W8) && (W8)->w4) {                                         \
       gemm_w4_launch((g), A, (const sgl_w4w *)(W8)->w4, bias, C, M, N, K);         \
       break;                                                                       \

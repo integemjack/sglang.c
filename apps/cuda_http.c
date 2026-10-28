@@ -80,6 +80,12 @@ static unsigned long long sgl_tick_ms(void) {
   return (unsigned long long)ts.tv_sec * 1000ULL + (unsigned long long)(ts.tv_nsec / 1000000L);
 }
 #define GetTickCount64() sgl_tick_ms()
+/* 单调微秒，给性能诊断用 */
+static double sgl_now_us(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1e3;
+}
 /* 线程入口签名：Win32 = DWORD WINAPI f(LPVOID)，POSIX = void *f(void *) */
 #define SGL_THREAD_SIG(name) static void *name(void *arg)
 #define SGL_THREAD_RETURN return NULL
@@ -722,7 +728,26 @@ SGL_THREAD_SIG(worker) {
             fprintf(stderr, " | tok=%d base=%d len=%d slot=%d", bt[q], bb[q], bl[q], bs[q]);
           fprintf(stderr, "\n");
         }
+        /* P3 诊断（SGL_HTTP_PROF=1）：把每个 token 的时间拆成「前向」和「前向之外」
+         * 两段——前向外的 gap 包含采样、logits 拷贝、以及为流式公平性加的
+         * 200μs nanosleep。不先量出这个，就会把时间花在错的地方。*/
+        static int hp_on = -1;
+        static double hp_prev = 0.0, hp_dec = 0.0, hp_gap = 0.0;
+        static long hp_n = 0;
+        if (hp_on < 0) { const char *e2 = getenv("SGL_HTTP_PROF"); hp_on = e2 ? atoi(e2) : 0; }
+        double hp_t0 = hp_on ? sgl_now_us() : 0.0;
+        if (hp_on && hp_prev > 0.0) hp_gap += hp_t0 - hp_prev;
         int rc = sgl_cuda_decode_batch(E.gpu, bt, bb, bl, nb, batch_logits);
+        if (hp_on) {
+          double hp_t1 = sgl_now_us();
+          hp_dec += hp_t1 - hp_t0;
+          hp_prev = hp_t1;
+          if (++hp_n % 16 == 0) {
+            fprintf(stderr, "[hprof] n=%ld  dec %.2f ms  gap %.2f ms (per token)\n",
+                    hp_n, hp_dec / 16000.0, hp_gap / 16000.0);
+            hp_dec = hp_gap = 0.0;
+          }
+        }
         if (rc != 0) {
           for (int b = 0; b < nb; b++) br[b]->state = R_FAIL;
         } else {
