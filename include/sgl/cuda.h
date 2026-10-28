@@ -77,6 +77,26 @@ int sgl_cuda_copy_kv(sgl_cuda_model *m, int src, int dst, int len);
  * 权重（fp32/fp16/int8 按当前环境变量开关）+ KV 池(ctx) + 激活工作区(rows) +
  * logits 设备镜像 + cublas workspace。llama_model 为 sgl_llama*。 */
 long sgl_cuda_estimate_vram_mb(const void *llama_model, int ctx, int rows);
+
+/* ============ M3: MTP（multi-token prediction）草稿头 ============
+ * 从同一检查点的 mtp.safetensors 读一个 full-attention 草稿层，量化成 int8。
+ * kv_ctx = MTP 自有 KV 的容量（只影响草稿能看多远的历史）。
+ * 返回 0 = 就绪；非 0 = 没有 mtp 权重 / 环境不支持（调用方应静默降级）。 */
+int sgl_cuda_mtp_load(sgl_cuda_model *m, int kv_ctx);
+int sgl_cuda_mtp_ready(const sgl_cuda_model *m);
+
+/* 一步草稿：给定位置 pos 的 hidden（device [E] 单行）与该位置的 token，
+ * 预测 pos+1 的 token。hidden 取 final-norm 之前还是之后由 SGL_MTP_HIDDEN
+ * 决定（pre 默认 / post）。返回 0 成功。 */
+int sgl_cuda_mtp_draft(sgl_cuda_model *m, int token, int pos, const float *hidden,
+                       int *out_tok);
+
+/* MTP 自验证：在同一 prompt 上让主模型贪心跑 ngen 个 token 作为参考流，
+ * 再 teacher-forced 逐步跑 MTP，统计草稿与参考流的一致率（接受率）。
+ * 正确实现约 0.6–0.85，实现错了约 0–0.05——判别极锐利。
+ * 结果写进 *acc（接受率）与 *n_ok（命中数）。返回 0 成功。 */
+int sgl_cuda_mtp_accept_test(sgl_cuda_model *m, const int *prompt, int np, int ngen,
+                             double *acc, int *n_ok);
 /* G5: 当前可用显存（cudaMemGetInfo 的 free，MB）；失败返回 -1 */
 long sgl_cuda_avail_vram_mb(void);
 

@@ -1,9 +1,15 @@
-﻿/* sgl/tensor.h — 张量（PyTorch torch.Tensor 的最小 C 子集：1D/2D/3D f32） */
+/* sgl/tensor.h — 张量（PyTorch torch.Tensor 的最小 C 子集：1D/2D/3D f32） */
 #ifndef SGL_TENSOR_H
 #define SGL_TENSOR_H
 
 #include <stddef.h>
 #include <stdint.h>
+
+/* C++ 调用方需要 C 链接（M3：cuda_backend.cu 会用 sgl_tensor）。与其它公开
+ * 头文件保持一致。*/
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef enum {
   SGL_CPU = 0,
@@ -38,5 +44,9 @@ void sgl_tensor_free(sgl_tensor *t);
 /* element-wise 归约 */
 float sgl_tensor_sum(const sgl_tensor *t);
 float sgl_tensor_max_abs(const sgl_tensor *t);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

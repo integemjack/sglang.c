@@ -5,6 +5,13 @@
 
 #include "sgl/tensor.h"
 
+/* C++ 调用方（cuda_backend.cu / 测试）需要 C 链接：本头文件此前没有这个保护，
+ * 所以一旦 .cu 里调用 sgl_st_get 就会得到 mangled 名字、链接期 undefined
+ * reference。M3 的 MTP 加载是第一个在 C++ 里用它的地方。*/
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct sgl_st_ctx sgl_st_ctx;
 
 /* 打开单个 .safetensors 文件；失败返回 NULL */
@@ -38,5 +45,9 @@ int sgl_st_names(sgl_st_ctx *c, const char ***names);
 
 /* 已加载的分片数（单文件 = 1） */
 int sgl_st_shard_count(const sgl_st_ctx *c);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

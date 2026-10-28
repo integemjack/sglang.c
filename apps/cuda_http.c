@@ -1720,6 +1720,16 @@ int sgl_cuda_http_serve(const char *dir, int port, const char *host) {
     }
   }
   if (E.degraded) E.seg_len = 0;
+  /* M3: MTP 草稿头。默认关（SGL_MTP=1 开），因为要先测出接受率再决定。
+   * 权重在同一个检查点的 mtp.safetensors 里，没有就静默降级。*/
+  if (E.gpu && !E.degraded) {
+    const char *me = getenv("SGL_MTP");
+    if (me && atoi(me) > 0) {
+      int mctx = sgl_cuda_ctx(E.gpu);
+      if (sgl_cuda_mtp_load(E.gpu, mctx) != 0)
+        SGL_INFO("cuda http: MTP requested but not available, continuing without");
+    }
+  }
   char tpath[1024];
   snprintf(tpath, sizeof(tpath), "%s/tokenizer.json", dir);
   /* t11：必须走 load_dir——它会在 tokenizer_config.json 里解析 eos_token（字符串/
@@ -1846,6 +1856,50 @@ int sgl_cuda_http_serve(const char *dir, int port, const char *host) {
          (double)clock() / CLOCKS_PER_SEC - t0, E.gpu ? sgl_cuda_ctx(E.gpu) : 0,
          E.seg_len, ACTIVE_CONC, E.eos, E.degraded ? " [DEGRADED]" : "");
   fflush(stdout);
+  /* M3 自验证：SGL_MTP_TEST=1 时跑一遍 teacher-forced 接受率然后退出。
+   * 这是判断 MTP 实现对不对的唯一判据（对：0.6–0.85，错：0–0.05）。*/
+  {
+    const char *mt = getenv("SGL_MTP_TEST");
+    if (mt && atoi(mt) > 0 && E.gpu && sgl_cuda_mtp_ready(E.gpu)) {
+      const char *pr = getenv("SGL_MTP_PROMPT");
+      if (!pr) pr = "The capital of France is";
+      int ng = 24;
+      const char *ge = getenv("SGL_MTP_NGEN");
+      if (ge && atoi(ge) > 0) ng = atoi(ge);
+      int ids[512];
+      int np = 0;
+      if (getenv("SGL_MTP_DBG")) fprintf(stderr, "[mtp] stage: tokenize\n");
+      /* SGL_MTP_IDS=1,2,3 直接给 token id，绕开分词器（排错用）*/
+      const char *idsenv = getenv("SGL_MTP_IDS");
+      if (idsenv && *idsenv) {
+        const char *q = idsenv;
+        while (*q && np < 512) {
+          ids[np++] = (int)strtol(q, (char **)&q, 10);
+          if (*q == ',') q++;
+        }
+      } else {
+        int *enc = sgl_tokenizer_encode(E.tok, pr, strlen(pr), &np);
+        if (enc && np > 0) {
+          if (np > 512) np = 512;
+          memcpy(ids, enc, sizeof(int) * (size_t)np);
+        }
+        sgl_xfree(enc); /* 必须 sgl_xfree：sgl_xmalloc 在 ptr[-8] 存原始地址，
+                         * 用 free() 会直接堆损坏（启动时 “double free or
+                         * corruption (out)” 就是这个），见 TODO_PROMPTS.md:66 */
+      }
+      if (getenv("SGL_MTP_DBG")) fprintf(stderr, "[mtp] stage: tokenized np=%d\n", np);
+      if (np <= 0) {
+        fprintf(stderr, "[mtp] tokenize failed\n");
+      } else {
+        double acc = 0;
+        int nok = 0;
+        if (sgl_cuda_mtp_accept_test(E.gpu, ids, np, ng, &acc, &nok) == 0)
+          printf("[mtp] RESULT prompt=%s  n=%d  accept=%.3f (%d)\n", pr, np, acc, nok);
+        fflush(stdout);
+      }
+      exit(0);
+    }
+  }
 
 #ifdef _WIN32
   HANDLE w = CreateThread(NULL, 0, worker, NULL, 0, NULL);

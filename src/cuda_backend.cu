@@ -48,6 +48,37 @@
  * M1：w4 指向同一投影的 FP4 副本（NULL = 没有）。use_w4 时 PROJ 走它，
  * int8 数据不再上传——两套同时放显存放不下。*/
 typedef struct { int8_t *w; float *scale; void *w4; } sgl_w8w;
+
+/* ================= M3: MTP（multi-token prediction）草稿头 =================
+ * 目的：让一次前向产出多个 token。单发上限是 61.9 tok/s（实测：每 token 必读
+ * 27.296 GB / 1690 GB/s），只有「一次前向出多 token」能过 100，且不动精度。
+ *
+ * 结构（与 transformers modeling_layers.py:313 MtpLayer 一致）：
+ *   proj_in = cat([enorm(emb(t_p)), hnorm(hidden_p)])   [2E]
+ *   x       = fc @ proj_in                              [E]  (无 bias)
+ *   x       = DecoderLayer(x)  一个 full-attention 层，自带 KV cache
+ *   h       = post_norm(x)                              [E]
+ *   tok'    = argmax(lm_head @ h)
+ * 注意 emb 与 hidden 取**同一位置 p**，预测 p+1（不是错开一格）。
+ *
+ * MTP 层的 q/k/v/o 与 mlp 维度跟主模型的 full_attention 层完全一致，所以
+ * 直接复用 PROJ / k_hrmsnorm / k_rope / k_attn_long，不另写一套。*/
+typedef struct {
+  int ok;                     /* 1 = 权重已加载可用 */
+  sgl_w8w fc8;                /* [E, 2E] */
+  sgl_w8w q8, k8, v8, o8, g8, u8, d8;
+  float *enorm, *hnorm;       /* [E] pre_fc_norm_embedding / _hidden */
+  float *ln1, *ln2;           /* [E] input_layernorm / post_attention_layernorm */
+  float *post_norm;           /* [E] mtp.norm */
+  float *qn, *kn;             /* [D] q_norm / k_norm */
+  float *e, *proj_in;         /* [E], [2E] */
+  float *x, *h, *q, *q2, *qgate, *k, *v, *attn, *gate, *up; /* 单行 scratch */
+  float *kc, *vc;             /* [mtp_ctx][KD] 自有 KV（不与主模型共享）*/
+  int ctx;                    /* MTP KV 的容量 */
+  int hsrc;                   /* 0 = final-norm 之前, 1 = 之后（用接受率裁决）*/
+  int *d_tok;                 /* [1] 草稿输入 token */
+  int *d_arg;                 /* [1] device argmax 结果 */
+} sgl_mtp;
 /* M1: NVFP4 风格的 4-bit 权重。数据 2 个值/字节（e2m1），缩放按 16 元素一块
  * 存 fp16。相对 int8 的 1 字节/参数，这里是 0.5 + 2/16 = 0.625 字节/参数
  * （1.6× 减容）；e2m1 只有 16 个电平，必须靠小块缩放才能保住精度。*/
@@ -173,6 +204,9 @@ struct sgl_cuda_model {
   int8_t *w8_a8;   /* [ws_cap][max(E,I)] */
   int32_t *w8_c32; /* [ws_cap][max(E,I)] */
   float *w8_as;    /* [ws_cap] per-row activation scales */
+
+  sgl_mtp mtp;     /* M3: MTP 草稿头（mtp.ok=0 时全部跳过）*/
+  void *st;        /* llama 模型的 safetensors 上下文（MTP 加载用，不拥有）*/
 };
 
 __global__ void k_embed(const float *wte, const int *tok, float *x, int n, int E) {
@@ -1582,6 +1616,28 @@ __global__ void k_residual(float *x, const float *h, long n) {
   x[i] += h[i];
 }
 
+/* M3：device 侧 argmax。MTP 每步要为每个草稿算一次 lm_head（V=248320），
+ * 把 1 MB 的 logits D2H 每草稿一次不划算；在 device 上取完只回 4 字节。*/
+__global__ void k_argmax(const float *v, int n, int *out) {
+  __shared__ float bv[256];
+  __shared__ int bi[256];
+  int tid = threadIdx.x;
+  float best = -INFINITY;
+  int bidx = 0;
+  for (int i = tid; i < n; i += blockDim.x) {
+    float x = v[i];
+    if (x > best) { best = x; bidx = i; }
+  }
+  bv[tid] = best;
+  bi[tid] = bidx;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s && bv[tid + s] > bv[tid]) { bv[tid] = bv[tid + s]; bi[tid] = bi[tid + s]; }
+    __syncthreads();
+  }
+  if (tid == 0) *out = bi[0];
+}
+
 /* row-major C[M,N] = A[M,K] @ W[N,K]^T (+bias) via cublas.
  * mapping: row-major [N,K] with ld=K reads as col-major KxN (OP_T gives NxK),
  * row-major [M,K] ld=K is col-major KxM (OP_N); result col-major NxM with
@@ -2952,12 +3008,343 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
        hs * 4.0 / 1048576);
   }
   if (g->use_fp16) printf("[cuda] fp16 weights ON (SGL_CUDA_FP16=1)\n");
+  g->st = (void *)m->st; /* M3：MTP 加载复用主模型的 safetensors 上下文 */
   return g;
 
 fail:
   fprintf(stderr, "sgl_cuda_from_llama: out of VRAM or copy failed\n");
   sgl_cuda_free(g);
   return NULL;
+}
+
+/* ================= M3: MTP 权重加载与草稿 =================
+ *
+ * 张量直接从主模型的 safetensors 上下文取——mtp.safetensors 是一个散分片，
+ * sgl_st_get 的散分片扫描已经把它打开了。FP8 权重由 safetensors 层按
+ * 128x128 块 + <name>_scale_inv 解成 f32，这里再量化成 int8（与主模型同一
+ * 口径：per-row absmax），因为 M=1 的 GEMV 走 int8 dp4a。*/
+
+static int mtp_get_1d(sgl_cuda_model *g, const char *name, int n, float **dst) {
+  sgl_st_ctx *st = (sgl_st_ctx *)g->st;
+  int64_t sh[1] = {n};
+  sgl_tensor t = sgl_st_get(st, name, 1, sh);
+  if (sgl_tensor_is_null(t)) {
+    fprintf(stderr, "[mtp] missing tensor %s\n", name);
+    return -1;
+  }
+  if (cudaMalloc((void **)dst, sizeof(float) * (size_t)n) != cudaSuccess) {
+    sgl_st_drop(st, &t);
+    return -1;
+  }
+  cudaMemcpy(*dst, t.data, sizeof(float) * (size_t)n, cudaMemcpyHostToDevice);
+  sgl_st_drop(st, &t);
+  return 0;
+}
+
+static int mtp_get_w8(sgl_cuda_model *g, const char *name, int N, int K, sgl_w8w *out) {
+  sgl_st_ctx *st = (sgl_st_ctx *)g->st;
+  int64_t sh[2] = {N, K};
+  sgl_tensor t = sgl_st_get(st, name, 2, sh);
+  if (sgl_tensor_is_null(t)) {
+    fprintf(stderr, "[mtp] missing tensor %s\n", name);
+    return -1;
+  }
+  int rc = dev_copy_w8(t.data, N, K, out);
+  sgl_st_drop(st, &t);
+  return rc;
+}
+
+static int mtp_alloc(float **p, size_t n) {
+  if (cudaMalloc((void **)p, n * sizeof(float)) != cudaSuccess) return -1;
+  cudaMemset(*p, 0, n * sizeof(float));
+  return 0;
+}
+
+/* 加载 MTP 草稿头。kv_ctx = MTP 自有 KV 的容量。
+ * 返回 0 = 就绪；非 0 = 没有 MTP 权重 / 环境不支持。*/
+int sgl_cuda_mtp_load(sgl_cuda_model *g, int kv_ctx) {
+  sgl_mtp *t;
+  int E, D, KD, QD, I;
+  if (!g) return -1;
+  t = &g->mtp;
+  if (t->ok) return 0;
+  E = g->E; D = g->D; KD = g->KD; QD = g->QD; I = g->I;
+  if (!g->st) { fprintf(stderr, "[mtp] no safetensors ctx\n"); return -1; }
+  if (!g->use_w8) { fprintf(stderr, "[mtp] needs int8 weights (SGL_CUDA_W8=1)\n"); return -1; }
+  if (kv_ctx < 2) kv_ctx = 2;
+  t->ctx = kv_ctx;
+  {
+    const char *e = getenv("SGL_MTP_HIDDEN");
+    t->hsrc = (e && !strcmp(e, "post")) ? 1 : 0;
+  }
+
+  if (mtp_get_w8(g, "mtp.fc.weight", E, 2 * E, &t->fc8)) goto fail;
+  if (mtp_get_w8(g, "mtp.layers.0.self_attn.q_proj.weight", 2 * QD, E, &t->q8)) goto fail;
+  if (mtp_get_w8(g, "mtp.layers.0.self_attn.k_proj.weight", KD, E, &t->k8)) goto fail;
+  if (mtp_get_w8(g, "mtp.layers.0.self_attn.v_proj.weight", KD, E, &t->v8)) goto fail;
+  if (mtp_get_w8(g, "mtp.layers.0.self_attn.o_proj.weight", E, QD, &t->o8)) goto fail;
+  if (mtp_get_w8(g, "mtp.layers.0.mlp.gate_proj.weight", I, E, &t->g8)) goto fail;
+  if (mtp_get_w8(g, "mtp.layers.0.mlp.up_proj.weight", I, E, &t->u8)) goto fail;
+  if (mtp_get_w8(g, "mtp.layers.0.mlp.down_proj.weight", E, I, &t->d8)) goto fail;
+
+  if (mtp_get_1d(g, "mtp.pre_fc_norm_embedding.weight", E, &t->enorm)) goto fail;
+  if (mtp_get_1d(g, "mtp.pre_fc_norm_hidden.weight", E, &t->hnorm)) goto fail;
+  if (mtp_get_1d(g, "mtp.layers.0.input_layernorm.weight", E, &t->ln1)) goto fail;
+  if (mtp_get_1d(g, "mtp.layers.0.post_attention_layernorm.weight", E, &t->ln2)) goto fail;
+  if (mtp_get_1d(g, "mtp.norm.weight", E, &t->post_norm)) goto fail;
+  if (mtp_get_1d(g, "mtp.layers.0.self_attn.q_norm.weight", D, &t->qn)) goto fail;
+  if (mtp_get_1d(g, "mtp.layers.0.self_attn.k_norm.weight", D, &t->kn)) goto fail;
+
+  if (mtp_alloc(&t->e, E) || mtp_alloc(&t->proj_in, 2 * (size_t)E) ||
+      mtp_alloc(&t->x, E) || mtp_alloc(&t->h, E) ||
+      mtp_alloc(&t->q2, 2 * (size_t)QD) || mtp_alloc(&t->q, QD) ||
+      mtp_alloc(&t->qgate, (size_t)g->H * D) || mtp_alloc(&t->k, KD) ||
+      mtp_alloc(&t->v, KD) || mtp_alloc(&t->attn, (size_t)g->H * D) ||
+      mtp_alloc(&t->gate, I) || mtp_alloc(&t->up, I))
+    goto fail;
+  {
+    size_t kv = (size_t)kv_ctx * (size_t)KD;
+    if (cudaMalloc((void **)&t->kc, kv * sizeof(float)) != cudaSuccess) goto fail;
+    if (cudaMalloc((void **)&t->vc, kv * sizeof(float)) != cudaSuccess) goto fail;
+    cudaMemset(t->kc, 0, kv * sizeof(float));
+    cudaMemset(t->vc, 0, kv * sizeof(float));
+  }
+  if (cudaMalloc((void **)&t->d_tok, sizeof(int)) != cudaSuccess) goto fail;
+  if (cudaMalloc((void **)&t->d_arg, sizeof(int)) != cudaSuccess) goto fail;
+
+  t->ok = 1;
+  {
+    double wb = (double)E * 2 * E + 4.0 * (double)QD * E + 2.0 * (double)KD * E +
+                (double)E * QD + 2.0 * (double)I * E + (double)E * I;
+    printf("[mtp] loaded: int8 weights %.2f MiB, kv_ctx %d (%.1f MiB), hsrc=%s\n",
+           wb / 1048576.0, kv_ctx,
+           2.0 * (double)kv_ctx * (double)KD * 4.0 / 1048576.0,
+           t->hsrc ? "post-final-norm" : "pre-final-norm");
+  }
+  return 0;
+
+fail:
+  fprintf(stderr, "[mtp] load failed (out of VRAM or bad tensors)\n");
+  return -1;
+}
+
+int sgl_cuda_mtp_ready(const sgl_cuda_model *g) { return g ? g->mtp.ok : 0; }
+
+/* 一步草稿：给定位置 pos 的 hidden（device [E] 单行）与该位置的 token，
+ * 预测 pos+1 的 token。
+ *
+ * hidden 应指 SGL_MTP_HIDDEN=pre（默认）时的 final-norm 之前残差流（g->x），
+ * 或 =post 时的之后值（g->h）。哪个对由接受率裁决。
+ * 副作用：MTP 把自己的 K/V 写在自有 KV 的 pos 行（不与主模型共享）。*/
+int sgl_cuda_mtp_draft(sgl_cuda_model *g, int token, int pos, const float *hidden,
+                       int *out_tok) {
+  sgl_mtp *t;
+  int E, D, KD, QD, I, H, HK;
+  cudaStream_t s;
+  if (!g || !out_tok) return -1;
+  t = &g->mtp;
+  if (!t->ok) return -1;
+  if (pos < 0 || pos >= t->ctx) return -1;
+  E = g->E; D = g->D; KD = g->KD; QD = g->QD; I = g->I; H = g->H; HK = g->HK;
+  s = g->stream;
+
+  /* 1. emb(token) 与 hidden 各过一次 RMSNorm，拼成 proj_in（emb 在前）。
+   *
+   * 注意 grid：k_embed 是「一线程一元素、无 stride 循环」的，行宽 E=5120 必须
+   * ceil(E/256) 个 block。写成 <<<1,256>>> 只会写前 256 个元素，剩下 4864
+   * 是上一个请求的残留——症状是草稿变成「高频泛词、偶尔对」，接受率卡在 0.5。*/
+  cudaMemcpyAsync(t->d_tok, &token, sizeof(int), cudaMemcpyHostToDevice, s);
+  {
+    int eb = (int)(((long)E + 255) / 256);
+    if (g->wte_h)
+      k_embed_h<<<eb, 256, 0, s>>>(g->wte_h, t->d_tok, t->e, 1, E);
+    else
+      k_embed<<<eb, 256, 0, s>>>(g->wte, t->d_tok, t->e, 1, E);
+  }
+  if (g->norm_p1) {
+    k_rmsnorm_p1<<<1, 256, 256 * sizeof(float), s>>>(t->e, t->enorm, t->proj_in, 1, E, g->eps);
+    k_rmsnorm_p1<<<1, 256, 256 * sizeof(float), s>>>(hidden, t->hnorm, t->proj_in + E, 1, E,
+                                                    g->eps);
+  } else {
+    k_rmsnorm<<<1, 256, 256 * sizeof(float), s>>>(t->e, t->enorm, t->proj_in, 1, E, g->eps);
+    k_rmsnorm<<<1, 256, 256 * sizeof(float), s>>>(hidden, t->hnorm, t->proj_in + E, 1, E,
+                                                  g->eps);
+  }
+  /* 2. fc：x = W(2E->E) @ proj_in */
+  PROJ(g, t->proj_in, NULL, NULL, &t->fc8, NULL, t->x, 1, E, 2 * E);
+
+  /* 3. 一个完整的 full-attention decoder 层 */
+  if (g->norm_p1)
+    k_rmsnorm_p1<<<1, 256, 256 * sizeof(float), s>>>(t->x, t->ln1, t->h, 1, E, g->eps);
+  else
+    k_rmsnorm<<<1, 256, 256 * sizeof(float), s>>>(t->x, t->ln1, t->h, 1, E, g->eps);
+  PROJ(g, t->h, NULL, NULL, &t->q8, NULL, t->q2, 1, 2 * QD, E);
+  k_qgate_split<<<(QD + 255) / 256, 256, 0, s>>>(t->q2, t->q, t->qgate, 1, H, D);
+  PROJ(g, t->h, NULL, NULL, &t->k8, NULL, t->k, 1, KD, E);
+  PROJ(g, t->h, NULL, NULL, &t->v8, NULL, t->v, 1, KD, E);
+  CK(cudaGetLastError());
+  k_hrmsnorm<<<H, D, D * sizeof(float), s>>>(t->q, t->qn, 1, H, D, 1e-6f, g->norm_p1);
+  k_hrmsnorm<<<HK, D, D * sizeof(float), s>>>(t->k, t->kn, 1, HK, D, 1e-6f, g->norm_p1);
+  if (g->rot_dim && g->rot_dim < D && g->pinvf) {
+    int half = g->rot_dim / 2;
+    k_rope_p<<<(H * half + 255) / 256, 256, 0, s>>>(t->q, H, D, H, pos, g->pinvf, g->rot_dim);
+    k_rope_p<<<(HK * half + 255) / 256, 256, 0, s>>>(t->k, HK, D, HK, pos, g->pinvf, g->rot_dim);
+  } else {
+    k_rope<<<(H * D / 2 + 255) / 256, 256, 0, s>>>(t->q, H, D, H, pos, g->freqs);
+    k_rope<<<(HK * D / 2 + 255) / 256, 256, 0, s>>>(t->k, HK, D, HK, pos, g->freqs);
+  }
+  CK(cudaGetLastError());
+  /* KV 写到自有池的 pos 行 */
+  {
+    size_t pitch = (size_t)KD * sizeof(float);
+    if (cudaMemcpy2DAsync(t->kc + (size_t)pos * KD, pitch, t->k, pitch, pitch, 1,
+                          cudaMemcpyDeviceToDevice, s) != cudaSuccess)
+      return -1;
+    if (cudaMemcpy2DAsync(t->vc + (size_t)pos * KD, pitch, t->v, pitch, pitch, 1,
+                          cudaMemcpyDeviceToDevice, s) != cudaSuccess)
+      return -1;
+  }
+  /* attention 覆盖 0..pos（含自身）*/
+  k_attn_long<<<H, 256, 0, s>>>(t->q, t->kc, t->vc, t->attn, pos, 0, 1, H, HK, D,
+                                1.0f / sqrtf((float)D), 0);
+  k_qgate_apply<<<(QD + 255) / 256, 256, 0, s>>>(t->attn, t->qgate, (long)QD);
+  CK(cudaGetLastError());
+  PROJ(g, t->attn, NULL, NULL, &t->o8, NULL, t->h, 1, E, QD);
+  k_residual<<<(E + 255) / 256, 256, 0, s>>>(t->x, t->h, E);
+  if (g->norm_p1)
+    k_rmsnorm_p1<<<1, 256, 256 * sizeof(float), s>>>(t->x, t->ln2, t->h, 1, E, g->eps);
+  else
+    k_rmsnorm<<<1, 256, 256 * sizeof(float), s>>>(t->x, t->ln2, t->h, 1, E, g->eps);
+  PROJ(g, t->h, NULL, NULL, &t->g8, NULL, t->gate, 1, I, E);
+  PROJ(g, t->h, NULL, NULL, &t->u8, NULL, t->up, 1, I, E);
+  k_silu_mul<<<(I + 255) / 256, 256, 0, s>>>(t->gate, t->up, I);
+  PROJ(g, t->gate, NULL, NULL, &t->d8, NULL, t->h, 1, E, I);
+  k_residual<<<(E + 255) / 256, 256, 0, s>>>(t->x, t->h, E);
+  CK(cudaGetLastError());
+
+  /* 4. post_norm，然后共享 lm_head（不拥有自己的词表投影）*/
+  if (g->norm_p1)
+    k_rmsnorm_p1<<<1, 256, 256 * sizeof(float), s>>>(t->x, t->post_norm, t->h, 1, E, g->eps);
+  else
+    k_rmsnorm<<<1, 256, 256 * sizeof(float), s>>>(t->x, t->post_norm, t->h, 1, E, g->eps);
+  lm_head_gemm(g, t->h, g->d_lgb, 1);
+  k_argmax<<<1, 256, 0, s>>>(g->d_lgb, g->V, t->d_arg);
+  if (cudaMemcpyAsync(out_tok, t->d_arg, sizeof(int), cudaMemcpyDeviceToHost, s) != cudaSuccess)
+    return -1;
+  return cudaStreamSynchronize(s) == cudaSuccess ? 0 : -1;
+}
+
+/* 便捷计时（单调秒），MTP 诊断用。sgl_hnow 定义在文件后半段，这里需要
+ * 前面的声明。*/
+static double mtp_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* MTP 自验证：teacher-forced 接受率。
+ *
+ * 关键点（第一版错在这里）：MTP 层有**自己的** KV cache，它必须像主模型
+ * 一样从位置 0 顺序填满。只给草稿位置写 KV、让 prompt 那段留零，等于让草稿
+ * 看不见上下文——实测接受率只有 40%。正确做法：
+ *   1) 主模型贪心跑出参考流
+ *   2) 整条序列（prompt + 参考流）过一遍 forward_seg_rows，把每个位置的
+ *      hidden 拿全（g->x 本来就有 n 行）
+ *   3) 从位置 0 开始逐位置跑 MTP（顺序写它自己的 KV），预测下一个 token
+ *
+ * 正确实现约 0.6–0.85；拼接顺序/归一化位置错了约 0–0.05。*/
+int sgl_cuda_mtp_accept_test(sgl_cuda_model *m, const int *prompt, int np, int ngen,
+                             double *acc, int *n_ok) {
+  int E, i, ok = 0, tot = 0, N;
+  int *gen = NULL, *seq = NULL;
+  float *hidall = NULL;
+  double dr_ms = 0.0;
+  int ndr = 0;
+  static float *logits = NULL;
+  if (!m || !prompt || np <= 0 || ngen <= 1) return -1;
+  if (!m->mtp.ok) return -1;
+  if (getenv("SGL_MTP_DBG")) fprintf(stderr, "[mtp] stage: accept_test enter\n");
+  E = m->E;
+  N = np + ngen;
+  gen = (int *)calloc((size_t)ngen, sizeof(int));
+  seq = (int *)calloc((size_t)N, sizeof(int));
+  if (!gen || !seq) { free(gen); free(seq); return -1; }
+  if (!logits) logits = (float *)malloc(sizeof(float) * (size_t)m->V);
+  if (!logits) { free(gen); free(seq); return -1; }
+  if (cudaMalloc((void **)&hidall, sizeof(float) * (size_t)N * E) != cudaSuccess) {
+    free(gen); free(seq);
+    return -1;
+  }
+
+  /* 1. 参考流：逐 token 贪心 */
+  {
+    int pos = np;
+    if (getenv("SGL_MTP_DBG")) fprintf(stderr, "[mtp] stage: prefill np=%d\n", np);
+    if (sgl_cuda_forward_seg(m, prompt, np, 0, 0, logits) != 0) goto fail;
+    for (i = 0; i < ngen; i++) {
+      int tk = 0;
+      float best = -INFINITY;
+      for (int v = 0; v < m->V; v++)
+        if (logits[v] > best) { best = logits[v]; tk = v; }
+      gen[i] = tk;
+      if (i + 1 < ngen) {
+        if (sgl_cuda_forward_seg(m, &tk, 1, pos, 0, logits) != 0) goto fail;
+        pos++;
+      }
+    }
+  }
+
+  /* 2. 整条序列过一遍，拿全部位置的 hidden（=pre 取 x，=post 取 h）*/
+  memcpy(seq, prompt, sizeof(int) * (size_t)np);
+  for (i = 0; i < ngen; i++) seq[np + i] = gen[i];
+  if (getenv("SGL_MTP_DBG")) fprintf(stderr, "[mtp] stage: ref done, forward all %d rows\n", N);
+  /* logits_out 传 NULL：这一步只要 g->x/g->h 的 N 行 hidden，不要 lm_head。
+   * （传个小缓冲会写 N*V 个 float 把堆冲掉。）*/
+  if (sgl_cuda_forward_seg_rows(m, seq, N, 0, 0, NULL) != 0) goto fail;
+  {
+    const float *src = m->mtp.hsrc ? m->h : m->x;
+    if (cudaMemcpy(hidall, src, sizeof(float) * (size_t)N * E, cudaMemcpyDeviceToDevice) !=
+        cudaSuccess)
+      goto fail;
+  }
+
+  /* 3. 从位置 0 顺序跑 MTP，顺带把它自己的 KV 顺序填满。
+   *
+   * 配对是**错开一格**的（MtpModel.forward 的文档写得很清楚）：
+   *   位置 p 的输入 = (hidden[p-1], token[p])，输出预测 token[p+1]。
+   * 直接同位置配对（hidden[p], token[p]）实测只有 37%，错就错在这里。
+   * 序列真实长度下 p 从 np 开始才是真正的草稿位置（prompt 那段的运行只是
+   * 为了填 MTP 自己的 KV），但两边都要跑，因为 KV 必须从 0 顺序建。*/
+  for (i = 0; i + 1 < N; i++) {
+    int d = 0;
+    int hp = (i == 0) ? 0 : i - 1;
+    double t0 = mtp_now();
+    if (sgl_cuda_mtp_draft(m, seq[i], i, hidall + (size_t)hp * E, &d) != 0) goto fail;
+    dr_ms += (mtp_now() - t0) * 1000.0;
+    ndr++;
+    if (i >= np) {
+      if (getenv("SGL_MTP_DBG"))
+        fprintf(stderr, "[mtp] dbg pos=%d draft=%d ref=%d %s\n", i, d, seq[i + 1],
+                d == seq[i + 1] ? "HIT" : "miss");
+      tot++;
+      if (d == seq[i + 1]) ok++;
+    }
+  }
+  if (acc) *acc = tot > 0 ? (double)ok / (double)tot : 0.0;
+  if (n_ok) *n_ok = ok;
+  printf("[mtp] acceptance (teacher-forced): %d/%d = %.1f%%  hsrc=%s  draft %.2f ms/step\n", ok,
+         tot, tot > 0 ? 100.0 * (double)ok / (double)tot : 0.0,
+         m->mtp.hsrc ? "post" : "pre", ndr > 0 ? dr_ms / ndr : 0.0);
+  cudaFree(hidall);
+  free(gen);
+  free(seq);
+  return 0;
+fail:
+  if (hidall) cudaFree(hidall);
+  free(gen);
+  free(seq);
+  fprintf(stderr, "[mtp] accept_test failed\n");
+  return -1;
 }
 
 /* t4: transpose-copy helper — HF Conv1D weight is [K,N] row-major; llama's
@@ -3852,10 +4239,12 @@ int sgl_cuda_forward_seg(sgl_cuda_model *g, const int *tokens, int n, int pos0,
 }
 
 /* G7: verify forward — every one of the n positions gets its own logits row
- * (single M=n lm_head GEMM). See cuda.h for row semantics. */
+ * (single M=n lm_head GEMM). See cuda.h for row semantics.
+ * M3：logits_out 允许为 NULL = 只算到 hidden（每行的 x/h 仍然写满），
+ * 给 MTP 预热/取全位置 hidden 用——那时不需要 lm_head，省一次 248320 的 GEMM。*/
 int sgl_cuda_forward_seg_rows(sgl_cuda_model *g, const int *tokens, int n,
                               int pos0, int kv_base, float *logits_out) {
-  if (!logits_out || n <= 0) return -1;
+  if (n <= 0) return -1;
   if (g->kind == 1) return -1; /* llama backend only */
   return fwd_seg_llama(g, tokens, NULL, n, pos0, kv_base, logits_out, 1);
 }

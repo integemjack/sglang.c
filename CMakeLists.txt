@@ -301,6 +301,11 @@ if(SGL_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl/cuda.h
               ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl/cuda_deepseek.h
               ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl/deepseek.h
+              # M3：cuda_backend.cu 现在直接调 safetensors（MTP 权重加载）。
+              # 这两个头必须进 DEPENDS，否则只改头不改 .cu 时 nvcc 不会重编，
+              # 链接期才报 undefined reference（本定改动就撞过）。
+              ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl/safetensors.h
+              ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl/tensor.h
       COMMENT "nvcc ${_cu}.cu (sm_${SGL_CUDA_ARCH})"
       VERBATIM)
     list(APPEND SGL_CUDA_OBJS ${_obj})
