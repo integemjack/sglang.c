@@ -95,6 +95,13 @@ static double sgl_now_us(void) {
 #define SGL_SEND_FLAGS 0 /* winsock 无 MSG_NOSIGNAL */
 #define SGL_THREAD_SIG(name) static DWORD WINAPI name(LPVOID arg)
 #define SGL_THREAD_RETURN return 0
+/* 单调微秒，给性能诊断用（POSIX 版在上面的 #else 里）*/
+static double sgl_now_us(void) {
+  LARGE_INTEGER f, c;
+  QueryPerformanceFrequency(&f);
+  QueryPerformanceCounter(&c);
+  return (double)c.QuadPart * 1e6 / (double)f.QuadPart;
+}
 #endif
 
 #include <math.h> /* P1: grammar 掩码用 -INFINITY */
@@ -599,6 +606,7 @@ SGL_THREAD_SIG(worker) {
       /* t11：告诉引擎本序列用哪个线性注意力递归状态槽（= 段号）。
        * 递归状态不能像 KV 那样按位置重建，不设就会全用槽 0 而互相覆盖。*/
       sgl_cuda_set_lin_slot(E.gpu, i);
+      sgl_cuda_mtp_set_base(E.gpu, base); /* MTP 自有 KV 与主 KV 同段 */
       if (getenv("SGL_HTTP_DBG"))
         fprintf(stderr, "[pf] id=%d seg=%d slot=%d nprompt=%d off=%d\n",
                 r->id, i, i, r->n_prompt, off);
@@ -869,17 +877,28 @@ static int spec_try_step(request *r, int W) {
     rows = nr;
     rows_cap = (W + 1) * E.vocab;
   }
-  toks[0] = r->gen[r->n_gen - 1];
-  nd = sgl_cuda_mtp_drafts(E.gpu, toks[0], pos, W, drafts);
-  if (nd < 1) return 0;
   /* 验收用：SGL_SPEC_CORRUPT=1 每步把第 (step % nd) 个草稿改坏，逼出各个 k 上的
-   * 拒绝 + 回滚；与正常投机应在相同 token 处（off 的近 tie 处）与 off 分叉。SGL_SPEC_STATS=1 逐步打印 k。*/
+   * 拒绝 + 回滚；与正常投机应在相同 token 处（off 的近 tie 处）与 off 分叉。
+   * SGL_SPEC_STATS=1 逐步打印 k、各草稿概率与耗时。
+   * SGL_SPEC_MINP：草稿链整体置信度低于它就提前停（0 = 固定拟 W 个，W 此时是上限）。
+   * 27B 实测 W=6/0.3 比 W=4/0 每个 prompt 都慢 3–9%（MTP 置信度对接受与否预测力弱），默认关。*/
   static int spec_corrupt = -1, spec_stats = -1;
+  static float spec_minp = 0.0f;
   static long spec_steps = 0, spec_toks = 0;
+  float probs[16];
+  double t_d0, t_d1, t_v1, t_c1;
   if (spec_corrupt < 0) {
     spec_corrupt = getenv("SGL_SPEC_CORRUPT") ? atoi(getenv("SGL_SPEC_CORRUPT")) : 0;
     spec_stats = getenv("SGL_SPEC_STATS") ? atoi(getenv("SGL_SPEC_STATS")) : 0;
+    spec_minp = getenv("SGL_SPEC_MINP") ? (float)atof(getenv("SGL_SPEC_MINP")) : 0.0f;
   }
+  /* 并发时别的请求的 prefill 会改 MTP 段基址，每步按本请求的段重设 */
+  sgl_cuda_mtp_set_base(E.gpu, r->seg * E.seg_len);
+  toks[0] = r->gen[r->n_gen - 1];
+  t_d0 = spec_stats ? sgl_now_us() : 0.0;
+  nd = sgl_cuda_mtp_drafts(E.gpu, toks[0], pos, W, spec_minp, drafts, spec_stats ? probs : NULL);
+  if (nd < 1) return 0;
+  t_d1 = spec_stats ? sgl_now_us() : 0.0;
   if (spec_corrupt) {
     int c = (int)(spec_steps % nd);
     drafts[c] = (drafts[c] + 1) % E.vocab;
@@ -887,6 +906,7 @@ static int spec_try_step(request *r, int W) {
   for (i = 0; i < nd; i++) toks[i + 1] = drafts[i];
   if (sgl_cuda_spec_verify(E.gpu, toks, nd + 1, pos, r->seg * E.seg_len, rows, &k) != 0)
     return 0;
+  t_v1 = spec_stats ? sgl_now_us() : 0.0;
   if (k > nd) k = nd;
   /* 停词：出现在第 i 个草稿就只收前 i 个（与普通路径一致，EOS 本身不入 gen）*/
   for (i = 0; i < k; i++) {
@@ -902,9 +922,16 @@ static int spec_try_step(request *r, int W) {
   if (sgl_cuda_spec_commit(E.gpu, r->seg, k) != 0) return 0;
   spec_steps++;
   spec_toks += k + 1;
-  if (spec_stats)
-    fprintf(stderr, "[spec] step=%ld pos=%d nd=%d k=%d tok/step=%.3f\n", spec_steps, pos, nd, k,
-            (double)spec_toks / (double)spec_steps);
+  if (spec_stats) {
+    char pb[160];
+    int o = 0;
+    t_c1 = sgl_now_us();
+    for (i = 0; i < nd && o < (int)sizeof(pb) - 8; i++)
+      o += snprintf(pb + o, sizeof(pb) - (size_t)o, "%s%.3f", i ? "," : "", probs[i]);
+    fprintf(stderr, "[spec] step=%ld pos=%d nd=%d k=%d tok/step=%.3f p=%s ms=%.2f/%.2f/%.2f\n",
+            spec_steps, pos, nd, k, (double)spec_toks / (double)spec_steps, pb,
+            (t_d1 - t_d0) / 1000.0, (t_v1 - t_d1) / 1000.0, (t_c1 - t_v1) / 1000.0);
+  }
   for (i = 0; i < k; i++) r->gen[r->n_gen++] = drafts[i];
   memcpy(r->logits, rows + (size_t)k * E.vocab, sizeof(float) * E.vocab);
   r->has_logits = 1;

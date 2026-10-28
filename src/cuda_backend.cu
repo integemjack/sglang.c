@@ -87,6 +87,10 @@ typedef struct {
   float *fe, *fhid, *fpin, *fx, *fh, *fk, *fv; /* [cap][E]×5、[cap][2E]、[cap][KD]×2 */
   int *ftok;                  /* [cap] */
   float *hprev;               /* [E] 上一块最后一行的 hidden（下一块第 0 行用）*/
+  int base;                   /* 当前序列在 kc/vc 里的起始行（= 主模型 KV 段基址，前缀复用时整段搬）*/
+  float *d_p;                 /* [1] device：草稿 token 的 softmax 概率 */
+  float last_p;               /* 最近一次 mtp_draft 的草稿概率（host；want_p=0 时不算）*/
+  int want_p;                 /* 1 = mtp_draft 要算草稿概率（阈值或统计要用；默认路径不多付这一趟）*/
 } sgl_mtp;
 
 /* ================= M3: 投机解码的 GDN 状态快照 =================
@@ -2403,6 +2407,40 @@ __global__ void k_argmax(const float *v, int n, int *out) {
   if (tid == 0) *out = bi[0];
 }
 
+/* k_argmax 再加 argmax 的 softmax 概率 1/Σexp(v-max)；选出的下标与 k_argmax 相同 */
+__global__ void k_argmax_p(const float *v, int n, int *out, float *pout) {
+  __shared__ float bv[256];
+  __shared__ int bi[256];
+  int tid = threadIdx.x;
+  float best = -INFINITY;
+  int bidx = 0;
+  for (int i = tid; i < n; i += blockDim.x) {
+    float x = v[i];
+    if (x > best) { best = x; bidx = i; }
+  }
+  bv[tid] = best;
+  bi[tid] = bidx;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s && bv[tid + s] > bv[tid]) { bv[tid] = bv[tid + s]; bi[tid] = bi[tid + s]; }
+    __syncthreads();
+  }
+  float mx = bv[0];
+  __syncthreads();
+  float sum = 0.0f;
+  for (int i = tid; i < n; i += blockDim.x) sum += __expf(v[i] - mx);
+  bv[tid] = sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) bv[tid] += bv[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    *out = bi[0];
+    *pout = 1.0f / bv[0];
+  }
+}
+
 /* row-major C[M,N] = A[M,K] @ W[N,K]^T (+bias) via cublas.
  * mapping: row-major [N,K] with ld=K reads as col-major KxN (OP_T gives NxK),
  * row-major [M,K] ld=K is col-major KxM (OP_N); result col-major NxM with
@@ -3921,6 +3959,7 @@ int sgl_cuda_mtp_load(sgl_cuda_model *g, int kv_ctx) {
   }
   if (cudaMalloc((void **)&t->d_tok, sizeof(int)) != cudaSuccess) goto fail;
   if (cudaMalloc((void **)&t->d_arg, sizeof(int)) != cudaSuccess) goto fail;
+  if (cudaMalloc((void **)&t->d_p, sizeof(float)) != cudaSuccess) goto fail;
 
   t->ok = 1;
   {
@@ -3956,9 +3995,10 @@ int sgl_cuda_mtp_draft(sgl_cuda_model *g, int token, int pos, const float *hidde
   if (!g || !out_tok) return -1;
   t = &g->mtp;
   if (!t->ok) return -1;
-  if (pos < 0 || pos >= t->ctx) return -1;
+  if (pos < 0 || t->base + pos >= t->ctx) return -1;
   E = g->E; D = g->D; KD = g->KD; QD = g->QD; I = g->I; H = g->H; HK = g->HK;
   s = g->stream;
+  float *kc = t->kc + (size_t)t->base * KD, *vc = t->vc + (size_t)t->base * KD;
 
   /* 1. emb(token) 与 hidden 各过一次 RMSNorm，拼成 proj_in（emb 在前）。
    *
@@ -4006,18 +4046,18 @@ int sgl_cuda_mtp_draft(sgl_cuda_model *g, int token, int pos, const float *hidde
     k_rope<<<(HK * D / 2 + 255) / 256, 256, 0, s>>>(t->k, HK, D, HK, pos, g->freqs);
   }
   CK(cudaGetLastError());
-  /* KV 写到自有池的 pos 行 */
+  /* KV 写到自有池的 base+pos 行 */
   {
     size_t pitch = (size_t)KD * sizeof(float);
-    if (cudaMemcpy2DAsync(t->kc + (size_t)pos * KD, pitch, t->k, pitch, pitch, 1,
+    if (cudaMemcpy2DAsync(kc + (size_t)pos * KD, pitch, t->k, pitch, pitch, 1,
                           cudaMemcpyDeviceToDevice, s) != cudaSuccess)
       return -1;
-    if (cudaMemcpy2DAsync(t->vc + (size_t)pos * KD, pitch, t->v, pitch, pitch, 1,
+    if (cudaMemcpy2DAsync(vc + (size_t)pos * KD, pitch, t->v, pitch, pitch, 1,
                           cudaMemcpyDeviceToDevice, s) != cudaSuccess)
       return -1;
   }
   /* attention 覆盖 0..pos（含自身）*/
-  k_attn_long<<<H, 256, 0, s>>>(t->q, t->kc, t->vc, t->attn, pos, 0, 1, H, HK, D,
+  k_attn_long<<<H, 256, 0, s>>>(t->q, kc, vc, t->attn, pos, 0, 1, H, HK, D,
                                 1.0f / sqrtf((float)D), 0);
   k_qgate_apply<<<(QD + 255) / 256, 256, 0, s>>>(t->attn, t->qgate, (long)QD);
   CK(cudaGetLastError());
@@ -4047,10 +4087,20 @@ int sgl_cuda_mtp_draft(sgl_cuda_model *g, int token, int pos, const float *hidde
   if (t->chain_post) CK(cudaMemcpyAsync(t->chain_post, t->h, sizeof(float) * (size_t)E,
                                         cudaMemcpyDeviceToDevice, s));
   lm_head_gemm(g, t->h, g->d_lgb, 1);
-  k_argmax<<<1, 256, 0, s>>>(g->d_lgb, g->V, t->d_arg);
+  if (t->want_p)
+    k_argmax_p<<<1, 256, 0, s>>>(g->d_lgb, g->V, t->d_arg, t->d_p);
+  else
+    k_argmax<<<1, 256, 0, s>>>(g->d_lgb, g->V, t->d_arg);
   if (cudaMemcpyAsync(out_tok, t->d_arg, sizeof(int), cudaMemcpyDeviceToHost, s) != cudaSuccess)
     return -1;
+  if (t->want_p &&
+      cudaMemcpyAsync(&t->last_p, t->d_p, sizeof(float), cudaMemcpyDeviceToHost, s) != cudaSuccess)
+    return -1;
   return cudaStreamSynchronize(s) == cudaSuccess ? 0 : -1;
+}
+
+void sgl_cuda_mtp_set_base(sgl_cuda_model *g, int base) {
+  if (g) g->mtp.base = base > 0 ? base : 0;
 }
 
 int sgl_cuda_mtp_fill_kv(sgl_cuda_model *g, const int *toks, int n, int pos0,
@@ -4061,7 +4111,7 @@ int sgl_cuda_mtp_fill_kv(sgl_cuda_model *g, const int *toks, int n, int pos0,
   cudaStream_t s;
   if (!g || !toks || n < 1) return -1;
   t = &g->mtp;
-  if (!t->ok || pos0 < 0 || pos0 + n > t->ctx) return -1;
+  if (!t->ok || pos0 < 0 || t->base + pos0 + n > t->ctx) return -1;
   E = g->E; KD = g->KD; HK = g->HK; D = g->D;
   s = g->stream;
   src = t->hsrc ? g->h : g->x;
@@ -4129,10 +4179,10 @@ int sgl_cuda_mtp_fill_kv(sgl_cuda_model *g, const int *toks, int n, int pos0,
           t->fk, nb * HK, D, HK, pos0 + b0, g->freqs);
     }
     CK(cudaGetLastError());
-    CK(cudaMemcpyAsync(t->kc + (size_t)(pos0 + b0) * KD, t->fk, sizeof(float) * (size_t)nb * KD,
-                       cudaMemcpyDeviceToDevice, s));
-    CK(cudaMemcpyAsync(t->vc + (size_t)(pos0 + b0) * KD, t->fv, sizeof(float) * (size_t)nb * KD,
-                       cudaMemcpyDeviceToDevice, s));
+    CK(cudaMemcpyAsync(t->kc + (size_t)(t->base + pos0 + b0) * KD, t->fk,
+                       sizeof(float) * (size_t)nb * KD, cudaMemcpyDeviceToDevice, s));
+    CK(cudaMemcpyAsync(t->vc + (size_t)(t->base + pos0 + b0) * KD, t->fv,
+                       sizeof(float) * (size_t)nb * KD, cudaMemcpyDeviceToDevice, s));
   }
   CK(cudaMemcpyAsync(t->hprev, src + (size_t)(n - 1) * E, sizeof(float) * (size_t)E,
                      cudaMemcpyDeviceToDevice, s));
@@ -4168,6 +4218,7 @@ int sgl_cuda_mtp_accept_test(sgl_cuda_model *m, const int *prompt, int np, int n
   static float *logits = NULL;
   if (!m || !prompt || np <= 0 || ngen <= 1) return -1;
   if (!m->mtp.ok) return -1;
+  m->mtp.base = 0; /* 自测从位置 0 起，用第 0 段 */
   if (getenv("SGL_MTP_DBG")) fprintf(stderr, "[mtp] stage: accept_test enter\n");
   E = m->E;
   N = np + ngen;
@@ -4431,16 +4482,25 @@ int sgl_cuda_spec_begin(sgl_cuda_model *m, int W) {
   return 0;
 }
 
-int sgl_cuda_mtp_drafts(sgl_cuda_model *m, int t0, int pos, int W, int *out) {
+int sgl_cuda_mtp_drafts(sgl_cuda_model *m, int t0, int pos, int W, float minp, int *out,
+                        float *probs) {
   int i, tok, d;
   float *hp;
+  double joint = 1.0;
   if (!m || !m->mtp.ok || !out || W < 1) return -1;
   tok = t0;
   hp = m->mtp.hlast;
+  m->mtp.want_p = (minp > 0.0f || probs) ? 1 : 0;
+  m->mtp.last_p = 1.0f;
   for (i = 0; i < W; i++) {
     if (!hp) return i;
     if (sgl_cuda_mtp_draft(m, tok, pos + i, hp, &d) != 0) return i;
+    joint *= m->mtp.last_p;
+    /* 第 1 个草稿总留着（1 行草稿的 verify 与普通 decode 同价）；之后整条链都对的
+     * 概率低于 minp 就停，这一个也不要 */
+    if (i > 0 && joint < (double)minp) return i;
     out[i] = d;
+    if (probs) probs[i] = m->mtp.last_p;
     tok = d;
     /* 链式：下一步用本层的输出 hidden（而不是主模型的）*/
     hp = m->mtp.chain_use_post ? m->mtp.chain_post : m->mtp.chain_pre;
@@ -4791,6 +4851,15 @@ int sgl_cuda_copy_kv(sgl_cuda_model *g, int src_base, int dst_base, int len) {
   if (src_base == dst_base) return 0;
   if (src_base < 0 || dst_base < 0 || src_base + len > g->ctx || dst_base + len > g->ctx)
     return -1;
+  /* M3：MTP 自有 KV 与主模型同段布局，前缀复用时一起搬（否则命中段的草稿看到的是旧值）*/
+  if (g->mtp.ok && g->mtp.kc && src_base + len <= g->mtp.ctx && dst_base + len <= g->mtp.ctx) {
+    size_t mb = (size_t)len * g->KD * sizeof(float);
+    if (cudaMemcpyAsync(g->mtp.kc + (size_t)dst_base * g->KD, g->mtp.kc + (size_t)src_base * g->KD,
+                        mb, cudaMemcpyDeviceToDevice, g->stream) != cudaSuccess ||
+        cudaMemcpyAsync(g->mtp.vc + (size_t)dst_base * g->KD, g->mtp.vc + (size_t)src_base * g->KD,
+                        mb, cudaMemcpyDeviceToDevice, g->stream) != cudaSuccess)
+      return -1;
+  }
   if (g->kvq.on) {
     /* M2：量化池的前缀复用。逐页搬（源/目都同偏移时才能一次搬一页）。
      * 请求段通常 64 对齐（seg_len 是 1024 的倍数），所以这里按页走。*/

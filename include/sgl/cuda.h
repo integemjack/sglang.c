@@ -113,12 +113,18 @@ int sgl_cuda_spec_begin(sgl_cuda_model *m, int W);
  * prefill → 第一次投机之间用一次。*/
 int sgl_cuda_mtp_set_hidden(sgl_cuda_model *m, int row);
 
-/* 链式草稿：从位置 pos 开始草拟 W 个 token，写进 out[0..W-1]。
- * 第 i 步用上一步的输出 hidden（MTP 自己的，不是主模型的）——因为主模型对
- * 尚未存在的 token 没有 hidden。返回实际生成的个数（<= W）。*/
-int sgl_cuda_mtp_drafts(sgl_cuda_model *m, int t0, int pos, int W, int *out);
+/* 链式草稿：从位置 pos 开始最多草拟 W 个 token，写进 out[0..]，各自的 softmax
+ * 概率写进 probs（可 NULL）。第 i 步用上一步的输出 hidden（MTP 自己的，不是主模型的）
+ * ——因为主模型对尚未存在的 token 没有 hidden。minp > 0 时，前 i 个草稿概率之积
+ * 低于 minp 就在第 i 个停（第 1 个总保留）；minp = 0 固定拟 W 个。返回实际个数。*/
+int sgl_cuda_mtp_drafts(sgl_cuda_model *m, int t0, int pos, int W, float minp, int *out,
+                        float *probs);
 
-/* 回填 MTP 自有 KV 的 [pos0, pos0+n) 行，必须紧跟在算出这 n 行的主模型前向之后调用
+/* MTP 自有 KV 的段基址（= 主模型 KV 段基址）。草稿与 fill_kv 都写 base+pos 行，
+ * sgl_cuda_copy_kv 同步搬这些行，所以前缀命中时 MTP KV 跟着复用。*/
+void sgl_cuda_mtp_set_base(sgl_cuda_model *m, int base);
+
+/* 回填 MTP 自有 KV 的 base+[pos0, pos0+n) 行，必须紧跟在算出这 n 行的主模型前向之后调用
  * （读它留在 g->x / g->h 的 hidden）。第 i 行的输入是 (toks[i], hidden[pos0+i-1])：
  * i>=1 取前向第 i-1 行，i=0 取 hprev（device [E]；NULL = 第 0 行自己，用于 pos0==0）。
  * 草稿只给拟出的位置写 KV，且用的是链式 hidden；不回填时 prompt 段是上个请求的残留，

@@ -19,6 +19,11 @@
   重写被接受的草稿行。之前 prompt 段是上个请求的残留，第 1 个草稿接受率只有 0.785。回填后各位置
   0.82 / 0.74 / 0.71 / 0.76，**3.16 token/步、decode 53–84 tok/s**；code prompt 的 d1 = 0.88，
   与 teacher-forced 0.894 一致。同一请求重发的投机输出也从「每次不同」变成逐字相同。
+- **MTP KV 按段存放**（`sgl_cuda_mtp_set_base`）：之前所有段共用同一批 MTP 行，并发时别的请求的
+  prefill 回填会盖掉正在 decode 的请求的行（CONC=2 实测被插队的请求 4.14 → 4.62 token/步）；
+  `sgl_cuda_copy_kv` 同步搬 MTP 行（hybrid 模型的前缀缓存目前是关的，这条路暂时用不到）。
+- `SGL_SPEC_MINP`（草稿链置信度低于阈值就停，默认 0 = 关）：实测 W=6/0.3 每个 prompt 都比 W=4 慢
+  3–9%，负结果，保留为可选项。`SGL_SPEC_STATS` 现在也打印逐草稿概率与 draft/verify/commit 耗时。
 - 投机路径的两个 bug：一步收 k+1 个 token 时不看 `max_tokens` 余量（越过定长 `gen[]`）、
   无视 `ignore_eos`。
 - **M2 量化 KV 池（`SGL_KVQ=1`，默认关）一并入库**：之前未提交的工作，与 M3 在同一批改动里；

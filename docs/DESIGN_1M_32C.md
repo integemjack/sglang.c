@@ -1109,7 +1109,24 @@ attention/MLP，每块约 62 MB 权重读）：prefill 每块之后回填 prompt
 分 prompt 的 d1：code 0.88（同 prompt teacher-forced 0.894）/ list 0.90 / prose 0.82 / zh 0.72，
 token/步 3.85 / 3.85 / 3.03 / 2.41 —— 剩下的差距是 prompt 难度，不是实现。
 另一个效果：MTP KV 不再带上个请求的残留，同一请求重发的投机输出从「每次不同」变成逐字相同。
-前缀缓存命中的 `[0, hit)` 行没有主模型 hidden，仍沿用旧值（只影响草稿质量）。
+
+**MTP KV 按段存放**（`sgl_cuda_mtp_set_base`）：MTP 的 `kc/vc` 本来就按整个 ctx 分配，但之前按序列内
+位置寻址，所有段共用同一批行 —— 并发时别的请求的 prefill 回填会盖掉正在 decode 的请求的行。
+现在与主 KV 一样用 `段基址 + pos`，`sgl_cuda_copy_kv` 也同步搬 MTP 行。`SGL_HTTP_CONC=2`、
+A 在跑时插进一个无关请求 D：A 的 token/步 4.14 → **4.62**（其余请求两版完全相同）。
+注意 hybrid 模型的前缀缓存本来就是关的（`E.pfx_ok = lin_slots <= 0`：GDN 递归状态不能从拷贝的
+KV 复原），而目前有 MTP 的只有这一族，所以「前缀命中时 MTP KV 是旧值」现在不会发生；copy_kv 里
+搬 MTP 行是给以后 hybrid 前缀复用留的。
+
+**按置信度提前停（`SGL_SPEC_MINP`）是负结果**：草稿 token 的 softmax 概率之积低于阈值就停。
+W=8 一次跑出逐草稿概率后离线扫阈值，模型预测 W=6/τ=0.3 能 +5%；实测反而每个 prompt 都慢
+（code 84.4 → 77.1、prose 66.1 → 64.0、zh 53.1 → 50.6、list 84.1 → 79.1 tok/s）。MTP 置信度对
+「会不会被接受」预测力弱（0.99 的草稿照样被拒），所以默认关，W=4 不变。
+
+真正的成本在别处（W=8 日志）：每个草稿 **2.5 ms**，几乎全是全词表 lm_head（248320×5120 fp16
+≈ 2.5 GB/次，MTP 层本身只有 465 MB）；verify 约 **33 ms**，几乎与行数无关（+0.3 ms/行），比普通
+decode 的 ~28 ms 还贵。下一步该压这两项（草稿用 int8 lm_head 或截断词表；verify 走更便宜的路径），
+而不是调停止规则。
 
 ### 17.5 验收时顺带修掉的旁路问题
 
