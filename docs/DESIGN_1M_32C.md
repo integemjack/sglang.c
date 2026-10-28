@@ -851,6 +851,124 @@ M0 解决的是「并发」，设计文档的另两个目标仍未达成：
 
 ---
 
+## 15. MTP 投机解码：语义确认 + 可行性实测（2026-10-28）
+
+这一节把「单发怎么上 100 tok/s」从推测变成了有依据的工程计划。
+
+### 15.1 softmax 之外的地板：不降精度就只有 64 tok/s
+
+单发每 token 必读 27.296 GB（mlp 17.38 + linear_attn 5.56 + self_attn 1.78
++ lm_head 2.54 BF16）。实测显存带宽 1690 GB/s，所以：
+
+> **单发上限 = 1690 / 27.296 = 61.9 tok/s**
+
+而且实测 int8 GEMV 已经到 86–89% 的峰值（lm_head 1693 GB/s）。也就是说，
+**不减少每 token 的权重字节数，单发绝对不能过 62 tok/s**。
+
+不降精度就只能让**一次前向产出多个 token** —— 这正是 MTP 干的事。
+
+### 15.2 为什么 MTP 在这里特别合算：验证成本几乎恒定
+
+实测 prefill/verify 成本曲线（同一模型、warm）：
+
+| 验证行数 n | 前向时间 |
+| --- | --- |
+| 1 | 24.3 ms |
+| 2 | 25.7 ms |
+| 3 | 25.9 ms |
+| 5 | 26.3 ms |
+| 8 | 26.6 ms |
+| 16 | 27.4 ms |
+
+n=1 → n=5 只多 2.0 ms。原因是权重带宽受限：**读一遍 27 GB 就能同时验证
+5 个位置**。所以投机解码的分子（token 数）可以涨，分母（时间）几乎不动。
+
+预估（接受率 α）：
+
+| 方案 | 每步 token | 每步时间 | 单发 tok/s |
+| --- | --- | --- | --- |
+| 现在（无投机） | 1.00 | 27.0 ms | 37 |
+| MTP W=4, α=0.7 | 2.77 | 26.3 + 4×~2 = 34.3 ms | 81 |
+| MTP W=4, α=0.8 | 3.36 | 34.3 ms | 98 |
+| 上表 + lm_head int8（省 1.27 GB） | 3.36 | 30.5 ms | **110** |
+| 再叠 CUDA graph（去掉 ~700 次 launch） | 3.36 | ~27 ms | **124** |
+
+注意 MTP 草稿每步也要过一次 lm_head（248320 词表），这在草稿阶段是
+主要成本（2.54 GB BF16 = 1.5 ms/草稿）。所以 **lm_head 转 int8 是 MTP 的
+前置优化**，收益比在主模型里更大（每步被读 1+W 次）。
+
+### 15.3 权重确实存在，而且结构完全够用
+
+`mtp.safetensors` 455.09 MiB，全部张量：
+
+| 张量 | dtype | shape |
+| --- | --- | --- |
+| `mtp.pre_fc_norm_embedding.weight` | BF16 | [5120] |
+| `mtp.pre_fc_norm_hidden.weight` | BF16 | [5120] |
+| `mtp.fc.weight` | BF16 | [5120, 10240] |
+| `mtp.layers.0.input_layernorm.weight` | BF16 | [5120] |
+| `mtp.layers.0.self_attn.q_proj.weight` | F8_E4M3 | [12288, 5120] |
+| `mtp.layers.0.self_attn.k_proj.weight` | F8_E4M3 | [1024, 5120] |
+| `mtp.layers.0.self_attn.v_proj.weight` | F8_E4M3 | [1024, 5120] |
+| `mtp.layers.0.self_attn.o_proj.weight` | F8_E4M3 | [5120, 6144] |
+| `mtp.layers.0.self_attn.q_norm.weight` | BF16 | [256] |
+| `mtp.layers.0.self_attn.k_norm.weight` | BF16 | [256] |
+| `mtp.layers.0.post_attention_layernorm.weight` | BF16 | [5120] |
+| `mtp.layers.0.mlp.{gate,up}_proj.weight` | F8_E4M3 | [17408, 5120] |
+| `mtp.layers.0.mlp.down_proj.weight` | F8_E4M3 | [5120, 17408] |
+| `mtp.norm.weight` | BF16 | [5120] |
+
+关键观察：**MTP 层的 q/k/v/o 和 mlp 维度与主模型的 full_attention 层完全
+一致**（12288 = 2×24×256 即 q_gate，1024 = 4×256 即 4 个 KV 头，
+6144 = 24×256，mlp 17408）。没有 `in_proj_qkvz`，所以它是 full 层不是
+linear 层。=> 可以直接复用现有的 full 层前向代码路径，只换权重指针和 KV 缓冲。
+
+### 15.4 权威前向语义（来自 transformers `modeling_layers.py:313` MtpLayer）
+
+```python
+enorm  = RMSNorm(hidden, eps)   # 作用于 embedding
+hnorm  = RMSNorm(hidden, eps)   # 作用于 previous hidden
+proj   = cat([enorm(inputs_embeds), hnorm(previous_hidden_state)], dim=-1)
+h      = eh_proj(proj)          # Linear(2E -> E), bias=False
+h      = mtp_block(h, ...)      # 一个 full-attention decoder 层
+h      = post_norm(h)           # = mtp.norm
+```
+
+三个容易搞错的点，已逐一核实：
+
+1. **拼接顺序是 embedding 在前**（除非 config 里有 `mtp_hidden_states_first`，
+   本 config 没有）。搞反了会得到 ~0% 接受率。
+2. **`mtp_block` 有自己的 KV cache**（`past_key_values` 是独立传入的），
+   不与主模型共享。1 层 × 4 KV 头 × 256 维 = 2048 值/token，FP32 = 8 KiB/token。
+3. **`previous_hidden_state` 取 final-norm 前还是后没写死**。transformers 的
+   assisted decoding 传 `hidden_states[-1]`（通常已过 final norm），但 MtpLayer
+   自己又做一次 `hnorm`。两种都可能对 → 在 C 实现里做成开关
+   `SGL_MTP_HIDDEN=pre|post`，**用接受率来决定**（正确实现 α≈0.6–0.85，
+   错了 α≈0–5%，判别极其锐利）。
+
+### 15.5 验证前向可以直接复用 prefill 路径
+
+验证阶段要对 W+1 个位置做因果注意力。现有 `sgl_cuda_forward_seg` 已经支持
+chunk 内因果掩码（prefill 本来就是这么干的），所以：
+
+> 验证 = `sgl_cuda_forward_seg(g, tokens[W+1], n=W+1, pos0, kv_base, logits)`
+
+不需要新的 attention kernel。被拒绝的草稿多写的那些 KV 位置不用回滚：
+下一步从接受长度往后写，自然覆盖。
+
+### 15.6 实施顺序（下一步）
+
+1. 加载 `mtp.safetensors` → int8（复用 `dev_copy_w8` / FP8 反量化路径）
+2. 写 `mtp_draft(g, h_last, tok, pos) -> draft_token`（M=1，单层，复用 PROJ/
+   k_rmsnorm/k_attention），带自己的 KV 缓冲
+3. 自验证：主模型贪心跑 T 个 token 作为参考流；再 teacher-forced 逐步跑 MTP，
+   统计草稿与参考流的一致率。**这是唯一判据，不靠目测。**
+4. 通过后接 `cuda_http.c` 的 worker 循环：草稿 W 个 → 一次 verify → 取最长
+   匹配前缀 → 推进
+5. lm_head 转 int8（MTP 每步读 1+W 次，收益翻倍）
+
+---
+
 ## 附：本文数字的来源
 
 **实测**（本机，方法见 §1.1/§1.2/§1.4）：显存带宽 1690 GB/s、PCIe 56/54/51 GB/s、RAM 125 GB/s、
