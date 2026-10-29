@@ -7,6 +7,13 @@
 #include "sgl/safetensors.h"
 #include "sgl/tensor.h"
 
+/* C++ 调用方（mlx_backend.cpp）需要 C 链接：没这个保护的话 llama.c 编出的是
+ * `sgl_llama_load_full`，C++ 侧找的是 mangled 名（`_Z18sgl_llama_load_fullPKci`），
+ * 链接期报 undefined symbol。safetensors.h 踩过同一个坑（见那里的注释）。*/
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifndef SGL_LLAMA_POOL_SLOTS
 #define SGL_LLAMA_POOL_SLOTS 4096
 #endif
@@ -103,8 +110,13 @@ typedef struct {
 } sgl_llama;
 
 sgl_llama *sgl_llama_load(const char *model_dir);
+/* 只读 config.json 拿几何，不加载任何权重（layers/wte/kc/vc 均为空）。
+ * 给 MLX 后端用：量化检查点（<base>.weight 是 U32 的 4-bit 打包）sgl_st_get 拿不到，
+ * 但几何与 m->st 句柄是 MLX 需要的（它自己从 m->st 读量化三件套）。
+ * 用完仍用 sgl_llama_free() 释放（已处理 layers==NULL 的情况）。
+ * config_only=0 与 sgl_llama_load 完全等价。*/
+sgl_llama *sgl_llama_load_full(const char *model_dir, int config_only);
 void sgl_llama_free(sgl_llama *m);
-
 /* 分页池（语义同 gpt2）*/
 int sgl_llama_pages_alloc(sgl_llama *m, int *idx, int n);
 void sgl_llama_pages_unref(sgl_llama *m, const int *idx, int n);
@@ -156,4 +168,8 @@ int sgl_llama_beam_search(sgl_llama *m, const int *prompt, int n_prompt,
                           int beam_width, int max_new, int eos_id,
                           sgl_llama_beam_result *out);
 
+#ifdef __cplusplus
+} /* extern "C" */
 #endif
+
+#endif /* SGL_LLAMA_H */

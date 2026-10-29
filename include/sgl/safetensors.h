@@ -46,6 +46,21 @@ int sgl_st_names(sgl_st_ctx *c, const char ***names);
 /* 已加载的分片数（单文件 = 1） */
 int sgl_st_shard_count(const sgl_st_ctx *c);
 
+/* 按名字取**原始字节**（不解码、不转换、零拷贝指向 mmap）。
+ *
+ * 用途：量化权重。sgl_st_get 只认浮点，而 MLX/mlx-community 的 4-bit 检查点把稠密
+ * 矩阵存在 `<base>.weight`(U32，每 uint32 打包 8 个 4bit 值) + `<base>.scales`(F16)
+ * + `<base>.biases`(F16) 三件套里；要保住 4-bit 就必须拿到原始 U32，不能让上层
+ * 先解成 fp32。scales/biases 是 F16，同样用这个拿（sgl_st_get 会转 fp32，多一次拷贝
+ * 且丢掉 fp16 精度）。
+ *
+ * 参数：dtype 指向内部字符串（"F16"/"U32"/...，不归调用方释放）；dims 至少 4 元素；
+ * bytes/nbytes 是 mmap 内的视图，**生命周期跟 ctx 走**。
+ * 返回 1 = 找到；0 = 没有（或这个 ctx 是 GGUF 源 —— GGUF 请走 sgl_st_get）。
+ * 注：向 sgl_st_get 一样会试 prefix 回退（VLM 包装检查点）。 */
+int sgl_st_get_raw(sgl_st_ctx *c, const char *name, const char **dtype, int *ndim,
+                   int64_t *dims, const void **bytes, size_t *nbytes);
+
 #ifdef __cplusplus
 }
 #endif

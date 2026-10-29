@@ -805,38 +805,41 @@ void sgl_cuda_ds_free(sgl_cuda_ds *g) {
         if (g->e_up && g->e_up[l]) F(g->e_up[l][e]);
         if (g->e_dn && g->e_dn[l]) F(g->e_dn[l][e]);
       }
-      sgl_xfree(g->e_gate[l]);
+      free(g->e_gate[l]); /* calloc → free（sgl_xfree 是 _aligned_free，混用会堆损坏）*/
     }
-    if (g->e_up && g->e_up[l]) sgl_xfree(g->e_up[l]);
-    if (g->e_dn && g->e_dn[l]) sgl_xfree(g->e_dn[l]);
+    if (g->e_up && g->e_up[l]) free(g->e_up[l]);
+    if (g->e_dn && g->e_dn[l]) free(g->e_dn[l]);
   }
-  sgl_xfree(g->inp_norm);
-  sgl_xfree(g->post_norm);
-  sgl_xfree(g->q_a_w);
-  sgl_xfree(g->q_a_norm);
-  sgl_xfree(g->q_b_w);
-  sgl_xfree(g->q_a_b);
-  sgl_xfree(g->kv_a_w);
-  sgl_xfree(g->kv_a_norm);
-  sgl_xfree(g->kv_a_b);
-  sgl_xfree(g->w_ukt);
-  sgl_xfree(g->w_uv);
-  sgl_xfree(g->o_w);
-  sgl_xfree(g->o_b);
-  sgl_xfree(g->is_moe);
-  sgl_xfree(g->g_w);
-  sgl_xfree(g->u_w);
-  sgl_xfree(g->d_w);
-  sgl_xfree(g->router_w);
-  sgl_xfree(g->ec_bias);
-  sgl_xfree(g->exp_gu);
-  sgl_xfree(g->exp_dn);
-  sgl_xfree(g->e_gate);
-  sgl_xfree(g->e_up);
-  sgl_xfree(g->e_dn);
-  sgl_xfree(g->sh_g);
-  sgl_xfree(g->sh_u);
-  sgl_xfree(g->sh_d);
+  /* 下面这些指针数组都是 from() 里 calloc 出来的，必须用 free()；
+   * 2026-10-29 修：原先把它们交给 sgl_xfree（Windows 上是 _aligned_free），
+   * 进程退出时必报 0xC0000374 堆损坏（cuda_deepseek_test 就是这样挂的）。*/
+  free(g->inp_norm);
+  free(g->post_norm);
+  free(g->q_a_w);
+  free(g->q_a_norm);
+  free(g->q_b_w);
+  free(g->q_a_b);
+  free(g->kv_a_w);
+  free(g->kv_a_norm);
+  free(g->kv_a_b);
+  free(g->w_ukt);
+  free(g->w_uv);
+  free(g->o_w);
+  free(g->o_b);
+  free(g->is_moe);
+  free(g->g_w);
+  free(g->u_w);
+  free(g->d_w);
+  free(g->router_w);
+  free(g->ec_bias);
+  free(g->exp_gu);
+  free(g->exp_dn);
+  free(g->e_gate);
+  free(g->e_up);
+  free(g->e_dn);
+  free(g->sh_g);
+  free(g->sh_u);
+  free(g->sh_d);
 #undef F
   if (g->blas) cublasDestroy(g->blas);
   if (g->stream) cudaStreamDestroy(g->stream);

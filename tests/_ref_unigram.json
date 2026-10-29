@@ -1,0 +1,126 @@
+{
+ "vocab_size": 32100,
+ "cases": [
+  {
+   "text": "Hello world",
+   "ids": [
+    8774,
+    296
+   ],
+   "decoded": " Hello world"
+  },
+  {
+   "text": "The capital of France is Paris.",
+   "ids": [
+    37,
+    1784,
+    13,
+    1410,
+    19,
+    1919,
+    5
+   ],
+   "decoded": " The capital of France is Paris."
+  },
+  {
+   "text": "translate English to German: How are you?",
+   "ids": [
+    13959,
+    1566,
+    12,
+    2968,
+    10,
+    571,
+    33,
+    25,
+    58
+   ],
+   "decoded": " translate English to German: How are you?"
+  },
+  {
+   "text": "  leading and   multiple   spaces  ",
+   "ids": [
+    3,
+    3,
+    1374,
+    11,
+    3,
+    3,
+    1317,
+    3,
+    3,
+    4856,
+    3,
+    3
+   ],
+   "decoded": "   leading and   multiple   spaces  "
+  },
+  {
+   "text": "Mixed 中文 and English 混排",
+   "ids": [
+    28024,
+    3,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    11,
+    1566,
+    3,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2
+   ],
+   "decoded": " Mixed <unk><unk><unk><unk><unk><unk> and English <unk><unk><unk><unk><unk><unk>"
+  },
+  {
+   "text": "emoji 😀👍 test",
+   "ids": [
+    3,
+    15,
+    51,
+    21892,
+    3,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    794
+   ],
+   "decoded": " emoji <unk><unk><unk><unk><unk><unk><unk><unk> test"
+  },
+  {
+   "text": "def f(x):\n    return x + 1\n",
+   "ids": [
+    20,
+    89,
+    3,
+    89,
+    599,
+    226,
+    61,
+    10,
+    2,
+    3,
+    3,
+    3,
+    1205,
+    3,
+    226,
+    1768,
+    209,
+    2
+   ],
+   "decoded": " def f(x):<unk>    return x + 1<unk>"
+  }
+ ]
+}

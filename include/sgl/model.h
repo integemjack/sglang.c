@@ -14,6 +14,9 @@ void sgl_model_free(sgl_model *m);
 int sgl_model_vocab(const sgl_model *m);
 int sgl_model_ctx(const sgl_model *m);
 
+/* G21：文本隐藏维（视觉 emb 行宽也是它）*/
+int sgl_model_hidden(const sgl_model *m);
+
 /* 分页 KV 池（两后端语义一致）*/
 int sgl_model_pages_alloc(sgl_model *m, int *idx, int n);
 void sgl_model_pages_unref(sgl_model *m, const int *idx, int n);

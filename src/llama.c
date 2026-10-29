@@ -147,7 +147,7 @@ static int lora_merge_all(sgl_llama *m, const char *dir) {
   return merged > 0 ? 0 : -1;
 }
 
-sgl_llama *sgl_llama_load(const char *dir) {
+sgl_llama *sgl_llama_load_full(const char *dir, int config_only) {
   /* 配置来源：<dir>/config.json；没有的话从 <dir>/*.gguf 的元数据合成一份
    * （GGUF 单文件下载通常不带 config.json）。*/
   size_t sz = 0;
@@ -395,6 +395,14 @@ sgl_llama *sgl_llama_load(const char *dir) {
     return NULL;
   }
   if (is_vlm_wrap) sgl_st_set_prefix(m->st, "model.language_model.");
+
+  /* config-only：只要几何（MLX 后端用）。量化检查点（mlx-community 的 4-bit）把稠密
+   * 矩阵存在 U32 的 <base>.weight + F16 的 .scales/.biases 里，sgl_st_get 拿不到；
+   * 本函数的权重加载段会因此失败。MLX 自己从 m->st 读量化三件套，所以这里停在这。*/
+  if (config_only) {
+    SGL_INFO("llama: config-only 模式（跳过权重；MLX 后端自己读）");
+    return m;
+  }
 
   /* t11 流式 int8：SGL_W8=1 时大矩阵取到 f32 后立刻量化并 drop，
    * 宿存峰值从 ~4.8B 参数×4B 降到 int8 + 单张量瞬态（27B 模型 ~130GB → ~30GB）。
@@ -799,7 +807,11 @@ sgl_llama *sgl_llama_load(const char *dir) {
 
 void sgl_llama_free(sgl_llama *m) {
   if (!m) return;
-  for (int l = 0; l < m->n_layer; l++) {
+  /* m->layers 要到权重开始加载才分配（见 sgl_llama_load 里那行 calloc）。
+   * 若在此之前就失败（例：4bit 检查点的 model.embed_tokens.weight 是 U32，
+   * sgl_st_get 拿不到 → wte 为 NULL → 提前 return），n_layer 已经是真值而
+   * layers 还是 NULL，这里不判空就会 SIGSEGV（实测 exit=139）。*/
+  for (int l = 0; m->layers && l < m->n_layer; l++) {
     sgl_llama_layer *L = &m->layers[l];
     sgl_xfree(L->q8); sgl_xfree(L->k8); sgl_xfree(L->v8); sgl_xfree(L->o8);
     sgl_xfree(L->g8); sgl_xfree(L->u8); sgl_xfree(L->d8);
@@ -830,6 +842,8 @@ void sgl_llama_free(sgl_llama *m) {
   sgl_st_close(m->st);
   sgl_xfree(m);
 }
+
+sgl_llama *sgl_llama_load(const char *dir) { return sgl_llama_load_full(dir, 0); }
 
 /* ---- paged KV pool: LIFO free stack + refcounts ---- */
 int sgl_llama_pages_alloc(sgl_llama *m, int *idx, int n) {

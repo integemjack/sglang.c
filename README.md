@@ -174,22 +174,27 @@ needed cross-compilation from an arm64 host plus Rosetta to run the tests, and I
 | **GGUF built-in tokenizer** | `tokenizer/` | ✅ P0: `tokenizer.ggml.tokens/merges/token_type` → vocab/merges/special tokens, so a directory containing **only a `.gguf`** works end to end (`sglc --model <dir>`; verified on Q4_K_M and Q2_K: "The capital of France is Paris.") |
 | **AWQ weights** (gemm / gemv layouts) | `srt/layers/quantization/awq.py` | ✅ P0: `qweight`/`qzeros`/`scales` unpacked on load, including the 8-element permutation table (`AWQ_ORDER` / `AWQ_REVERSE_ORDER`); `zero_point` on/off, `group_size=-1`, 4-bit. Against **three tensors of the real Qwen2.5-0.5B-Instruct-AWQ checkpoint**, our dequant is bit-identical (rel_rms = 0) to AutoAWQ's own `dequantize_gemm` |
 | **GPTQ weights** (incl. desc_act / g_idx) | `srt/layers/quantization/gptq.py` | ✅ P0: `qweight`/`qzeros`/`scales`/`g_idx`, sym and asym, 4- and 8-bit; act-order with a non-contiguous `g_idx` follows `scales[g_idx]*(q-zeros[g_idx])` row-wise. Rel_rms = 0 against real Qwen2.5-0.5B-Instruct-GPTQ-Int4 slices; end-to-end logits on three local fixtures match the numpy reference to 5e-8 (`test_qweight`, `test_family_qw_*`) |
+| **compressed-tensors W4A16 / W8A16** (pack-quantized) | `srt/layers/quantization/compressed_tensors/` | ✅ P1: `weight_packed` / `weight_scale` / `weight_shape`, bit order per the official `unpack_from_int32` (low nibble = even index; offset 8 for 4-bit / 128 for 8-bit). End-to-end on a fixture whose reference is an independent numpy implementation of that same spec (`test_family_qw_ct4`) |
+| **MXFP4** (gpt-oss) | `srt/layers/quantization/mxfp4.py` | ✅ P1: e2m1 codebook + one e8m0 scale per 32 elements, following transformers' `_convert_moe_packed_tensors` (`test_family_qw_mxfp4`) |
+| **GPTQ `format: gptq_v2`** | `srt/layers/quantization/gptq.py` | ✅ qzeros are stored as `v1 − 1`; a fixture derived from the v1 one (`tests/make_gptq_v2.py`) reproduces the v1 reference logits bit-for-bit |
+| **marlin ABI (4-bit / 8-bit)** | `srt/layers/quantization/utils/marlin_utils.py` | ✅ P1: 16×64 tiles in the kernel's word/nibble order — for 4-bit, Marlin's own `Layer.pack` and vLLM's `awq_marlin_repack.cu` agree byte-for-byte; for 8-bit, vLLM's `awq_marlin_repack.cu` and `gptq_marlin_repack.cu` (different inputs and shared-memory layout) agree byte-for-byte, both matching our closed-form index (`tests/marlin_layout.py`), plus the 64-column scale permutation and `awq_to_marlin_zero_points` (8-element interleave for 4-bit, `[0,2,1,3]` for 8-bit); `test_family_qw_marlin` 2.9e-05, `test_family_qw_marlin8` 7.2e-05, unit cases exact. A config that merely *claims* marlin but stores natural tensors falls back with an INFO |
 | **YaRN RoPE (+ mscale)** | `modeling_rope_utils._compute_yarn_parameters` | ✅ P1: frequency table matches HF to 1.5e-07 over 6 configs (`test_yarn`). llama path multiplies cos/sin by HF's `attention_factor` and matches `LlamaForCausalLM` logits to 1.5e-07 (`test_llama_yarn`); DeepSeek follows its own convention (`softmax_scale *= mscale²`, mscale from `mscale_all_dim`) and matches HF to 3.0e-07. Reads both `rope_scaling` (old) and `rope_parameters` (transformers 5.x) |
 
-**Not covered:** tensor parallelism; GPU data parallel (the CPU build's `--dp` replicas are real processes-in-one
-scheduler, each with its own KV pool, but they share one host); the full LLaVA **7B language model** end to end
-(CLIP-L/14-336 and `mm_projector` were verified against real weights piecewise; the 7B LM was not downloaded
-due to disk/VRAM); GPU-side sliding window; the CUDA path for Qwen3-Next and for the new P0/P1 features
-(they are wired into the CPU scheduler); HiCache-style host/disk KV tiering (the CPU build's KV pool *is*
-host memory, so offload has nothing to gain there); W4A16 / GPTQ / AWQ; DeepSeek's grouped-MoE routing is
-validated against the official formula rather than HF (transformers 5.20's `DeepseekV2` router does not
-implement `scoring_func`/`norm_topk_prob`/`e_score_correction_bias`, so it agrees only to ~3e-04 there);
-legacy `.bin` checkpoints (GGUF is supported now, see the matrix above); W4A16 / compressed-tensors /
-MXFP4-NVFP4 checkpoints; AWQ `version: marlin` and GPTQ `format: gptq_v2` are rejected with a clear
-message rather than silently mis-decoded;
+**Not covered:** tensor / pipeline / expert parallelism; GPU data parallel (the CPU build's `--dp` replicas are
+real processes-in-one-scheduler, each with its own KV pool, but they share one host); the full LLaVA **7B
+language model** end to end (CLIP-L/14-336 and `mm_projector` were verified against real weights piecewise;
+the 7B LM was not downloaded due to disk/VRAM); HiCache-style host/disk KV tiering (the CPU build's KV pool
+*is* host memory, so offload has nothing to gain there); LoRA and grammar-constrained decoding on the CUDA
+engine (they live in the CPU scheduler; Qwen3-Next, GDN hybrid, llama-family MoE and DeepSeek MLA+MoE *are*
+wired into the CUDA path — `cuda_moe_test`, `test_family_qw_*`, and a CPU↔GPU byte-identical conformance run);
+**W8A8, FP8-blockwise and NVFP4 on-disk formats**, and marlin's `is_a_8bit` variant (that one is **W4A8** — 8-bit *activations*, which uses a 32×32 tile; the 4-bit and 8-bit *weight* marlin ABIs, AWQ, GPTQ v1+v2, compressed-tensors W4A16, MXFP4 and GGUF are all supported — see the quantization rows above);
+DeepSeek's grouped-MoE routing is validated against the official formula rather than HF (transformers 5.20's
+`DeepseekV2` router does not implement `scoring_func`/`norm_topk_prob`/`e_score_correction_bias`, so it agrees
+only to ~3e-04 there); legacy `.bin` checkpoints;
 IQ2_XXS/IQ2_XS/IQ3_XXS/IQ3_S/IQ4_XS (codebook-based IQ types beyond IQ4_NL);
 `/update_weights_from_disk` on the CUDA engine (returns 501 — weights live in
-VRAM, restart instead); embeddings/rerank only exist on the CPU engine.
+VRAM, restart instead); reward heads and the other 33 endpoints that return an explicit 501 with a reason
+(see `docs/GAP_vs_upstream.md` §3).
 
 ## Build from source
 

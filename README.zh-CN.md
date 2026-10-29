@@ -95,12 +95,23 @@ ctest --test-dir sglang-c/build          # 26 套测试（部分需 models/ 下�
 sglang-c/build/bin/sglc --model models/gpt2 --prompt "The meaning of life is" --max-new 32
 sglang-c/build/bin/sglc --model models/tinyllama --w8 --kv8 --max-new 64   # 量化提速
 
-# HTTP 服务（OpenAI 兼容）；--device auto 默认 cuda → mlx（无实现）→ cpu
+# HTTP 服务（OpenAI 兼容）；--device auto 默认 cuda → mlx → cpu
 sglang-c/build/bin/sglc --model models/qwen05 --serve --port 30000 --w8
 sglang-c/build-cuda/bin/Release/sglc.exe --model models/qwen05 --serve --port 30000   # 有显卡走 GPU
 sglang-c/build-cuda/bin/Release/sglc.exe --model models/qwen05 --serve --device cpu   # 强制 CPU 引擎
 curl localhost:30000/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+# Apple Silicon（Metal / MLX）：-DSGL_MLX=ON 产出 mlx_test / mlx_q4_test / mlx_http
+cmake -S sglang-c -B sglang-c/build-mlx -G Ninja -DSGL_MLX=ON \
+      -DSGL_MLX_ROOT=$(python3 -m mlx --cmake-dir)
+cmake --build sglang-c/build-mlx --target mlx_test mlx_q4_test mlx_http -j 8
+sglang-c/build-mlx/bin/mlx_test models/qwen05 16              # 与 CPU 金标准对拍（13 项）
+sglang-c/build-mlx/bin/mlx_q4_test models/qwen05-4bit 9707    # 4-bit logits 对拍 mlx_lm
+sglang-c/build-mlx/bin/sglc --model models/qwen05-4bit --serve --device mlx --port 30001
 ```
+
+量化检查点直接用 `mlx-community` 的 4-bit（`.weight` 是 U32 打包 + `.scales`/`.biases`），
+不做成 fp16：Qwen2.5-0.5B 磁盘 276 MB（fp16 是 951 MB），decode 75 tok/s。
 
 模型目录格式（HF 标准）：`config.json` / `tokenizer.json` / `model.safetensors`（F32/F16/BF16）。
 
@@ -125,6 +136,15 @@ curl localhost:30000/v1/chat/completions -d '{"messages":[{"role":"user","conten
 | GEMM 峰值 | matmul_nt 8.4 GFLOPs（4x 于标量） |
 
 Qwen2.5-0.5B chat 实测 4.2 tok/s（W8+KV8+SIMD；其 151k 大词表的 lm_head 是主要成本）。
+
+**MLX 后端（Apple M1 / 8 核 / 16 GB，Metal 4；MLX 0.29.3）**：Qwen2.5-0.5B fp16
+单流 **43.2 tok/s**（23.2 ms/步）、批量 4 序列 **119.6 tok/s**；
+**同机同模型官方 mlx_lm 为 41.9 tok/s**（23.89 ms/步，`mlx_lm.generate` 128 token 实测）。
+4-bit 量化检查点：单流 **75.0 tok/s**、并发 4 条 **111 tok/s**（磁盘 276 MB vs fp16 的 951 MB），
+官方 mlx_lm 同检查点 80.7 tok/s。对拍：fixture 13/13，真模型 fp16 12/12、
+fp32 13/13（跨路径概率误差 8.9e-7），4-bit 的 logits 与 `mlx_lm` top10 **逐位一致**。
+定位过程与实测数据见 [docs/NOTES_mlx_t2.md](docs/NOTES_mlx_t2.md) 与
+[docs/NOTES_mlx_q4.md](docs/NOTES_mlx_q4.md)。
 
 **CUDA 后端（RTX 2060，sm_75；M23 自适应 GEMM：M=1 手写 kernel / M>1 cuBLAS）**：
 Qwen2.5-0.5B：单流 **45.7 tok/s**（10.9x CPU）；**批处理（4 序列）105.2 tok/s**

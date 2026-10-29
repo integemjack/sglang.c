@@ -99,9 +99,14 @@ struct sgl_tokenizer {
   int n_added;
   int eos_id;
   /* Llama/SentencePiece 路径（style=1）*/
-  int style;            /* 0 = GPT-2 byte-level，1 = Llama metaspace */
+  int style;            /* 0 = GPT-2 byte-level，1 = Llama metaspace，2 = Unigram(SP) */
   int bos_id;
   int byte_tok_ids[256]; /* "<0xXX>" token id；-1 不存在 */
+  /* Unigram（SentencePiece）路径（style=2）：tokenizer.json 的 model.vocab 是
+   * [[piece, logprob], ...] 数组，没有 merges；编码走 Viterbi 最大得分切分。*/
+  float *scores;       /* 按 id 的 log prob */
+  int max_piece_len;   /* 词表最长 piece 的字节数（Viterbi 搜索上界）*/
+  int unk_id;          /* "<unk>" 的 id（byte fallback 也找不到时的兜底）*/
 };
 
 /* GPT-2 的 bytes_to_unicode() */
@@ -174,8 +179,8 @@ sgl_tokenizer *sgl_tokenizer_load(const char *path) {
 
   const sgl_json *model = sgl_json_get(root, "model");
   const sgl_json *vocab = model ? sgl_json_get(model, "vocab") : NULL;
-  if (!vocab || vocab->type != SGL_JSON_OBJECT) {
-    SGL_ERROR("tokenizer.json: model.vocab 缺失（本项目先支持 GPT-2 系 BPE）");
+  if (!vocab || (vocab->type != SGL_JSON_OBJECT && vocab->type != SGL_JSON_ARRAY)) {
+    SGL_ERROR("tokenizer.json: model.vocab 缺失（需 object(BPE) 或 array(Unigram)）");
     sgl_json_free(root);
     return NULL;
   }
@@ -187,11 +192,35 @@ sgl_tokenizer *sgl_tokenizer_load(const char *path) {
   sm_init(&t->vocab, vocab->count);
   t->vocab_size = vocab->count;
   t->id2tok = (char **)sgl_xcalloc(t->vocab_size, sizeof(char *));
-  for (int i = 0; i < vocab->count; i++) {
-    const char *tok = vocab->keys[i];
-    int id = (int)vocab->items[i]->num;
-    sm_put(&t->vocab, tok, id);
-    if (id >= 0 && id < t->vocab_size && !t->id2tok[id]) t->id2tok[id] = xstrdup(tok);
+  if (vocab->type == SGL_JSON_ARRAY) {
+    /* Unigram（SentencePiece / T5 系）：“[[piece, score], ...]”，id 就是下标 */
+    t->style = 2;
+    t->scores = (float *)sgl_xcalloc(t->vocab_size, sizeof(float));
+    int maxlen = 1;
+    for (int i = 0; i < vocab->count; i++) {
+      const sgl_json *e = vocab->items[i];
+      if (!e || e->type != SGL_JSON_ARRAY || e->count < 1) continue;
+      if (e->items[0]->type != SGL_JSON_STRING) continue;
+      const char *piece = e->items[0]->str;
+      sm_put(&t->vocab, piece, i);
+      t->id2tok[i] = xstrdup(piece);
+      t->scores[i] = (e->count > 1 && e->items[1]->type == SGL_JSON_NUMBER)
+                         ? (float)e->items[1]->num
+                         : 0.0f;
+      int pl = (int)strlen(piece);
+      if (pl > maxlen) maxlen = pl;
+    }
+    if (maxlen > 64) maxlen = 64;
+    t->max_piece_len = maxlen;
+    t->unk_id = sm_get(&t->vocab, "<unk>");
+    if (t->unk_id < 0) t->unk_id = 0;
+  } else {
+    for (int i = 0; i < vocab->count; i++) {
+      const char *tok = vocab->keys[i];
+      int id = (int)vocab->items[i]->num;
+      sm_put(&t->vocab, tok, id);
+      if (id >= 0 && id < t->vocab_size && !t->id2tok[id]) t->id2tok[id] = xstrdup(tok);
+    }
   }
 
   const sgl_json *merges = sgl_json_get(model, "merges");
@@ -231,11 +260,14 @@ sgl_tokenizer *sgl_tokenizer_load(const char *path) {
 
   int n_merges = merges ? merges->count : 0; /* 先存下：root 马上释放 */
 
-  /* 风格判定：Metaspace 预分词（Llama 系）或存在 <s>/<0x00> 特殊 token */
+  /* 风格判定：Metaspace 预分词（Llama 系）或存在 <s>/<0x00> 特殊 token；
+   * Unigram（style=2）已在上面的 vocab 分支里定死，不要覆盖。*/
   const sgl_json *pre = sgl_json_get(root, "pre_tokenizer");
   const char *pretype = pre ? sgl_json_get_str(pre, "type", "") : "";
-  if (strcmp(pretype, "Metaspace") == 0) t->style = 1;
-  if (sm_get(&t->vocab, "<s>") >= 0 && sm_get(&t->vocab, "<0x41>") >= 0) t->style = 1;
+  if (t->style != 2) {
+    if (strcmp(pretype, "Metaspace") == 0) t->style = 1;
+    if (sm_get(&t->vocab, "<s>") >= 0 && sm_get(&t->vocab, "<0x41>") >= 0) t->style = 1;
+  }
   t->bos_id = sm_get(&t->vocab, "<s>");
   t->eos_id = sm_get(&t->vocab, "</s>");
   if (t->eos_id < 0) t->eos_id = sm_get(&t->vocab, "<|endoftext|>");
@@ -247,7 +279,7 @@ sgl_tokenizer *sgl_tokenizer_load(const char *path) {
 
   sgl_json_free(root);
   SGL_INFO("tokenizer loaded: style=%s vocab=%d merges=%d added=%d bos=%d eos=%d",
-           t->style ? "llama/SP" : "gpt2/ByteLevel",
+           t->style == 2 ? "unigram/SP" : (t->style ? "llama/SP" : "gpt2/ByteLevel"),
            t->vocab_size, n_merges, t->n_added, t->bos_id, t->eos_id);
   return t;
 }
@@ -622,6 +654,120 @@ static int *sp_encode(const sgl_tokenizer *t, const char *text, size_t len,
   return ids;
 }
 
+/* Unigram（SentencePiece）Viterbi 切分：段内空格→"▁"，段首补一个 "▁"（
+ * 与 sp_encode 一致）。找不到 piece 的单字节回退到 "<0xXX>"，再不行用 id 0。*/
+static int uni_encode_seg(const sgl_tokenizer *t, const char *text, size_t len, int *out,
+                          int cap) {
+  if (len == 0 || cap <= 0) return 0;
+  size_t cap_buf = len * 3 + 8;
+  char *buf = (char *)sgl_xmalloc(cap_buf);
+  size_t n = 0;
+  buf[n++] = (char)0xE2;
+  buf[n++] = (char)0x96;
+  buf[n++] = (char)0x81; /* 段首 "▁" */
+  for (size_t i = 0; i < len; i++) {
+    if (text[i] == ' ') {
+      buf[n++] = (char)0xE2;
+      buf[n++] = (char)0x96;
+      buf[n++] = (char)0x81;
+    } else {
+      buf[n++] = text[i];
+    }
+  }
+  const float NEG = -1e30f;
+  float *dp = (float *)sgl_xmalloc((n + 1) * sizeof(float));
+  int *prev = (int *)sgl_xmalloc((n + 1) * sizeof(int));
+  int *pid = (int *)sgl_xmalloc((n + 1) * sizeof(int));
+  for (size_t i = 0; i <= n; i++) {
+    dp[i] = NEG;
+    prev[i] = -1;
+    pid[i] = 0;
+  }
+  dp[0] = 0;
+  int maxl = t->max_piece_len > 0 ? t->max_piece_len : 16;
+  for (size_t i = 0; i < n; i++) {
+    if (dp[i] == NEG) continue;
+    int any = 0;
+    char tmp[128];
+    for (int l = 1; l <= maxl && i + (size_t)l <= n; l++) {
+      size_t j = i + (size_t)l;
+      if (j < n && (((unsigned char)buf[j] & 0xC0) == 0x80)) continue; /* 必须落在字符边界 */
+      if (l >= (int)sizeof(tmp)) break;
+      memcpy(tmp, buf + i, (size_t)l);
+      tmp[l] = 0;
+      int id = sm_get(&t->vocab, tmp);
+      if (id < 0) continue;
+      any = 1;
+      float sc = dp[i] + (t->scores ? t->scores[id] : 0.0f);
+      if (sc > dp[j]) {
+        dp[j] = sc;
+        prev[j] = (int)i;
+        pid[j] = id;
+      }
+    }
+    if (!any) { /* 单字节回退：<0xXX> → <unk> */
+      unsigned char b = (unsigned char)buf[i];
+      int id = t->byte_tok_ids[b];
+      if (id < 0) id = t->unk_id;
+      float sc = dp[i] - 20.0f;
+      if (sc > dp[i + 1]) {
+        dp[i + 1] = sc;
+        prev[i + 1] = (int)i;
+        pid[i + 1] = id;
+      }
+    }
+  }
+  int cnt = 0;
+  for (int p = (int)n; p > 0; p = prev[p]) cnt++;
+  int *tmpids = (int *)sgl_xmalloc(sizeof(int) * (size_t)(cnt > 0 ? cnt : 1));
+  int k = 0;
+  for (int p = (int)n; p > 0 && k < cnt; p = prev[p]) tmpids[k++] = pid[p];
+  int nout = 0;
+  for (int i = k - 1; i >= 0 && nout < cap; i--) out[nout++] = tmpids[i];
+  sgl_xfree(tmpids);
+  sgl_xfree(dp);
+  sgl_xfree(prev);
+  sgl_xfree(pid);
+  sgl_xfree(buf);
+  return nout;
+}
+
+/* Unigram 主编码：先按 added token 字面量切段，段内走 Viterbi。*/
+static int *uni_encode(const sgl_tokenizer *t, const char *text, size_t len, int *out_n) {
+  int max_tokens = (int)len * 4 + 16;
+  int *ids = (int *)sgl_xmalloc(sizeof(int) * (size_t)max_tokens);
+  int nids = 0;
+  if (t->bos_id >= 0 && max_tokens > 0) ids[nids++] = t->bos_id;
+  size_t i = 0;
+  while (i < len) {
+    int matched = 0;
+    for (int a = 0; a < t->n_added; a++) {
+      size_t l = strlen(t->added_tokens[a]);
+      if (l && i + l <= len && memcmp(text + i, t->added_tokens[a], l) == 0) {
+        if (nids < max_tokens) ids[nids++] = t->added_ids[a];
+        i += l;
+        matched = 1;
+        break;
+      }
+    }
+    if (matched) continue;
+    size_t seg_end = len;
+    for (size_t k = i; k < len && seg_end == len; k++) {
+      for (int a = 0; a < t->n_added; a++) {
+        size_t l = strlen(t->added_tokens[a]);
+        if (l && k + l <= len && memcmp(text + k, t->added_tokens[a], l) == 0) {
+          seg_end = k;
+          break;
+        }
+      }
+    }
+    nids += uni_encode_seg(t, text + i, seg_end - i, ids + nids, max_tokens - nids);
+    i = seg_end;
+  }
+  *out_n = nids;
+  return ids;
+}
+
 /* G12: 纯 BPE 编码（不处理 added token 字面量）。原 sgl_tokenizer_encode 的主体，
  * 提出来是为了先按 added token 切文本再逐段编码 —— HF 是在 pre-tokenize 之前就
  * 切出特殊 token 的，所以在段中间出现的 "<image>" 也必须是一个 token。
@@ -658,6 +804,7 @@ static void gpt2_encode_plain(const sgl_tokenizer *t, const char *text, size_t l
 
 int *sgl_tokenizer_encode(const sgl_tokenizer *t, const char *text, size_t len,
                           int *out_n) {
+  if (t->style == 2) return uni_encode(t, text, len, out_n);
   if (t->style == 1) return sp_encode(t, text, len, out_n);
   int max_tokens = (int)len * 2 + 16;
   int *ids = (int *)sgl_xmalloc(sizeof(int) * (size_t)max_tokens);
@@ -696,7 +843,7 @@ int sgl_tokenizer_piece_bytes(const sgl_tokenizer *t, int id, char *buf, int cap
   const char *tok = t->id2tok ? t->id2tok[id] : NULL;
   if (!tok) return 0;
   int len = 0;
-  if (t->style == 1) {
+  if (t->style >= 1) {
     if (tok[0] == '<' && tok[1] == '0' && tok[2] == 'x' && strlen(tok) == 6) {
       buf[len++] = (char)strtol(tok + 3, NULL, 16);
       buf[len] = 0;
@@ -728,7 +875,7 @@ int sgl_tokenizer_piece_bytes(const sgl_tokenizer *t, int id, char *buf, int cap
 }
 
 char *sgl_tokenizer_decode(const sgl_tokenizer *t, const int *ids, int n) {
-  if (t->style == 1) {
+  if (t->style >= 1) {
     /* Llama：token 字符串原样输出，"▁"→空格，"<0xXX>"→字节 */
     size_t cap = 4096, len = 0;
     char *out = (char *)sgl_xmalloc(cap);

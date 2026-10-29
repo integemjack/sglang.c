@@ -39,8 +39,9 @@ typedef enum {
   SGL_Q_NONE = 0,
   SGL_Q_AWQ = 1,
   SGL_Q_GPTQ = 2,
+  SGL_Q_CT = 3, /* compressed-tensors 的 pack-quantized（W4A16 / W8A16）*/
+  SGL_Q_MXFP4 = 4, /* gpt-oss 系列的 mxfp4（e2m1 + e8m0 块缩放）*/
 } sgl_qmethod;
-
 typedef struct {
   int method;      /* sgl_qmethod */
   int bits;        /* 4 或 8（AWQ 官方只支持 4）*/
@@ -48,7 +49,21 @@ typedef struct {
   int zero_point;  /* AWQ: 0/1（config 的 zero_point）；GPTQ: 恒为 1 */
   int desc_act;    /* GPTQ: 是否有 g_idx 的非连续分组 */
   int transposed;  /* AWQ: qweight 是否按 [N/pack, K] 存放（gemv 变体）*/
+  int v2;          /* GPTQ: format=gptq_v2（qzeros 存的是 v1 值 - 1，解时 +1）*/
+  int packed_dim;  /* CT: 沿哪一维打包（0 或 1；Linear 权重是 1 = 沿 K）*/
+  int offset;      /* CT: 无符号码的零点偏移（4bit 是 8，8bit 是 128）*/
+  int layout;      /* 0 = 各格式的自然落盘布局；1 = marlin 布局（见下）*/
 } sgl_qcfg;
+
+/* layout=1：marlin（vLLM 的 awq_marlin / gptq_marlin 在 process_weights_after_loading
+ * 里做出来的布局，kernel 直接吃的那份内存形态）。跟自然落盘的区别：
+ *   qweight int32 [K/16, N*16/pack]   16x64 的 tile，tile 内按 kernel 的 word/nibble 序
+ *   scales  f16   [K/G, N]            列做过 64 列置换（marlin_permute_scales）
+ *   qzeros  int32 [K/G, N/pack]       可选；行内 64 列置换 + 8 元 interleave
+ * 注意：这不是 HF 生态的落盘格式（上游没有哪个工具把权重存成 marlin），见
+ * docs/GAP_vs_upstream.md 的 A5 与 tests/marlin_layout.py 的说明。*/
+#define SGL_QLAYOUT_NATURAL 0
+#define SGL_QLAYOUT_MARLIN 1
 
 /* 每 int32 装几个值 */
 int sgl_q_pack(int bits);
@@ -61,6 +76,30 @@ int sgl_qweight_dequant(const sgl_qcfg *cfg, const int32_t *qweight, int64_t qw_
                         int64_t qw_cols, const int32_t *qzeros, int64_t qz_rows,
                         int64_t qz_cols, const float *scales, int64_t sc_rows, int64_t sc_cols,
                         const int32_t *g_idx, int64_t g_n, int64_t N, int64_t K, float *out);
+
+/* compressed-tensors pack-quantized：直接吃 weight_packed[rows, cols] 的 int32。
+ * 官方解包（vllm-project/compressed-tensors
+ *   src/compressed_tensors/compressors/pack_quantized/helpers.py::unpack_from_int32）
+ * 对 4bit 的做法：把 int32 看成 4 个字节，每字节低半字节是偶数元素、高半字节是奇数元素，
+ * 拼成一维后取前 cols 个，再整体减 1<<(bits-1) 得到有符号值。
+ * scales 是 [N, K/G]（沿 K 分组，对称量化，无 zero point）。*/
+int sgl_qweight_dequant_ct(const sgl_qcfg *cfg, const int32_t *wpacked, int64_t rows,
+                           int64_t cols, const float *scales, int64_t sc_rows, int64_t sc_cols,
+                           int64_t N, int64_t K, float *out);
+
+/* gpt-oss 的 mxfp4：weight 是 uint8（两个 e2m1 挤一字节，低半字节在前），
+ * scales 是 e8m0（uint8，值 = 2^(x-127)），每 32 个元素一个。*/
+int sgl_qweight_dequant_mxfp4(const int32_t *cfg_unused, const uint8_t *wpacked, int64_t rows,
+                              int64_t cols, const uint8_t *scales, int64_t sc_rows,
+                              int64_t sc_cols, int64_t N, int64_t K, float *out);
+
+/* marlin 布局（layout=1）的解包：形状/置换按 cfg 里的 bits/group_size 走。
+ * 只支持 4bit（AWQ 官方也只支持 4bit）；scales/qzeros 必须已经是 marlin 置换后的样子。
+ * 没有 qzeros 时按 marlin 的约定 w = (q - 8) * scale。*/
+int sgl_qweight_dequant_marlin(const sgl_qcfg *cfg, const int32_t *qweight, int64_t qw_rows,
+                               int64_t qw_cols, const int32_t *qzeros, int64_t qz_rows,
+                               int64_t qz_cols, const float *scales, int64_t sc_rows,
+                               int64_t sc_cols, int64_t N, int64_t K, float *out);
 
 /* 从 config.json 的 quantization_config 文本填 cfg（返回 1 = 认出了 AWQ/GPTQ）。*/
 int sgl_qcfg_from_json(const char *json, size_t len, sgl_qcfg *cfg);

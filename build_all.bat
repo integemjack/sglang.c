@@ -23,29 +23,31 @@ set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin;%PATH%"
 
 echo [build_all 1/4] CPU build (MinGW, sglang-c/build) ...
 cmake --build sglang-c\build
-if errorlevel 1 (
-    echo [build_all] ERROR: CPU build FAILED ^(step 1/4^)
+rem 不能用 if errorlevel 1：它只判「>= 1」，而崩溃退出码是负的（如 0xC0000005 =
+rem -1073741819），会被当成成功、照样打 ALL OK（本定就因此漏了一个 cuda_test 崩溃）。
+if not "!ERRORLEVEL!"=="0" (
+    echo [build_all] ERROR: CPU build FAILED ^(step 1/4, exit=!ERRORLEVEL!^)
     popd & exit /b 1
 )
 
 echo [build_all 2/4] CUDA build (MSVC, sglang-c/build-cuda, targets: cuda_test cuda_cli cuda_http) ...
 cmake --build sglang-c\build-cuda --config Release --target cuda_test cuda_cli cuda_http
-if errorlevel 1 (
-    echo [build_all] ERROR: CUDA build FAILED ^(step 2/4^)
+if not "!ERRORLEVEL!"=="0" (
+    echo [build_all] ERROR: CUDA build FAILED ^(step 2/4, exit=!ERRORLEVEL!^)
     popd & exit /b 1
 )
 
 echo [build_all 3/4] CPU tests: ctest --test-dir sglang-c/build ...
 ctest --test-dir sglang-c\build --output-on-failure
-if errorlevel 1 (
-    echo [build_all] ERROR: ctest FAILED ^(step 3/4^)
+if not "!ERRORLEVEL!"=="0" (
+    echo [build_all] ERROR: ctest FAILED ^(step 3/4, exit=!ERRORLEVEL!^)
     popd & exit /b 1
 )
 
 echo [build_all 4/4] CUDA tests: cuda_test.exe models/qwen05 ...
 sglang-c\build-cuda\bin\Release\cuda_test.exe models\qwen05
-if errorlevel 1 (
-    echo [build_all] ERROR: cuda_test FAILED ^(step 4/4^)
+if not "!ERRORLEVEL!"=="0" (
+    echo [build_all] ERROR: cuda_test FAILED ^(step 4/4, exit=!ERRORLEVEL!^)
     popd & exit /b 1
 )
 

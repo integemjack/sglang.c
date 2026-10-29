@@ -270,6 +270,75 @@ static float *bytes_to_f32(const char *bytes, size_t nbytes, const char *dtype, 
  * 成功时返回 malloc 的缓冲（调用方负责登记归属），失败返回 NULL。*/
 static float *quant_get(sgl_st_ctx *c, const char *base, int64_t *out_N, int64_t *out_K,
                         int *out_ndim) {
+  /* ---- compressed-tensors（W4A16/W8A16）与 mxfp4：张量名/布局完全不同，单开一路 ---- */
+  if (c->q.method == SGL_Q_CT || c->q.method == SGL_Q_MXFP4) {
+    char nm2[512];
+    st_raw wp, sc;
+    int ct = c->q.method == SGL_Q_CT;
+    snprintf(nm2, sizeof(nm2), ct ? "%s.weight_packed" : "%s.weight", base);
+    const st_shard *sh2 = shard_for(c, nm2);
+    if (!sh2 || !shard_raw(sh2, nm2, &wp)) return NULL;
+    snprintf(nm2, sizeof(nm2), ct ? "%s.weight_scale" : "%s.scales", base);
+    sh2 = shard_for(c, nm2);
+    if (!sh2 || !shard_raw(sh2, nm2, &sc)) {
+      SGL_ERROR("quant: 缺 %s", nm2);
+      return NULL;
+    }
+    /* N, K：优先信 weight_shape（CT）/ config 推出的 scales 列数 */
+    int64_t N = wp.dims[0];
+    int64_t K = 0;
+    if (ct) {
+      snprintf(nm2, sizeof(nm2), "%s.weight_shape", base);
+      st_raw ws;
+      sh2 = shard_for(c, nm2);
+      if (sh2 && shard_raw(sh2, nm2, &ws) && ws.nbytes >= 16) {
+        const int64_t *d = (const int64_t *)ws.bytes;
+        N = d[0];
+        K = d[1];
+      } else {
+        K = wp.dims[1] * (c->q.bits == 4 ? 8 : 4);
+      }
+    } else {
+      K = wp.dims[1] * 2; /* mxfp4：1 字节 2 个值 */
+    }
+    int64_t sc_n = 0;
+    float *scl = ct ? bytes_to_f32(sc.bytes, sc.nbytes, sc.dtype, &sc_n) : NULL;
+    if (ct && !scl) {
+      SGL_ERROR("quant: %s dtype=%s 不支持", base, sc.dtype);
+      return NULL;
+    }
+    int64_t sc_cols = sc.dims[sc.ndim - 1];
+    int64_t sc_rows = sc.dims[sc.ndim - 2 >= 0 ? sc.ndim - 2 : 0];
+    if (N <= 0 || K <= 0) {
+      SGL_ERROR("quant: %s 形状推不出来（weight [%lld,%lld]）", base, (long long)wp.dims[0],
+                (long long)wp.dims[1]);
+      sgl_xfree(scl);
+      return NULL;
+    }
+    float *out = (float *)sgl_xmalloc((size_t)(N * K) * sizeof(float));
+    int rc;
+    if (ct) {
+      int64_t nw = 0;
+      int32_t *wv = bytes_to_i32(wp.bytes, wp.nbytes, &nw);
+      rc = wv ? sgl_qweight_dequant_ct(&c->q, wv, wp.dims[0], wp.dims[1], scl, sc_rows, sc_cols,
+                                      N, K, out)
+              : -1;
+      sgl_xfree(wv);
+      sgl_xfree(scl);
+    } else {
+      rc = sgl_qweight_dequant_mxfp4(NULL, (const uint8_t *)wp.bytes, wp.dims[0], wp.dims[1],
+                                     (const uint8_t *)sc.bytes, sc_rows, sc_cols, N, K, out);
+    }
+    if (rc != 0) {
+      sgl_xfree(out);
+      return NULL;
+    }
+    if (out_N) *out_N = N;
+    if (out_K) *out_K = K;
+    if (out_ndim) *out_ndim = 2;
+    return out;
+  }
+
   char nm[512];
   st_raw qw, qz, sc, gi;
   memset(&qz, 0, sizeof(qz));
@@ -311,6 +380,40 @@ static float *quant_get(sgl_st_ctx *c, const char *base, int64_t *out_N, int64_t
   int64_t sc_rows = (int64_t)(sc_n / (N > 0 ? N : 1));
   int64_t K = 0;
   const int pack = sgl_q_pack(c->q.bits);
+  /* marlin 布局：qweight [K/16, N*16/pack]。形状对得上才走这条路，
+   * 对不上（有些导出工具只是把 version/format 写成 marlin）回退到自然布局。*/
+  if (c->q.layout == SGL_QLAYOUT_MARLIN) {
+    if (c->q.bits != 4 && c->q.bits != 8) {
+      SGL_ERROR("quant(marlin): %s 是 marlin 布局，但 marlin 只做 4/8bit（config bits=%d）", base,
+                c->q.bits);
+      sgl_xfree(scl);
+      return NULL;
+    }
+    const int64_t K_m = qw.dims[0] * 16;
+    if (K_m > 0 && qw.dims[1] * pack == N * 16) {
+      int32_t *qwv = bytes_to_i32(qw.bytes, qw.nbytes, NULL);
+      int32_t *qzv = has_z ? bytes_to_i32(qz.bytes, qz.nbytes, NULL) : NULL;
+      float *out = (float *)sgl_xmalloc((size_t)(N * K_m) * sizeof(float));
+      int rc = qwv ? sgl_qweight_dequant_marlin(&c->q, qwv, qw.dims[0], qw.dims[1], qzv,
+                                                qz.dims[0], qz.dims[1], scl, sc_rows, N, N,
+                                                K_m, out)
+                   : -1;
+      sgl_xfree(qwv);
+      sgl_xfree(qzv);
+      sgl_xfree(scl);
+      if (rc != 0) {
+        sgl_xfree(out);
+        return NULL;
+      }
+      if (out_N) *out_N = N;
+      if (out_K) *out_K = K_m;
+      if (out_ndim) *out_ndim = 2;
+      return out;
+    }
+    SGL_INFO("quant: %s 声明 marlin 布局但形状 qweight[%lld,%lld] 与 N=%lld（pack=%d）"
+             "对不上，回退按自然布局读",
+             base, (long long)qw.dims[0], (long long)qw.dims[1], (long long)N, pack);
+  }
   if (c->q.method == SGL_Q_AWQ) {
     /* gemm: qweight [K, N/pack]；gemv: [N/pack, K]。方形权重（K==N）两者都满足，
      * 所以先信 config 的 version，对不上再按形状修正。*/
@@ -872,4 +975,27 @@ int sgl_st_names(sgl_st_ctx *c, const char ***names) {
 int sgl_st_shard_count(const sgl_st_ctx *c) {
   if (!c) return 0;
   return c->gg ? 1 : c->n_sh;
+}
+
+int sgl_st_get_raw(sgl_st_ctx *c, const char *name, const char **dtype, int *ndim,
+                   int64_t *dims, const void **bytes, size_t *nbytes) {
+  if (!c || c->n_sh == 0 || c->gg || !name) return 0;
+  const st_shard *sh = shard_for(c, name);
+  char pn[640];
+  if (!sh && c->has_prefix && !strncmp(name, "model.", 6)) {
+    /* 与 st_get_plain 同一套回退：VLM 包装检查点的 model.X 在 model.language_model.X 下 */
+    snprintf(pn, sizeof(pn), "%s%s", c->prefix, name + 6);
+    sh = shard_for(c, pn);
+    if (sh) name = pn;
+  }
+  if (!sh) return 0;
+  st_raw r;
+  if (!shard_raw(sh, name, &r)) return 0;
+  if (dtype) *dtype = r.dtype;
+  if (ndim) *ndim = r.ndim;
+  if (dims)
+    for (int i = 0; i < 4; i++) dims[i] = r.dims[i];
+  if (bytes) *bytes = r.bytes;
+  if (nbytes) *nbytes = r.nbytes;
+  return 1;
 }

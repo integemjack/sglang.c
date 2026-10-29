@@ -157,7 +157,61 @@ int main(int argc, char **argv) {
 
   sgl_xfree(lc);
   sgl_xfree(lg);
+  sgl_deepseek_pages_unref(cpu, pages, ctx);
   sgl_xfree(pages);
+
+  /* 贪婪生成 16 步：CPU 与 GPU 的 token 序列必须完全一致（服务层就是这么采的）*/
+  {
+    int seq_cpu[16], seq_gpu[16];
+    float *row = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+    int *p2 = (int *)sgl_xmalloc(sizeof(int) * (size_t)ctx);
+    CHECK(sgl_deepseek_pages_alloc(cpu, p2, ctx) == 0, "greedy pages alloc");
+    int np = 0;
+    /* CPU：从头 prefill（前面的数组已 free，这里重新算）*/
+    for (int t = 0; t < n; t++)
+      if (sgl_deepseek_forward(cpu, &toks[t], 1, t, p2, row) != 0) {
+        printf("FAIL: cpu re-prefill t=%d\n", t);
+        fails++;
+        break;
+      }
+    np = n;
+    for (int i = 0; i < 16; i++) {
+      int best = 0;
+      for (int v = 1; v < V; v++)
+        if (row[v] > row[best]) best = v;
+      seq_cpu[i] = best;
+      if (sgl_deepseek_forward(cpu, &best, 1, np, p2, row) != 0) { seq_cpu[i] = -1; break; }
+      np++;
+    }
+    sgl_cuda_ds_reset(gpu);
+    if (sgl_cuda_ds_forward_n(gpu, toks, n, 0, row, 0) != 0) {
+      printf("FAIL: greedy prefill\n");
+      fails++;
+    } else {
+      for (int i = 0; i < 16; i++) {
+        int best = 0;
+        for (int v = 1; v < V; v++)
+          if (row[v] > row[best]) best = v;
+        seq_gpu[i] = best;
+        if (sgl_cuda_ds_decode(gpu, best, n + i, row) != 0) { seq_gpu[i] = -1; break; }
+      }
+      int same = 1;
+      for (int i = 0; i < 16; i++)
+        if (seq_cpu[i] != seq_gpu[i]) same = 0;
+      printf("[greedy] 16 步 token 序列%s\n", same ? "完全一致" : "不一致");
+      if (!same) {
+        printf("  cpu:");
+        for (int i = 0; i < 16; i++) printf(" %d", seq_cpu[i]);
+        printf("\n  gpu:");
+        for (int i = 0; i < 16; i++) printf(" %d", seq_gpu[i]);
+        printf("\n");
+      }
+      CHECK(same, "CPU 与 GPU 贪婪 16 步 token 序列一致");
+    }
+    sgl_deepseek_pages_unref(cpu, p2, ctx);
+    sgl_xfree(row);
+    sgl_xfree(p2);
+  }
   sgl_cuda_ds_free(gpu);
   sgl_deepseek_free(cpu);
 

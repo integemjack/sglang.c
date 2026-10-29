@@ -27,6 +27,12 @@
 int sgl_cuda_http_serve(const char *dir, int port, const char *host);
 #endif
 
+#ifdef SGL_EMBED_MLX_HTTP
+#include "sgl/mlx.h" /* sgl_mlx_avail_mem_mb / sgl_mlx_device_name：同一套探针 */
+/* mlx_http.c 的引擎入口（与上面完全对称）*/
+int sgl_mlx_http_serve(const char *dir, int port, const char *host);
+#endif
+
 /* t11 调试：崩溃时打回溯（无 gdb 环境下定位段错误用，-g 编译后 addr2line 可解） */
 #if !defined(_WIN32)
 #include <signal.h>
@@ -328,19 +334,34 @@ int main(int argc, char **argv) {
 
   if (serve) {
     /* ---- 后端选择（--device）----
-     * auto 的次序：cuda → mlx → cpu。
-     *  - cuda：编了 SGL_CUDA、且运行时能拿到一块可用显卡（avail_vram > 0）才用它；
-     *  - mlx：本仓库没有 MLX 后端（只有 macOS 的 tools/ref_llava_mlx.py 数值参考），
-     *         这一档只打一行日志就跳过；
+     * auto 的次序：cuda → mlx → cpu。三个都是同一个 sglc：引擎不同，端点集相同
+     * （/health /generate /v1/completions /v1/chat/completions /v1/models /flush_cache
+     * + SSE），客户端不需要因为换了后端而改代码。
+     *  - cuda：编了 SGL_CUDA、且运行时能拿到一块可用显卡（avail_vram > 0）；
+     *  - mlx ：编了 SGL_MLX（macOS/arm64）、且 Metal 设备可用（统一内存报得出数）；
      *  - cpu：回落路径，调度器 + http.c。
-     * 两个引擎的端点集一致（/health /generate /v1/completions /v1/chat/completions），
-     * 客户端不需要因为换了后端而改代码。*/
+     * 显式 --device <名字> 但没编入/不可用 → 报错退出（不默默降级）；
+     * auto 才逐档探测。*/
     int dev_auto = !strcmp(device, "auto");
     int dev_cuda = dev_auto || !strcmp(device, "cuda");
-    if (!strcmp(device, "mlx"))
-      fprintf(stderr, "[device] mlx：本仓库未提供 MLX 后端（只有 macOS 数值参考脚本），回落 cpu\n");
-    else if (dev_auto)
-      SGL_INFO("device: 选择次序 cuda → mlx（未编入）→ cpu");
+    int dev_mlx = dev_auto || !strcmp(device, "mlx");
+    if (dev_auto) SGL_INFO("device: 选择次序 cuda → mlx → cpu");
+#ifndef SGL_EMBED_CUDA_HTTP
+    if (!dev_auto && dev_cuda) {
+      fprintf(stderr, "[device] --device cuda：这个构建没编 CUDA 后端（cmake -DSGL_CUDA=ON）；只用 cpu\n");
+      return 1;
+    }
+    if (dev_auto) SGL_INFO("device: 本构建未编入 CUDA 后端");
+    dev_cuda = 0;
+#endif
+#ifndef SGL_EMBED_MLX_HTTP
+    if (!dev_auto && dev_mlx) {
+      fprintf(stderr, "[device] --device mlx：这个构建没编 MLX 后端（cmake -DSGL_MLX=ON，Apple Silicon）；只用 cpu\n");
+      return 1;
+    }
+    if (dev_auto) SGL_INFO("device: 本构建未编入 MLX 后端");
+    dev_mlx = 0;
+#endif
 #ifdef SGL_EMBED_CUDA_HTTP
     if (dev_cuda && !sglc_cublas_loadable()) {
       if (!dev_auto) {
@@ -381,12 +402,35 @@ int main(int argc, char **argv) {
           SGL_INFO("device: cuda 不可用（avail_vram=%ld MB）→ cpu", free_mb);
       }
     }
-#else
-    if (!dev_auto && !strcmp(device, "cuda")) {
-      fprintf(stderr, "[device] --device cuda：这个构建没编 CUDA 后端（cmake -DSGL_CUDA=ON）；只用 cpu\n");
-      return 1;
+#endif
+#ifdef SGL_EMBED_MLX_HTTP
+    if (dev_mlx) {
+      long mlx_avail_mb = sgl_mlx_avail_mem_mb(); /* 无 Metal 设备 → 负数 */
+      if (n_loras > 0) {
+        /* 与 cuda 同理：多 LoRA 路由只在 CPU 调度器里 */
+        fprintf(stderr, "[device] --lora 多实例路由只有 CPU 引擎支持；改用 cpu 引擎\n");
+        if (!dev_auto) return 1;
+        dev_mlx = 0;
+      } else {
+        if (mlx_avail_mb > 0) {
+          /* MLX 后端只有 fp16/fp32 两条路（没有 int8 权重与 int8 KV），
+           * --w8/--kv8 在这个后端上不生效；说一声，不默默忽略。*/
+          if (w8 || kv8)
+            SGL_INFO("device: mlx 后端只做 fp16/fp32，--w8/--kv8 在这里不生效（忽略）");
+          SGL_INFO("device: mlx（%s，可用内存 %ld MB）—— Metal 引擎起服务，端口 %d",
+                   sgl_mlx_device_name(), mlx_avail_mb, port);
+          return sgl_mlx_http_serve(model_dir, port, host);
+        }
+        if (!dev_auto) {
+          fprintf(stderr,
+                  "[device] --device mlx：没有可用的 Metal 设备（可用内存 = %ld MB）。"
+                  "需 Apple Silicon + macOS\n",
+                  mlx_avail_mb);
+          return 2;
+        }
+        SGL_INFO("device: mlx 不可用（可用内存 = %ld MB）", mlx_avail_mb);
+      }
     }
-    if (dev_auto) SGL_INFO("device: 本构建未编入 CUDA 后端 → cpu");
 #endif
     if (w8) SGLC_SETENV("SGL_W8", "1");
     if (kv8) SGLC_SETENV("SGL_KV8", "1");

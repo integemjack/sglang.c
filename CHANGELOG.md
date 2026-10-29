@@ -2,6 +2,55 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — MLX 后端 T1 + T2（fp16 + 量化）（2026-11-04）
+
+Apple Silicon 上多一个后端：`-DSGL_MLX=ON` 产出 `mlx_test` / `mlx_q4_test` / `mlx_http`，
+llama 系模型走 Metal。详见 [docs/PROGRESS_mlx.md](docs/PROGRESS_mlx.md)、
+[docs/NOTES_mlx_t2.md](docs/NOTES_mlx_t2.md)（fp16 性能）与
+[docs/NOTES_mlx_q4.md](docs/NOTES_mlx_q4.md)（量化）。
+
+- **新后端**：`include/sgl/mlx.h` + `src/mlx_backend.cpp`（llama/Qwen2/Qwen2.5/
+  Mistral/Gemma/Gemma-2 系 dense 层，含 GQA、qk-norm、q_gate、partial rotary、
+  逐层不同 RoPE 表、sliding window、gemma softcap）。MoE / MLA / hybrid linear
+  attention **明确拒绝并说明原因**（T3）。
+- **量化检查点（4-bit / 8-bit / MXFP4）**：直接读 `mlx-community` 格式
+  （`.weight` U32 打包 + `.scales`/`.biases`），走 `mx::quantized_matmul`，
+  不解成 fp16；位宽与 group 从形状现场推断。Qwen2.5-0.5B：4-bit 磁盘 276 MB、
+  8-bit 525 MB（fp16 是 951 MB）；多分片（`.index.json`）已支持。
+  MXFP4（无 biases、scales=U8）已验证：**顺带抓出 MLX 0.29.3 的 kernel bug ——
+  mxfp4 的 `quantized_matmul` 对 f16/bf16 输入给垃圾值（f32 才对），已强制
+  f32 输入规避**；`dequantize(mxfp4)` 输出 bf16 也已统一转回 wdt。
+- **mlx_lm 自身的 1D/2D 差异**：同一 token，1D 输入（`mx.array([id])`）与
+  2D（`[[id]]）在 8-bit 下走出不同数值路径（batch=1 语义上应一致）。
+  对拍脚本统一 2D。
+- **接缝复用**：`apps/mlx_http.c` 只装 `sgl_accel_api` 表，服务逻辑共享
+  `apps/accel_http.c`，不抄第二套 HTTP。
+- **正确性**：`tests/mlx_test.c` 对拍 CPU 金标准 —— 5 个 fixture 13/13，
+  Qwen2.5-0.5B fp16 12/12 + fp32 13/13（fp32 跨路径概率误差 8.9e-7）；
+  `tests/mlx_q4_test.c` 对拍 `mlx_lm`：4-bit top10 与 8-bit 的 lg 值与官方
+  2D 路径**逐位一致**；mxfp4（合成检查点）逐层 hidden 逐位一致 + logits
+  统计量全同。
+- **性能（M1，Qwen2.5-0.5B）**：
+  - fp16 decode 69.0 → **23.2 ms/步**（43.2 tok/s），同机官方 `mlx_lm` 41.9；
+  - 4-bit decode **75.2 tok/s**，官方 80.7（差 6%）；并发 4 条 **111 tok/s**；
+  - 8-bit decode **58.3 tok/s**，官方 65.3。
+- **四个每层 48 次强制同步点**：`decode_batch` 里 `krows.eval()` 把整步切成
+  24×2 段，删掉后 MLX 才能跨层融合 kernel（45.4 → 23.2 ms/步）。
+  教训：**MLX 里除最后一次取结果，中间不要 eval**。
+- **并发时的 KV 空间散布**：`Smax` 原本跟着段的跨度走，4 条序列分乘在
+  4 个 4096 段里就要扫 12416 行（实测 25.9 tok/s）；改成 `take` gather 成
+  `[B, maxlen, KVH, D]` 后 **111 tok/s**。
+- **`apps/accel_http.c`**：① `Sleep((DWORD)d)` 在 POSIX 下 `DWORD` 未定义 →
+  在文件头的 POSIX shim 块里补 `typedef unsigned long DWORD;`；
+  ② 量化检查点上 CPU 侧 `sgl_llama_load` 会失败，加一条降级：改用
+  `sgl_llama_load_full(dir, 1)` 只取 config，交给后端自读权重（非 MLX 后端
+  遇到 config-only 直接给可读错误，而不是去读 NULL 的 `m->layers`）。
+- **测试本身的三个 bug**（都是真模型才暴露出来的）：
+  1. `[3] 分块 prefill` 拿被 `[2]` 覆写的缓冲区当参考 → 改为存档；
+  2. `[5] 段隔离` 的参考少走一步（`lens[1]=P2+1` 对 `pos0=P2`），玩具模型分布近乎
+     均匀看不出来，真模型上差到 8e-2；
+  3. `now_s()` 用 `clock()`（CPU 时间）而不是墙钟，把 decode 报快 1.5 倍。
+
 ## [Unreleased] — CI 修复（2026-10-29）
 
 本地复现（Linux 用全新 checkout + CI 同款夹具串行 ctest；Windows 用 VS2022 BuildTools 的
@@ -16,6 +65,256 @@ MSVC + CUDA 13.3、MinGW gcc 16），四个问题各自独立：
   改为找不到 .gguf 就 SKIP（与同文件其它用例一致）。四个 CPU 测试任务的 exit 8 都是它。
 - **`test_jinja`（Windows）**：runner 的 `core.autocrlf=true` 把 `tests/ref_chat_*.txt` 转成 CRLF，
   与按字节比对的渲染结果对不上。加 `.gitattributes` 让这些参考文件不做换行转换。
+
+## [Unreleased] — marlin 8bit 分支（2026-10-29 第九轮）
+
+上一版把 marlin 限制在 4bit（8bit 直接报错）。这轮补上 8bit。
+
+### 布局依据（与 4bit 不同：没有“Marlin 官方”参考）
+
+Marlin 作者自己的 Python `Layer.pack` **只做 4bit**（`maxq = 2^4-1`、每 int32 八个 nibble），
+所以 8bit 靠 vLLM 里**两份相互独立的 repack kernel** 交叉钉死：
+
+| 参考 | 输入 | shared memory 组织 |
+| --- | --- | --- |
+| `awq_marlin_repack.cu`（is_a_8bit=false, num_bits=8） | AWQ 落盘 [K, N/pack]，含组内重排 | 按 nibble 列取 |
+| `gptq_marlin_repack.cu`（同上） | GPTQ 落盘 [K/pack, N]，沿 K 打包 | 按 K-group 行取 |
+
+两边写法、输入、参数都不同，输出必须一致。`tests/marlin_layout.py` 把两份都逐行移植成 numpy，
+对 K×N = 32×64 / 64×128 / 128×256 / 32×128 四种形状**逐字节相同**，我们的闭式索引也相同：
+
+```
+8bit：tile 仍是 16(k)x64(n)，但是 256 个 int32、每 word 4 个 byte；
+      word p = th*8 + warp*2 + half（半字 = n 的前/后 8 列）
+      byte j (0..3): k_off = 2*((p>>3)&3) + [0,8,1,9][j]
+                     n_off = 16*((p>>1)&3) + (p>>5) + (p&1 ? 8 : 0)
+```
+
+### 做了什么
+
+- `sgl_qweight_dequant_marlin()` 泛化到 bits ∈ {4,8}：pack 8/4、mask 0xF/0xFF、
+  tile 128/256 word、两套 `k_off`/`n_off`；无零点时偏移从 `8` 改成 `1<<(bits-1)`（8bit = 128）。
+- `marlin_col_map()` 的零点重排按 pack 分路：4bit 用 8 元 interleave 的逆、8bit 用 4 元
+  `[0,2,1,3]`（自逆）。
+- `safetensors.c`：marlin 布局允许 bits=8（其余值仍明确报错）。
+
+### 实测
+
+| 项 | 结果 |
+| --- | --- |
+| `tests/marlin_layout.py` | 8bit 四种形状：vLLM AWQ repack == vLLM GPTQ repack == 闭式索引，全 PASS；8bit 零点置换可逆 PASS |
+| `test_qweight` marlin 定值用例 | 从 2 个扩到 4 个（sym4/asym4/**sym8/asym8**），逐元素 **maxdiff = 0**（含 8bit 零点路径） |
+| `test_family_qw_marlin8`（`models/mistral-rand-marlin8`，GPTQ 8bit + 对称零点 128，10 个权重重排） | vs numpy 参考 top5 logits maxerr **6.2e-05 / 7.2e-05 / 5.0e-05 / 7.0e-05** |
+| 谎报 8bit 布局的 4bit 权重（config 只改 `format: marlin` + `bits: 8`） | 形状对不上 → 回退到自然布局 → 自然 GPTQ 又发现 qzeros 宽度不符 → **明确报错**，不会默默算出垃圾 |
+
+夹具生成也扩了：`python tests/make_marlin_fixture.py --bits 8 --out ../models/mistral-rand-marlin8
+--ref-out tests/_ref_mistral_marlin8.json`（4bit 仍走 ct4 的码 + Marlin 官方 pack；8bit 直接从 fp
+权重量化并用 vLLM 的 GPTQ repack 打包 —— 与 C 的闭式索引是两份独立实现）。
+
+
+
+上一版把 AWQ marlin 列为「明确报错」。这轮把它做了：先找资料把布局钉死，再实现。
+
+### 查到了什么（关键结论修正）
+
+**marlin 不是落盘格式，是 vLLM 加载期的内存布局。** 具体说，vLLM 的 `awq_marlin` /
+`gptq_marlin` 在 `process_weights_after_loading` 里把标准落盘权重（AWQ 的
+`qweight [K, N/pack]` 含 8 元重排、GPTQ 的沿 K 打包）重排成 marlin kernel 直接吃的形状，
+**HF 生态没有任何工具会把权重存成 marlin 布局**。所以它能被“找到”的不是“哪个模型的权重”，
+而是“vLLM/Marlin 的两份实现恰好一致”。
+
+布局由**两份独立实现**交叉对账钉死（`tests/marlin_layout.py`，可重跑）：
+
+| 来源 | 用途 |
+| --- | --- |
+| Marlin 作者官方 Python：[`IST-DASLab/marlin` `Layer.pack`](https://github.com/IST-DASLab/marlin) 的 `_get_perms` + `_perm` + `q \|= res[:, i::8] << 4*i` | 权威参考 A |
+| vLLM：[`csrc/quantization/marlin/awq_marlin_repack.cu`](https://github.com/vllm-project/vllm/blob/main/csrc/quantization/marlin/awq_marlin_repack.cu) | 权威参考 B（逐行移植到 numpy） |
+| vLLM：[`marlin_utils.py`](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/marlin_utils.py) 的 `marlin_permute_scales` / `awq_to_marlin_zero_points` | scale 与零点的置换 |
+
+结论：A 与 B 对 4 种形状（K×N = 32×64 / 64×128 / 128×256 / 32×128）产出**逐字节相同**的 B，
+我们从 B 化的闭式索引（`k_off = 2*((p>>2)&3) + (j&1?8:0) + (j>=4?1:0)`、
+`n_off = 16*(p&3) + (p>>4) + (j&2?8:0)`）也与它们逐字节相同 —— 所以下标不是猜的。
+（顺手也把上一版“找不到 perm 定义”的结论纠了：perm 确实存在，只是不在原来那个路径里。）
+
+### 做了什么
+
+- `sgl_qcfg` 加 `layout`（`SGL_QLAYOUT_MARLIN`）；AWQ `version: marlin`、GPTQ
+  `format: marlin/gptq_marlin` 都会置位。
+- `sgl_qweight_dequant_marlin()`：tile 内 word/nibble 反查 + scales 64 列置换的反向映射
+  + 零点（`awq_to_marlin_zero_points` 的 64 列置换叠加 8 元 interleave）的反向映射；
+  无零点时按 marlin 约定 `(q-8)*s`。
+- `safetensors.c`：`layout=marlin` 且形状合上 `[K/16, N*16/pack]` 才走；**形状对不上就回退**
+  自然布局（有些导出工具只是把 version 字段写成 marlin），并打 INFO 说明。
+  非 4bit 的 marlin 直接报错（marlin 的 8bit 分支是 `is_a_8bit` 的另一套形状，没实测就不写支持）。
+
+### 实测
+
+| 项 | 结果 |
+| --- | --- |
+| `tests/marlin_layout.py` | 三方差分 4 种形状全 PASS；scale / 零点置换可逆 PASS |
+| `test_qweight` 新增 marlin 定值用例（`_marlin_unit.json`，对称 + 带零点两组） | 逐元素 **maxdiff = 0** |
+| `test_family_qw_marlin`（`models/mistral-rand-marlin`，10 个权重真重排，另 4 个 N=32 的保留 fp16） | vs numpy 参考 top5 logits maxerr **2.9e-05** |
+| 回退路径（AWQ 夹具 config 改成 `version: marlin`） | 每个张量都打 INFO 回退，logits vs AWQ 参考 maxerr **3e-08** |
+| marlin 配 bits=8 | 明确报错，不静默解错 |
+
+
+
+### 做了什么
+
+`cuda_backend.cu` 补齐了 MoE 层的设备前向（之前只有 dense MLP，Qwen3-MoE / Qwen3-Next / Mixtral 在 GPU 上跑不了）：
+- kernel：`k_moe_route`（softmax + top-k + norm_topk + routed_scale）、`k_moe_gu`（每专家
+  gate_up + silu*mul）、`k_moe_down`（累加）、`k_moe_sgate`/`k_moe_gu_shared`/`k_moe_down_shared`
+  （共享专家 × sigmoid 门控）
+- 宿主侧：`moe_forward()` + 在 `fwd_seg_llama`、hybrid 路径、批量 decode 路径四处接入；
+  专家权重上传在 `sgl_cuda_from_llama`（只在 `n_experts>0` 时分配）
+- `sgl_cuda_moe_selftest()` + `tests/cuda_moe_test.c`：4 组形状（小夹具 / decode rows=1 /
+  rows=8 E=512 NE=16 topk=4 / 无共享专家）与 CPU 朴素实现对比
+
+### 实测
+
+| 项 | 结果 |
+| --- | --- |
+| `cuda_moe_test`（4 组形状 GPU vs CPU f32） | 全部通过，maxerr 2.9e-10 / 2.1e-09 / 7.2e-09 / 3.5e-10 |
+| **端到端**：`qwen3next-rand`（2 层 GDN hybrid + 2 层 MoE，4 专家 top-2）CPU 服务 vs GPU 服务 | `tests/conformance.py` **全部一致（逐字节相同）**：tokenize/detokenize、`/generate` 6 个 prompt、`/v1/completions`、`/v1/chat/completions`、流式拼装 |
+
+GPU 侧跑 GDN hybrid 模型需要 `SGL_CUDA_W8=1`（线性注意力层的权重走 int8，与早前 M 系列的约束一致）。
+
+
+
+本轮把上一版列在「本机可做但没完成」的三块里的两块半做完了。
+
+### 权重格式（全部本机编译 + 夹具端到端验证）
+
+| 格式 | 实现 | 验证 |
+| --- | --- | --- |
+| **GPTQ gptq_v2** | `qweight.c` `cfg->v2`：qzeros 存的是 v1 值 - 1，解量化时 +1 | `tests/make_gptq_v2.py` 从 v1 夹具派生（zeros 整体 -1）→ `test_family_qw_gptq_v2` 用 **v1 的参考 logits**，应逐位一致 → 通过 |
+| **compressed-tensors W4A16（pack-quantized）** | `sgl_qweight_dequant_ct()`：按官方 `unpack_from_int32` 的位流语义（每字节低半字节 = 偶下标、高半字节 = 奇下标），解出后减 `1<<(bits-1)`；张量名 `weight_packed`/`weight_scale`/`weight_shape` | `tests/make_ct_fixture.py` 按官方语义量化+打包 → 反量化参考 → `test_family_qw_ct4` 通过（rel_rms 0.0725 是 4bit 本身的量化误差） |
+| **MXFP4（gpt-oss）** | `sgl_qweight_dequant_mxfp4()`：e2m1 码书 `[0,.5,1,1.5,2,3,4,6]` + 符号位；e8m0 scale `2^(x-127)`，每 32 元素一个 | `tests/make_mxfp4_fixture.py` 按 transformers `_convert_moe_packed_tensors` 的语义生成 → `test_family_qw_mxfp4` 通过 |
+| **AWQ marlin** | **仍明确报错**（不静默解错） | 说明见下 |
+
+**AWQ marlin 为什么没做**：marlin 的落盘布局是 vLLM kernel 内部的 tile 重排（`gptq_marlin_repack` 的产物），
+不是公开的通用位流格式；本机没有真实 marlin 权重复现它，而我拿不到 vLLM 那份 perm 的权威定义
+（仓库路径已变、连试三个路径均 404）。按本项目「没实测过的不写已支持」的标准，
+这里保持**明确报错并说明绕法**（用 gemm/gemv 版本权重，或先用 AutoAWQ/llm-compressor 重新导出），
+不拿一个自洽但可能错位的实现冒充支持——那种错是**静默的数值错误**，比报错危险得多。
+
+### 多图 LLaVA（G21）
+
+之前多个 `<image>` 占位符全塌到同一个位置（README Known limitations）。现在：
+- `sched_req` 改存 `img_at[8]` + `n_place` + `per_img`，提交时扫出**所有**占位符，
+  按出现顺序把第 j 张图插到第 j 个占位符，其后的文本位置整体后移 `j*per_img`。
+- 图片数与占位符数不匹配时退回旧行为（不会崩）。
+- 验证：
+  - `tests/test_llava_multi.c`（ctest 里）：**手工把两个占位符各换成对应视觉段**算的参考
+    与调度器实际结果**首 token 相同**；两图 vs 单图 logits 最大差 0.178（第二张确实进了 KV）。
+  - `tests/llava_multi_check.py`（起服务实测）：两图 vs 单图、红/蓝 vs 红/红 输出均不同；
+    三图请求不崩。日志确认 `places=2 per_img=16`。
+  - 新夹具 `models/llava-lm`（`tests/make_llava_lm.py`：mistral-rand 的权重 + 加了 `<image>` 的分词器）。
+
+### CPU batch-invariant（实测，非新增代码）
+
+`tests/batch_invariant.py` 端到端验证 4 项，全部通过：
+同一 prompt 单独发 vs 与 3 个不同 prompt 并发时**逐字节相同**；重发相同；
+长 prompt（触发分块 prefill）与短 prompt 混批结果相同；`max_tokens=4` 是 `max_tokens=16` 的前缀。
+**结论**：本仓的 CPU 前向本来就与 batch 组成无关（每行独立、chunked prefill 逐 token 叠 KV），
+所以不需要上游那套 `batch_invariant_ops`；现在有回归测试把它钉住了。
+
+### 回归
+
+- CPU `ctest`：**49/49 通过**（新增 test_llava_multi、test_family_qw_gptq_v2 / _ct4 / _mxfp4）
+- `test_qweight` 同步改了用例：gptq_v2 不再是「期望被拒绝」，而是「真支持」
+
+
+
+本轮把「GPU 服务只在 15 个端点」和「DeepSeek 只能跑 CPU」两块补齐，并把 CPU/GPU 逐字节对拍固化成脚本。
+
+### GPU 服务（`apps/accel_http.c`，CPU/GPU 共用一份）
+- 15 → 50+ 个端点：`/tokenize` `/v1/tokenize` `/detokenize` `/v1/detokenize` `/encode`、
+  `/v1/messages/count_tokens`、`/v1/responses`、`/v1/messages`（**真流式**：茐 token 发
+  `content_block_delta`）、Ollama 四个、`/invocations`、`/pause_generation` `/continue_generation`
+  `/slow_down` `/start_profile` `/stop_profile` `/release_memory_occupation`
+  `/resume_memory_occupation` `/open_session` `/close_session` `/model_info`
+  `/separate_reasoning` `/parse_function_call`、`/v1/embeddings` `/v1/rerank` `/v1/score`，
+  以及 30 个无后端的端点**明确 501 + 原因**（hicache / audio / reward / expert 分布 /
+  `update_weights_*` 组 / Vertex / dumper 等）。
+- 调度器：`priority` 优先级等待队列（同优先级 FIFO）+ 抢占；`pause` 时 worker 不推进且保留 KV。
+- **emcoder 模式**：模型目录是 BERT/RoBERTa 时，同一个二进制直接当 embedding/rerank 服务
+  （生成类端点全 503，不假装），不需设备。
+- 修两个真 bug：
+  - `wait_done` 返回的文本是 `_strdup`（malloc），我却用 `sgl_xfree`（`_aligned_free`）释放 →
+    吐 `/api/generate` 必堆损坏 0xC0000374；已统一为 `free()`。
+  - `sgl_cuda_ds_free()` 把 `calloc` 出来的指针数组交给了 `sgl_xfree` →
+    `cuda_deepseek_test` **退出时必崩**（这个 bug 在 264ab89 就已存在，与本次改动无关）；
+    已改为 `free()`，测试现在 exit=0。
+
+### DeepSeek（MLA + MoE）设备服务路径
+- `sgl_accel_api` 加 `ds_*` 入口（ABI 1 → 2），`cuda_http.c` 实现；
+  `accel_http.c` 在启动时用 `sgl_deepseek_detect()` 识别，生成走单序列阻塞路径
+  （MLA 的 KV 行是 `[latent | k_pe]`，段租让/批量 decode 不适用），其余端点如实 503。
+- 采样与 CPU 同一套 `sgl_sample_ex`；`/generate` 返回 CPU 同形状
+  （`text` 回显 + `completion` + `meta_info`）。
+- 验证：`cuda_deepseek_test` 新增【贪婪 16 步 CPU vs GPU token 序列必须一致】，
+  实测完全一致；prefill logits 1.07e-06、增量 decode 9.54e-07、分块 prefill 5.96e-08。
+
+### 对拍与回归
+- `tests/conformance.py`：同一份权重起 CPU+GPU 两个服务，逐项比对
+  tokenize/detokenize、`/generate`、`/v1/completions`、`/v1/chat/completions`、流式拼装 == 整体。
+  实测（tiny-llama-hf）：**全部一致（逐字节相同）**。
+- 顺手修两个 CPU 侧缺口（对拍时暴露）：
+  - `/v1/completions` 以前忽略 `stream`（直接回整体 JSON）→ 现在真 SSE（`text_completion` shape）；
+  - sglang 原生 `/generate` 的 `sampling_params.max_new_tokens` 在 GPU 侧被忽略（固定 64）→ 已修。
+- `tests/ext_endpoints_test.py` 支持指定端口（`python tests/ext_endpoints_test.py 30112`），
+  CPU/GPU 同一套用例；两端都是 0 失败（GPU 的运行时 LoRA 为 501，用例里显式 SKIP）。
+
+### 本轮未做（本机可做，但没完成）
+
+- **GPU 侧的 MoE 层前向**（`cuda_backend.cu` 仍只有 dense MLP）：Qwen3-MoE / Qwen3-Next-80B /
+  Mixtral 在 GPU 上跑不了（DeepSeek 的 MoE 走的是 `cuda_deepseek.cu`，已通）。
+- **权重格式**：W4A16 / compressed-tensors / MXFP4 已支持（见第六轮）；AWQ marlin 仍明确报错。
+- **多图 LLaVA**：已支持（G21，第六轮：每个 `<image>` 占位符各插自己的视觉段，已实测），
+  CPU batch-invariant 已用 `tests/batch_invariant.py` 验过（4/4）。
+
+## [Unreleased] — 服务面补齐（对齐上游路由表）+ Unigram tokenizer（2026-10-29 第四轮）
+
+本轮只动「能在本机编译并验证」的部分（本机 = Windows + RTX 2060 sm_75 + GCC/MSVC）。
+每一项都跑了实测，命令见 `tests/ext_endpoints_test.py`。
+
+- **CPU 版 HTTP 端点补齐（18 → 40+）**，`src/http.c` 新增 `handle_extended()`：
+  - 分词：`POST /tokenize` `/v1/tokenize` `/detokenize` `/v1/detokenize`、`/encode`、`/v1/messages/count_tokens`
+  - 前端协议：`/v1/responses`（OpenAI Responses）、`/v1/messages`（Anthropic，含 SSE 流式：
+    `message_start`/`content_block_delta`/`message_delta`/`message_stop`）、Ollama
+    `/api/tags` `/api/show` `/api/generate` `/api/chat`、`POST /invocations`（SageMaker）
+  - 生命周期：`/pause_generation` `/continue_generation` `/slow_down`（`step_delay_ms`）、
+    `/start_profile` `/stop_profile`、`/release_memory_occupation`（刷 RadixCache）`/resume_memory_occupation`
+  - 会话：`/open_session` `/close_session`（登记表，明确注明不持久化 KV）
+  - 运行时 LoRA：`/load_lora_adapter` `/unload_lora_adapter`（忙碌返回 409）
+  - 诊断：`GET /model_info`（config.json 原文）、`/separate_reasoning` `/parse_function_call`
+  - **明确 501 的 33 个端点**（不假装成功）：`/v1/classify` `/v1/decisions` `/v1/audio/transcriptions`、
+    `/hicache/*`、external corpus、`/update_weights_from_tensor|distributed|ipc` 与 init/destroy group、
+    expert distribution、`/freeze_gc` `/set_trace_level` `/configure_logging` `/set_internal_state` `/dumper/*`、
+    `/pd_role_switch`、`/vertex_generate` 等。
+- **调度器：优先级与生命周期**（`src/scheduler.c`、`sgl/scheduler.h`）：
+  `sgl_sched_submit_prio` / `sgl_sched_submit_stream_prio`（body 里的 `priority` 字段），
+  等待队列按优先级取（同优先级 FIFO），抢占也先抢优先级最低、生成最少的；
+  `sgl_sched_set_paused`（pause 时 step 不推进、请求与 KV 都保留）；
+  `sgl_sched_remove_lora`（标记 dead、下标不复用，有在途请求时拒绝）。
+  + `/tokenize` 直通需要的新 API：`sgl_sched_encode/decode/vocab_size/piece_id`。
+- **Unigram（SentencePiece）tokenizer**（`src/bpe.c`）：tokenizer.json 的 `model.vocab` 为
+  `[[piece, score], ...]` 数组时走 Unigram 路径（style=2）：Viterbi 最大 logprob 切分 + 字符边界约束
+  + `<0xXX>`/`<unk>` 单字节回退；decode 复用 style≥1 的 `▁`→空格。
+  对照：`tests/gen_unigram_ref.py` 用**独立实现**的 Viterbi 生成参考（T5-small 真实词表 32100），
+  `tests/test_unigram.c` 7 个 case 全字符级一致（含中英混排、emoji、多空格、换行）。
+  **已知差异**：T5 的 `Precompiled`（NFKC）归一化未实现，只做空格→`▁` + 段首 `▁`；
+  全角/组合字符的归一化结果会与 HF 不同。
+- **回归**：CPU ctest 45 个全绿（原 44 + test_unigram）；`tests/ext_endpoints_test.py` 37 项
+  端点实测全通过（杀掉 heap corruption：`sgl_xmalloc` 是 `_aligned_malloc`，混用 `free()` 会 0xC0000374）。
+
+### 本轮未做（本机能做、但还没做）
+
+- GPU 服务（`apps/cuda_http.c`）的端点仍只有 15 个：缺 tokenize/detokenize、responses/messages、
+  Ollama、pause/continue、embeddings/rerank/score（GPU 侧未加载 BERT）、运行时 LoRA 增删。
+- GPU 侧 DeepSeek 接线（`cuda_deepseek.cu` 仍未接 `cuda_http`）、GPU MoE 层前向。
+- W4A16 / compressed-tensors / MXFP4 权重、AWQ marlin / GPTQ v2 落盘、多图 LLaVA、batch-invariant。
 
 ## [Unreleased] — Qwen3.8 GPU：GDN 门控修复 + M3 MTP 投机解码（2026-10-29）
 

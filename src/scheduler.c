@@ -24,11 +24,13 @@ typedef struct {
   char *name;      /* NULL = base 副本（含 DP 多副本）；否则路由名 */
   sgl_model *model;
   sgl_radix *radix;
+  int dead;        /* 1 = 已被 /unload_lora_adapter 卸载（下标不复用，避开悬垂请求）*/
 } sgl_inst;
 
 typedef struct {
   int id;
   sgl_req_state state;
+  int priority;    /* 优先级（大者先 prefill；默认 0）*/
   int *prompt;
   int n_prompt;
   int *gen;       /* 已生成 token（不含 eos）*/
@@ -45,10 +47,14 @@ typedef struct {
   int inst;       /* 路由到的实例下标（0=base，≥1=lora）*/
   float *feats;   /* G8: 视觉 token embedding [n_img][E_lm]（sgl_xmalloc，prefill 后释放）*/
   int n_img;      /* G8: 视觉 token 数（0 = 纯文本）*/
+  /* G21：多图。img_at[] 是所有 `<image>` 占位符的位置（按出现顺序），
+   * n_place 是有几个占位符，per_img 是每张图占的视觉 token 数。*/
+  int img_at[8];
+  int n_place;
+  int per_img;
   /* G12: `<image>` 占位符在 prompt 里的位置。>=0 → 视觉 token 插在这里（原占位符
    * 那个 token 丢掉，位置 = img_at），其后的文本 token 顺延；-1 → 旧行为（接在
    * prompt 末尾，仅在没有占位符 token 时用）。 */
-  int img_at;
   /* P0-3/P0-4: 采样 logprob 与 chunked prefill 游标 */
   float *tok_lp;  /* 每个生成 token 的 logprob */
   int n_gen_lp;
@@ -82,6 +88,7 @@ struct sgl_scheduler {
   int *vh_len;
   int vh_vocab;
   int vh_ready;
+  int paused;      /* 1 = /pause_generation 生效中，step 不推进 */
   sgl_sched_stats stats;
 };
 
@@ -166,7 +173,7 @@ void sgl_sched_free(sgl_scheduler *s) {
 }
 
 static sgl_req *req_new(sgl_scheduler *s, const char *text, const int *ids, int n_ids, int max_new,
-                        const sgl_sampling_params *sp, int inst) {
+                        const sgl_sampling_params *sp, int inst, int priority) {
   if (s->n_reqs == s->cap_reqs) {
     s->cap_reqs *= 2;
     s->reqs = (sgl_req *)sgl_xrealloc(s->reqs, sizeof(sgl_req) * s->cap_reqs);
@@ -187,6 +194,7 @@ static sgl_req *req_new(sgl_scheduler *s, const char *text, const int *ids, int 
   r->sp = sp ? *sp : (sgl_sampling_params){0};
   r->rng = mix64((uint64_t)r->id * 0x9E3779B97F4A7C15ULL + 1);
   r->inst = inst;
+  r->priority = priority;
   r->cap_gen = r->max_new + 1;
   r->gen = (int *)sgl_xmalloc(sizeof(int) * (size_t)r->cap_gen);
   r->tok_lp = (float *)sgl_xmalloc(sizeof(float) * (size_t)r->cap_gen); /* P0-3 */
@@ -308,16 +316,19 @@ static int req_sample_append(sgl_scheduler *s, sgl_req *r, const float *logits) 
  *   [img_at+n_img, ...)     占位符之后的文本 token（位置顺延，RoPE 跟着变）
  * 无占位符（img_at < 0）时保持旧行为：尾巴为空，视觉 token 接在 prompt 末尾。*/
 typedef struct { int tail_from, tail_pos, vis_pos; } img_plan;
-static img_plan plan_img_insert(const sgl_req *r) {
+/* G21：第 j 张（共 n_place 张）图在「占位符序列」上的插入点位。
+ * 前一张图占掉 per_img 个位置，所以之后的文本位置整体后移 j*per_img。*/
+static img_plan plan_img_j(const sgl_req *r, int j) {
   img_plan p;
-  if (r->img_at >= 0) {
-    p.vis_pos = r->img_at;
-    p.tail_from = r->img_at + 1;
-    p.tail_pos = r->img_at + r->n_img;
+  int shift = j * r->per_img;
+  if (j < r->n_place) {
+    p.vis_pos = r->img_at[j] + shift;
+    p.tail_from = r->img_at[j] + 1;
+    p.tail_pos = p.vis_pos + r->per_img;
   } else {
-    p.vis_pos = r->n_prompt;
+    p.vis_pos = r->n_prompt + shift;
     p.tail_from = r->n_prompt; /* 尾巴为空 */
-    p.tail_pos = r->n_prompt + r->n_img;
+    p.tail_pos = p.vis_pos + r->per_img;
   }
   return p;
 }
@@ -368,23 +379,28 @@ static int prefill_step(sgl_scheduler *s, sgl_req *r) {
      * 在视觉 token 之后接着算（位置 = img_at + n_img 起），这样 RoPE 位置与
      * llava「把 <image> 换成一个视觉 token 块」完全一致。*/
     int from = r->prefill_pos;
-    int n_suf = r->n_prompt - from;
-    if (r->img_at >= 0 && from < r->img_at) n_suf = r->img_at - from;
-    if (n_suf > 0) {
-      if (sgl_model_prefill(m, r->prompt + from, n_suf, from, r->pages, lg) != 0) return -1;
-      s->stats.prefill_tokens += n_suf;
-    }
-    r->kv_len = from + n_suf;
-    img_plan pl = plan_img_insert(r);
-    if (sgl_model_prefill_emb(m, r->feats, r->n_img, pl.vis_pos, r->pages, lg) != 0) return -1;
-    s->stats.prefill_tokens += r->n_img;
-    r->kv_len = pl.vis_pos + r->n_img;
-    if (pl.tail_from < r->n_prompt) {
-      int ntail = r->n_prompt - pl.tail_from;
-      if (sgl_model_prefill(m, r->prompt + pl.tail_from, ntail, pl.tail_pos, r->pages, lg) != 0)
+    for (int j = 0; j < r->n_place; j++) {
+      int n_suf = r->img_at[j] - from;
+      if (n_suf > 0) {
+        int base = from + j * r->per_img;
+        if (sgl_model_prefill(m, r->prompt + from, n_suf, base, r->pages, lg) != 0) return -1;
+        s->stats.prefill_tokens += n_suf;
+        from = r->img_at[j];
+      }
+      img_plan pl = plan_img_j(r, j);
+      if (sgl_model_prefill_emb(m, r->feats + (long)j * r->per_img * sgl_model_hidden(m),
+                                r->per_img, pl.vis_pos, r->pages, lg) != 0)
         return -1;
+      s->stats.prefill_tokens += r->per_img;
+      r->kv_len = pl.vis_pos + r->per_img;
+      from = pl.tail_from;
+    }
+    if (from < r->n_prompt) {
+      int ntail = r->n_prompt - from;
+      int base = from + r->n_place * r->per_img;
+      if (sgl_model_prefill(m, r->prompt + from, ntail, base, r->pages, lg) != 0) return -1;
       s->stats.prefill_tokens += ntail;
-      r->kv_len = pl.tail_pos + ntail;
+      r->kv_len = base + ntail;
     }
     sgl_xfree(r->feats);
     r->feats = NULL;
@@ -408,14 +424,16 @@ static int prefill_step(sgl_scheduler *s, sgl_req *r) {
   return 0;
 }
 
-/* P0-4: 抢占一个运行中的非流式请求（释放 KV → 回到等待队列重算），
- * 优先抢生成得最少的（丢弃的进度最少）。0 = 没抢到。*/
+/* P0-4: 抢占一个运行中的非流式请求（释放 KV → 回到等待队列重算）。
+ * 优先级低的先被抢；同优先级抢生成得最少的（丢弃的进度最少）。0 = 没抢到。*/
 static int preempt_one(sgl_scheduler *s) {
   sgl_req *best = NULL;
   for (int i = 0; i < s->n_reqs; i++) {
     sgl_req *r = &s->reqs[i];
     if (r->state != SGL_REQ_RUNNING || r->streaming || !r->pages) continue;
-    if (!best || r->n_gen < best->n_gen) best = r;
+    if (!best || r->priority < best->priority ||
+        (r->priority == best->priority && r->n_gen < best->n_gen))
+      best = r;
   }
   if (!best) return 0;
   sgl_model *m = s->insts[best->inst].model;
@@ -434,6 +452,7 @@ static int preempt_one(sgl_scheduler *s) {
 }
 
 int sgl_sched_step(sgl_scheduler *s) {
+  if (!s || s->paused) return 0; /* /pause_generation：请求留在队列，KV 保留 */
   /* 1) 推进正在进行的 chunked prefill（P0-4）：每步一块，decode 不被长 prompt 堵死 */
   for (int i = 0; i < s->n_reqs; i++) {
     sgl_req *r = &s->reqs[i];
@@ -443,10 +462,16 @@ int sgl_sched_step(sgl_scheduler *s) {
     return 0;
   }
 
-  /* 2) 没有进行中的，就取最早的等待请求开始 prefill */
-  for (int i = 0; i < s->n_reqs; i++) {
-    sgl_req *r = &s->reqs[i];
-    if (r->state != SGL_REQ_WAITING) continue;
+  /* 2) 没有进行中的，就取优先级最高（同优先级取最早）的等待请求开始 prefill */
+  {
+    int best = -1;
+    for (int i = 0; i < s->n_reqs; i++) {
+      sgl_req *r = &s->reqs[i];
+      if (r->state != SGL_REQ_WAITING) continue;
+      if (best < 0 || r->priority > s->reqs[best].priority) best = i;
+    }
+    if (best < 0) goto decode_phase;
+    sgl_req *r = &s->reqs[best];
     int rc = prefill_begin(s, r);
     if (rc < 0) { r->state = SGL_REQ_DONE; r->n_gen = -1; return 0; }
     if (rc == 1) {
@@ -459,6 +484,8 @@ int sgl_sched_step(sgl_scheduler *s) {
     if (rc2 < 0) { r->state = SGL_REQ_DONE; r->n_gen = -1; }
     return 0;
   }
+
+decode_phase:
 
   /* 2) 批量 decode：逐实例把该实例运行中的请求组成一批各自前向
    *    （不同实例的权重不同，不能混入同一 batch）*/
@@ -637,7 +664,7 @@ sgl_sched_stats sgl_sched_get_stats(const sgl_scheduler *s) {
   st.pool_free = 0;
   st.n_replicas = 0;
   for (int k = 0; k < s->n_insts; k++) {
-    if (s->insts[k].name) continue;
+    if (s->insts[k].name || s->insts[k].dead) continue;
     st.n_replicas++;
     st.pool_pages += sgl_model_pool_pages(s->insts[k].model);
     st.pool_free += sgl_model_nfree(s->insts[k].model);
@@ -668,7 +695,7 @@ int sgl_sched_find_lora(const sgl_scheduler *s, const char *name) {
     /* P1 DP：在 base 副本里挑当前运行请求最少的（--dp N 时有多份）*/
     int best = 0, best_load = 1 << 30;
     for (int k = 0; k < s->n_insts; k++) {
-      if (s->insts[k].name) continue;
+      if (s->insts[k].name || s->insts[k].dead) continue;
       int load = 0;
       for (int i = 0; i < s->n_reqs; i++)
         if (s->reqs[i].state != SGL_REQ_DONE && s->reqs[i].inst == k) load++;
@@ -680,7 +707,7 @@ int sgl_sched_find_lora(const sgl_scheduler *s, const char *name) {
     return best;
   }
   for (int i = 1; i < s->n_insts; i++)
-    if (s->insts[i].name && strcmp(s->insts[i].name, name) == 0) return i;
+    if (s->insts[i].name && !s->insts[i].dead && strcmp(s->insts[i].name, name) == 0) return i;
   return -1;
 }
 
@@ -775,13 +802,13 @@ int sgl_sched_add_lora(sgl_scheduler *s, const char *name, const char *model_dir
 }
 
 static int submit_impl(sgl_scheduler *s, const char *text, const int *ids, int n_ids, int max_new,
-                       const sgl_sampling_params *sp, const char *lora, int streaming) {
+                       const sgl_sampling_params *sp, const char *lora, int streaming, int priority) {
   int inst = sgl_sched_find_lora(s, lora);
   if (inst < 0) {
     SGL_ERROR("submit: unknown lora '%s'", lora ? lora : "");
     return -1;
   }
-  sgl_req *r = req_new(s, text, ids, n_ids, max_new, sp, inst);
+  sgl_req *r = req_new(s, text, ids, n_ids, max_new, sp, inst, priority);
   if (!r) return -1;
   if (streaming) r->streaming = 1;
   int need = r->n_prompt + r->max_new + 1;
@@ -797,14 +824,19 @@ static int submit_impl(sgl_scheduler *s, const char *text, const int *ids, int n
 
 int sgl_sched_submit_lora(sgl_scheduler *s, const char *text, int max_new,
                           const sgl_sampling_params *sp, const char *lora) {
-  return submit_impl(s, text, NULL, 0, max_new, sp, lora, 0);
+  return submit_impl(s, text, NULL, 0, max_new, sp, lora, 0, 0);
+}
+
+int sgl_sched_submit_prio(sgl_scheduler *s, const char *text, int max_new,
+                          const sgl_sampling_params *sp, const char *lora, int priority) {
+  return submit_impl(s, text, NULL, 0, max_new, sp, lora, 0, priority);
 }
 
 /* P0-3: 直接给 token id 提交（不经 tokenizer）*/
 int sgl_sched_submit_ids(sgl_scheduler *s, const int *ids, int n_ids, int max_new,
                          const sgl_sampling_params *sp, const char *lora) {
   if (!s || !ids || n_ids <= 0) return -1;
-  return submit_impl(s, NULL, ids, n_ids, max_new, sp, lora, 0);
+  return submit_impl(s, NULL, ids, n_ids, max_new, sp, lora, 0, 0);
 }
 
 /* G8: 带视觉特征的提交。feats [n_img][E_lm] 的所有权转给调度器（sgl_xmalloc 分配，
@@ -813,20 +845,31 @@ int sgl_sched_submit_img(sgl_scheduler *s, const char *text, int max_new,
                          const sgl_sampling_params *sp, float *feats, int n_img) {
   if (!s || !feats || n_img <= 0) { sgl_xfree(feats); return -1; }
   int inst = 0;
-  sgl_req *r = req_new(s, text, NULL, 0, max_new, sp, inst);
+  sgl_req *r = req_new(s, text, NULL, 0, max_new, sp, inst, 0);
   if (!r) { sgl_xfree(feats); return -1; }
   r->feats = feats;
   r->n_img = n_img;
-  /* G12: 找 `<image>` 占位符 -> 视觉 token 插在那里。多个占位符时只用第一个（
-   * 多图仍然按顺序拼给同一个占位位置，同 llava 的一图一占位不同；见文档）。 */
-  r->img_at = -1;
+  /* G21（多图）：扫出所有 `<image>` 占位符，按出现顺序把图片依次插进去。
+   * 之前只取第一个占位符，多图全撑到同一个位置（README 的 Known limitations）。
+   * 每张图的 token 数必须一致（同一视觉塔、同一分辨率），否则退回单占位符行为。*/
+  r->n_place = 0;
+  r->per_img = n_img;
   if (s->img_tok >= 0) {
-    for (int i = 0; i < r->n_prompt; i++)
-      if (r->prompt[i] == s->img_tok) { r->img_at = i; break; }
+    for (int i = 0; i < r->n_prompt && r->n_place < 8; i++)
+      if (r->prompt[i] == s->img_tok) r->img_at[r->n_place++] = i;
+  }
+  if (r->n_place > 0) {
+    if (n_img % r->n_place == 0) {
+      r->per_img = n_img / r->n_place;
+    } else {
+      /* 图片数与占位符数对不上：只用第一个占位符（旧行为）*/
+      r->n_place = 1;
+      r->per_img = n_img;
+    }
   }
   if (getenv("SGL_IMG_DEBUG"))
-    SGL_INFO("img insert: img_tok=%d n_prompt=%d img_at=%d n_img=%d", s->img_tok,
-             r->n_prompt, r->img_at, n_img);
+    SGL_INFO("img insert: img_tok=%d n_prompt=%d places=%d per_img=%d n_img=%d", s->img_tok,
+             r->n_prompt, r->n_place, r->per_img, n_img);
   int need = r->n_prompt + n_img + r->max_new + 1;
   if (need > sgl_model_pool_pages(s->insts[inst].model)) {
     SGL_ERROR("submit_img: need %d pages > pool %d", need,
@@ -841,7 +884,7 @@ int sgl_sched_submit_img(sgl_scheduler *s, const char *text, int max_new,
 /* P1: 带 grammar 提交（不支持流式/图片；gram 所有权转给调度器）*/
 int sgl_sched_submit_grammar(sgl_scheduler *s, const char *text, int max_new,
                              const sgl_sampling_params *sp, const char *lora, sgl_grammar *gram) {
-  int id = submit_impl(s, text, NULL, 0, max_new, sp, lora, 0);
+  int id = submit_impl(s, text, NULL, 0, max_new, sp, lora, 0, 0);
   if (id < 0) {
     sgl_grammar_free(gram);
     return -1;
@@ -857,5 +900,60 @@ int sgl_sched_submit_grammar(sgl_scheduler *s, const char *text, int max_new,
 
 int sgl_sched_submit_stream_lora(sgl_scheduler *s, const char *text, int max_new,
                                  const sgl_sampling_params *sp, const char *lora) {
-  return submit_impl(s, text, NULL, 0, max_new, sp, lora, 1);
+  return submit_impl(s, text, NULL, 0, max_new, sp, lora, 1, 0);
+}
+
+int sgl_sched_submit_stream_prio(sgl_scheduler *s, const char *text, int max_new,
+                                 const sgl_sampling_params *sp, const char *lora, int priority) {
+  return submit_impl(s, text, NULL, 0, max_new, sp, lora, 1, priority);
+}
+
+/* ---- 生命周期：/pause_generation /continue_generation ---- */
+
+void sgl_sched_set_paused(sgl_scheduler *s, int paused) {
+  if (s) s->paused = paused ? 1 : 0;
+}
+
+int sgl_sched_is_paused(const sgl_scheduler *s) { return s ? s->paused : 0; }
+
+/* ---- tokenizer 直通（/tokenize /detokenize）---- */
+
+int *sgl_sched_encode(sgl_scheduler *s, const char *text, size_t len, int *n_out) {
+  if (!s || !text) return NULL;
+  int n = 0;
+  int *ids = sgl_tokenizer_encode(s->tok, text, len, &n);
+  if (n_out) *n_out = n;
+  return ids;
+}
+
+char *sgl_sched_decode(sgl_scheduler *s, const int *ids, int n) {
+  if (!s || !ids || n <= 0) return NULL;
+  return sgl_tokenizer_decode(s->tok, ids, n);
+}
+
+int sgl_sched_vocab_size(const sgl_scheduler *s) {
+  return s ? sgl_tokenizer_vocab_size(s->tok) : 0;
+}
+
+int sgl_sched_piece_id(const sgl_scheduler *s, const char *piece) {
+  return s ? sgl_tokenizer_piece_id(s->tok, piece) : -1;
+}
+
+/* ---- 运行时卸载 LoRA（/unload_lora_adapter）----
+ * 实例下标不复用（运行中/已完成未取走的请求还指着它），只把模型和 radix 释放并标 dead。*/
+int sgl_sched_remove_lora(sgl_scheduler *s, const char *name) {
+  if (!s || !name || !*name) return -1;
+  int k = sgl_sched_find_lora(s, name);
+  if (k <= 0) return -1;
+  for (int i = 0; i < s->n_reqs; i++)
+    if (s->reqs[i].state != SGL_REQ_DONE && s->reqs[i].inst == k) return -2;
+  sgl_radix_free(s->insts[k].radix);
+  sgl_model_free(s->insts[k].model);
+  s->insts[k].radix = NULL;
+  s->insts[k].model = NULL;
+  s->insts[k].dead = 1;
+  SGL_INFO("lora instance '%s' unloaded", name);
+  sgl_xfree(s->insts[k].name);
+  s->insts[k].name = NULL;
+  return 0;
 }

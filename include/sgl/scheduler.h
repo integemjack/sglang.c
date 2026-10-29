@@ -1,4 +1,4 @@
-﻿/* sgl/scheduler.h — 多请求调度器：连续批处理（prefill 优先 + 批量 decode）
+/* sgl/scheduler.h — 多请求调度器：连续批处理（prefill 优先 + 批量 decode）
  * 对应 sglang srt/managers/scheduler.py 的单机同步核心路径：
  *   - 到达的请求进等待队列（FIFO）
  *   - 每步优先 prefill 一个等待请求（对应 sglang 默认 prefill 优先策略）
@@ -117,6 +117,30 @@ int sgl_sched_submit_lora(sgl_scheduler *s, const char *text, int max_new,
                           const sgl_sampling_params *sp, const char *lora);
 int sgl_sched_submit_stream_lora(sgl_scheduler *s, const char *text, int max_new,
                                  const sgl_sampling_params *sp, const char *lora);
+
+/* ---- 优先级（对应上游 schedule_policy 的优先级队列）----
+ * priority 越大越先被 prefill；同优先级仍按到达顺序（FIFO）。默认 0。
+ * 抢占（preempt_one）也按优先级：先抢优先级最低、生成最少的。*/
+int sgl_sched_submit_prio(sgl_scheduler *s, const char *text, int max_new,
+                          const sgl_sampling_params *sp, const char *lora, int priority);
+int sgl_sched_submit_stream_prio(sgl_scheduler *s, const char *text, int max_new,
+                                 const sgl_sampling_params *sp, const char *lora, int priority);
+
+/* ---- 生命周期：/pause_generation /continue_generation /slow_down ----
+ * paused 时 step 不推进（请求留在队列里，KV 保留）。*/
+void sgl_sched_set_paused(sgl_scheduler *s, int paused);
+int sgl_sched_is_paused(const sgl_scheduler *s);
+
+/* ---- tokenizer 直通（/tokenize /detokenize）---- */
+int *sgl_sched_encode(sgl_scheduler *s, const char *text, size_t len, int *n_out);
+char *sgl_sched_decode(sgl_scheduler *s, const int *ids, int n);
+int sgl_sched_vocab_size(const sgl_scheduler *s);
+int sgl_sched_piece_id(const sgl_scheduler *s, const char *piece);
+
+/* ---- 运行时卸载 LoRA（/unload_lora_adapter）----
+ * 该实例还有未完成请求时返回 -2；没有该名字返回 -1；成功 0。
+ * 实现上是标记 dead 并释放模型/radix，实例下标不复用（避免运行中请求悬垂）。*/
+int sgl_sched_remove_lora(sgl_scheduler *s, const char *name);
 
 /* ---- G8 多模态（LLaVA 风格 embedding 级融合，CPU 路径）----
  * feats: [n_img][E_lm] 视觉 token（由调用方的视觉塔+projector 算好，sgl_xmalloc 分配），

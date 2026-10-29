@@ -1,4 +1,4 @@
-﻿/* sgl http 实现：winsock2 + 每连接一线程 + worker 驱动调度器 */
+/* sgl http 实现：winsock2 + 每连接一线程 + worker 驱动调度器 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/http.h"
 
@@ -87,6 +87,13 @@ struct sgl_http_server {
   sgl_jinja *jinja;            /* P0-2: 模型自带 chat_template（NULL = 回退 ChatML）*/
   sgl_bert *embed;             /* P2: embedding / rerank 模型（NULL = 未加载）*/
   char model_name[256];        /* 响应体里的 model 字段（模型目录 basename）*/
+  char model_dir[512];         /* 模型目录（/model_info、运行时 LoRA 需要）*/
+  int profiling;               /* /start_profile /stop_profile */
+  int step_delay_ms;           /* /slow_down 的每步延迟（0 = 不延迟）*/
+  /* /open_session 的登记表（C 版无 KV 持久化，只做会话名与统计的登记）*/
+  struct { char name[128]; long created; int n_req; } sessions[64];
+  int n_sessions;
+  long n_load_lora, n_unload_lora;
 };
 
 void sgl_http_set_vision(sgl_http_server *srv, sgl_http_vision_fn fn, void *ud) {
@@ -106,6 +113,7 @@ void sgl_http_set_chat_template(sgl_http_server *srv, const char *model_dir) {
     if (*p == '/' || *p == '\\') b = p + 1;
   snprintf(srv->model_name, sizeof(srv->model_name), "%s", b);
   if (!srv->jinja) SGL_INFO("http: no chat_template in %s, falling back to ChatML", model_dir);
+  snprintf(srv->model_dir, sizeof(srv->model_dir), "%s", model_dir);
 }
 
 /* ---------- 响应构造：动态字符串 + JSON 转义 ---------- */
@@ -183,7 +191,12 @@ static void respond_error(SOCKET fd, int code, const char *msg) {
   sb_puts(&b, "{\"error\":{\"message\":");
   sb_putjson(&b, msg);
   sb_puts(&b, "}}");
-  respond(fd, code, code == 404 ? "Not Found" : "Bad Request", b.buf);
+  const char *st = code == 404 ? "Not Found"
+                  : code == 501 ? "Not Implemented"
+                  : code == 409 ? "Conflict"
+                  : code == 503 ? "Service Unavailable"
+                  : "Bad Request";
+  respond(fd, code, st, b.buf);
   sgl_xfree(b.buf);
 }
 
@@ -298,12 +311,19 @@ static void *worker_fn(void *arg) {
       pthread_mutex_unlock(&srv->lock);
       continue;
     }
+    /* /pause_generation：请求留在队列里等（不空转烧 CPU）*/
+    if (sgl_sched_is_paused(srv->sched)) {
+      pthread_mutex_unlock(&srv->lock);
+      sgl_sleep_ms(20);
+      continue;
+    }
     sgl_sched_step(srv->sched);
     int id, n, npt, nhit; char *text; int *ids; float *lp = NULL; int nlp = 0;
     while (sgl_sched_poll_lp(srv->sched, &id, &text, &ids, &n, &npt, &nhit, &lp, &nlp))
       done_push(srv, id, text, ids, n, npt, lp, nlp);
     pthread_cond_broadcast(&srv->cv_done);
     pthread_mutex_unlock(&srv->lock);
+    if (srv->step_delay_ms > 0) sgl_sleep_ms(srv->step_delay_ms); /* /slow_down */
   }
   return NULL;
 }
@@ -699,7 +719,137 @@ static void handle_score(sgl_http_server *srv, SOCKET fd, const sgl_json *j) {
   sgl_xfree(b2);
 }
 
+/* ---------- 扩展端点：与上游 sglang 对齐的服务面 ----------
+ *
+ * 原则：能真干的就实现；C 版没有的后端（Ray/gRPC/hicache 分层/expert 分布/
+ * 权重 tensor 流式同步）返回 501 + 写清缺什么，绝不假装成功。
+ */
+
+/* 一次性生成：submit → 等完成 → 交回文本。成功 0。*/
+static int gen_once(sgl_http_server *srv, const char *prompt, int max_new,
+                    const sgl_sampling_params *sp, const char *lora, int priority,
+                    char **out, int *n_prompt, int *n_ids) {
+  pthread_mutex_lock(&srv->lock);
+  int id = sgl_sched_submit_prio(srv->sched, prompt, max_new, sp, lora, priority);
+  if (id < 0) { pthread_mutex_unlock(&srv->lock); return -1; }
+  pthread_cond_signal(&srv->cv_work);
+  pthread_mutex_unlock(&srv->lock);
+  done_item *d = wait_done(srv, id);
+  if (!d) return -1;
+  if (out) { *out = d->text; d->text = NULL; }
+  else sgl_xfree(d->text);
+  if (n_prompt) *n_prompt = d->prompt_tokens;
+  if (n_ids) *n_ids = d->n_ids;
+  sgl_xfree(d->ids);
+  sgl_xfree(d->lp);
+  sgl_xfree(d);
+  return 0;
+}
+
+/* messages[] → chat 模板（Jinja 优先；无模板时内置 ChatML，纯文本）*/
+static char *render_chat_simple(sgl_http_server *srv, const sgl_json *reqj, const sgl_json *msgs) {
+  if (srv->jinja) {
+    float *f = NULL; long nf = 0; int fr = 0, ni = 0; const char *err = NULL;
+    char *out = chat_render_template(srv, reqj, msgs, &f, &nf, &fr, &ni, &err);
+    sgl_xfree(f);
+    return out;
+  }
+  sbuf ml; sb_init(&ml);
+  for (int i = 0; i < msgs->count; i++) {
+    const sgl_json *m = msgs->items[i];
+    const char *role = sgl_json_get_str(m, "role", "user");
+    const sgl_json *cj = sgl_json_get(m, "content");
+    sb_puts(&ml, "<|im_start|>");
+    sb_puts(&ml, role);
+    sb_puts(&ml, "\n");
+    if (cj && cj->type == SGL_JSON_ARRAY) {
+      for (int k = 0; k < cj->count; k++) sb_puts(&ml, sgl_json_get_str(cj->items[k], "text", ""));
+    } else {
+      sb_puts(&ml, sgl_json_get_str(m, "content", ""));
+    }
+    sb_puts(&ml, "<|im_end|>\n");
+  }
+  sb_puts(&ml, "<|im_start|>assistant\n");
+  return ml.buf;
+}
+
+/* 把 input / messages 归一化成 messages JSON（Responses / Anthropic 两个端点共用）
+ *   - 字符串 → 单条 user
+ *   - 数组 → 每个元素的 role/content（content 可为字符串或 part 数组，取各 part 的 text）
+ *   - system 非空时在最前面插一条 system */
+static void mj_add_text(sbuf *m, int *first, const char *role, const char *text) {
+  sb_puts(m, *first ? "" : ",");
+  *first = 0;
+  sb_puts(m, "{\"role\":");
+  sb_putjson(m, role);
+  sb_puts(m, ",\"content\":");
+  sb_putjson(m, text ? text : "");
+  sb_puts(m, "}");
+}
+
+static sgl_json *build_msgs(const sgl_json *j, const char *key, const char *system) {
+  const sgl_json *in = sgl_json_get(j, key);
+  if (!in) return NULL;
+  sbuf m;
+  sb_init(&m);
+  sb_puts(&m, "[");
+  int first = 1;
+  if (system && *system) mj_add_text(&m, &first, "system", system);
+  if (in->type == SGL_JSON_STRING) {
+    mj_add_text(&m, &first, "user", in->str);
+  } else if (in->type == SGL_JSON_ARRAY) {
+    for (int i = 0; i < in->count; i++) {
+      const sgl_json *it = in->items[i];
+      if (it->type == SGL_JSON_STRING) { mj_add_text(&m, &first, "user", it->str); continue; }
+      if (it->type != SGL_JSON_OBJECT) continue;
+      const char *role = sgl_json_get_str(it, "role", "user");
+      const sgl_json *c = sgl_json_get(it, "content");
+      if (c && c->type == SGL_JSON_ARRAY) {
+        sbuf t;
+        sb_init(&t);
+        for (int k = 0; k < c->count; k++) sb_puts(&t, sgl_json_get_str(c->items[k], "text", ""));
+        mj_add_text(&m, &first, role, t.buf ? t.buf : "");
+        sgl_xfree(t.buf);
+      } else {
+        mj_add_text(&m, &first, role, sgl_json_get_str(it, "content", ""));
+      }
+    }
+  } else {
+    sgl_xfree(m.buf);
+    return NULL;
+  }
+  sb_puts(&m, "]");
+  sgl_json *out = sgl_json_parse(m.buf, m.len);
+  sgl_xfree(m.buf);
+  return out;
+}
+
+/* 收集 stop：字符串或字符串数组（最多 4 个，各限 128 字节）*/
+static void collect_stops(const sgl_json *j, const char *key, char str_stops[4][128], int *n) {
+  *n = 0;
+  const sgl_json *v = sgl_json_get(j, key);
+  if (!v) return;
+  if (v->type == SGL_JSON_STRING) {
+    snprintf(str_stops[0], 128, "%s", v->str);
+    *n = 1;
+  } else if (v->type == SGL_JSON_ARRAY) {
+    for (int i = 0; i < v->count && *n < 4; i++)
+      if (v->items[i]->type == SGL_JSON_STRING) snprintf(str_stops[(*n)++], 128, "%s", v->items[i]->str);
+  }
+}
+
+/* 上游有、C 版确实没有后端支撑的端点：501 + 一句人话*/
+static void not_impl(SOCKET fd, const char *what, const char *why) {
+  char msg[384];
+  snprintf(msg, sizeof(msg), "%s: not implemented in sglang-c (%s)", what, why);
+  respond_error(fd, 501, msg);
+}
+
+/* 扩展端点入口。返回 1 = 已处理（route 直接返回）。*/
+static int handle_extended(sgl_http_server *srv, SOCKET fd, const http_req *req);
+
 static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
+  if (handle_extended(srv, fd, req)) return;
   /* ---------- 只读/管理端点（P1，与上游 sglang 同名）---------- */
   if (strcmp(req->method, "GET") == 0) {
     if (!strcmp(req->path, "/health")) {
@@ -835,6 +985,8 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
 
   sgl_json *j = sgl_json_parse(req->body, req->body_len);
   if (!j) { respond_error(fd, 400, "invalid JSON body"); return; }
+  /* 优先级（上游 schedule_policy 的 priority；缺省 0）*/
+  int prio = sgl_json_get_int(j, "priority", 0);
 
   /* 可选顶层字段 "lora":"name"：路由到启动时 --lora 加载的 adapter 实例
    * （/generate 与 /v1/chat/completions 及 /v1/completions 均支持；未知名 → 400）*/
@@ -947,7 +1099,7 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     }
     parse_sampling_json(j, &sp, &max_new, 256, 4096);
     want_lp = json_bool(j, "logprobs") || sgl_json_get_int(j, "top_logprobs", 0) > 0;
-    is_stream = chat && json_bool(j, "stream");
+    is_stream = json_bool(j, "stream"); /* 2026-10-29: /v1/completions 也真流式（原来只有 chat 流）*/
     parse_stops(j, stops, &n_stops);
     n_choices = sgl_json_get_int(j, "n", 1);
     if (is_stream && n_choices != 1) {
@@ -962,6 +1114,8 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     text = chatml;
   } else if (openai) {
     text = sgl_json_get_str(j, "prompt", NULL);
+    /* 2026-10-29: /v1/completions 也真流式（原来只是忽略了 stream）*/
+    is_stream = json_bool(j, "stream");
     /* P0-3: prompt 也可以是 token id 数组 */
     const sgl_json *pj = sgl_json_get(j, "prompt");
     if (pj && pj->type == SGL_JSON_ARRAY) {
@@ -972,6 +1126,12 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     }
     parse_sampling_json(j, &sp, &max_new, 16, 1024);
     want_lp = json_bool(j, "logprobs") || sgl_json_get_int(j, "logprobs", 0) > 0;
+    if (is_stream && n_choices > 1) {
+      sgl_json_free(j);
+      sgl_xfree(prompt_ids);
+      respond_error(fd, 400, "stream only supports n=1");
+      return;
+    }
     parse_stops(j, stops, &n_stops);
     n_choices = sgl_json_get_int(j, "n", 1);
     if (n_choices < 1) n_choices = 1;
@@ -1078,10 +1238,12 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     sgl_sampling_params spi = sp;
     if (i > 0) spi.seed = sp.seed ? sp.seed + (uint64_t)i : (uint64_t)(0x1234 + i);
     ids[i] = is_stream
-        ? sgl_sched_submit_stream_lora(srv->sched, text, max_new, &spi, lor)
+        ? (prio ? sgl_sched_submit_stream_prio(srv->sched, text, max_new, &spi, lor, prio)
+                : sgl_sched_submit_stream_lora(srv->sched, text, max_new, &spi, lor))
         : feats ? sgl_sched_submit_img(srv->sched, text, max_new, &spi, feats, n_img_tok)
         : gram ? sgl_sched_submit_grammar(srv->sched, text, max_new, &spi, lor, gram)
         : n_prompt_ids > 0 ? sgl_sched_submit_ids(srv->sched, prompt_ids, n_prompt_ids, max_new, &spi, lor)
+        : prio ? sgl_sched_submit_prio(srv->sched, text, max_new, &spi, lor, prio)
                 : sgl_sched_submit_lora(srv->sched, text, max_new, &spi, lor);
     if (gram) gram = NULL; /* 所有权已转给调度器 */
     if (feats) feats = NULL; /* 所有权已转给调度器（失败时 submit_img 自己回收）*/
@@ -1104,7 +1266,7 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     long seq = ++srv->req_counter;
     pthread_mutex_unlock(&srv->lock);
     char idbuf[64];
-    snprintf(idbuf, sizeof(idbuf), "chatcmpl-%ld", seq);
+    snprintf(idbuf, sizeof(idbuf), "%s-%ld", chat ? "chatcmpl" : "cmpl", seq);
     long created = (long)time(NULL);
     for (;;) {
       char *piece = NULL;
@@ -1117,11 +1279,20 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
         sb_init(&b);
         sb_puts(&b, "data: {\"id\":\"");
         sb_puts(&b, idbuf);
-        char head[128];
-        snprintf(head, sizeof(head), "\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"sglang-c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":", created);
+        char head[160];
+        if (chat)
+          snprintf(head, sizeof(head),
+                   "\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
+                   "\"choices\":[{\"index\":0,\"delta\":{\"content\":",
+                   created, srv->model_name[0] ? srv->model_name : "sglang-c");
+        else
+          snprintf(head, sizeof(head),
+                   "\",\"object\":\"text_completion\",\"created\":%ld,\"model\":\"%s\","
+                   "\"choices\":[{\"index\":0,\"text\":",
+                   created, srv->model_name[0] ? srv->model_name : "sglang-c");
         sb_puts(&b, head);
         sb_putjson(&b, piece ? piece : "");
-        sb_puts(&b, "},\"finish_reason\":null}]}\n\n");
+        sb_puts(&b, chat ? "},\"finish_reason\":null}]}\n\n" : ",\"finish_reason\":null}]}\n\n");
         send(fd, b.buf, (int)b.len, 0);
         sgl_xfree(b.buf);
         sgl_xfree(piece);
@@ -1130,8 +1301,21 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
         sb_init(&b);
         sb_puts(&b, "data: {\"id\":\"");
         sb_puts(&b, idbuf);
-        char tail[192];
-        snprintf(tail, sizeof(tail), "\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"sglang-c\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", created);
+        char tail[256];
+        if (chat)
+          snprintf(tail, sizeof(tail),
+                   "\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
+                   "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\n"
+                   "data: [DONE]\n\n",
+                   created, srv->model_name[0] ? srv->model_name : "sglang-c",
+                   "stop");
+        else
+          snprintf(tail, sizeof(tail),
+                   "\",\"object\":\"text_completion\",\"created\":%ld,\"model\":\"%s\","
+                   "\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"%s\"}]}\n\n"
+                   "data: [DONE]\n\n",
+                   created, srv->model_name[0] ? srv->model_name : "sglang-c",
+                   "stop");
         sb_puts(&b, tail);
         send(fd, b.buf, (int)b.len, 0);
         sgl_xfree(b.buf);
@@ -1320,6 +1504,603 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
   }
 }
 
+/* 扩展端点实现（对照上游 http_server.py 的路由表）。 */
+static int handle_extended(sgl_http_server *srv, SOCKET fd, const http_req *req) {
+  int is_get = strcmp(req->method, "GET") == 0;
+  int is_post = strcmp(req->method, "POST") == 0;
+  const char *p = req->path;
+
+  /* ---- 分词：/tokenize /v1/tokenize /detokenize /v1/detokenize /encode ---- */
+  if (is_post && (!strcmp(p, "/tokenize") || !strcmp(p, "/v1/tokenize"))) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    const char *text = j ? sgl_json_get_str(j, "text", sgl_json_get_str(j, "prompt", NULL)) : NULL;
+    if (!text) {
+      if (j) sgl_json_free(j);
+      respond_error(fd, 400, "\"text\" (or \"prompt\") required");
+      return 1;
+    }
+    int n = 0;
+    int *ids = sgl_sched_encode(srv->sched, text, strlen(text), &n);
+    sbuf b;
+    sb_init(&b);
+    sb_puts(&b, "{\"tokens\":[");
+    for (int i = 0; i < n; i++) {
+      char t[16];
+      snprintf(t, sizeof(t), "%s%d", i ? "," : "", ids[i]);
+      sb_puts(&b, t);
+    }
+    char tail[64];
+    snprintf(tail, sizeof(tail), "],\"count\":%d}", n);
+    sb_puts(&b, tail);
+    respond(fd, 200, "OK", b.buf);
+    sgl_xfree(b.buf);
+    sgl_xfree(ids);
+    sgl_json_free(j);
+    return 1;
+  }
+  if (is_post && (!strcmp(p, "/detokenize") || !strcmp(p, "/v1/detokenize"))) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    const sgl_json *t = j ? sgl_json_get(j, "tokens") : NULL;
+    if (!t) t = j ? sgl_json_get(j, "input_ids") : NULL;
+    if (!t || t->type != SGL_JSON_ARRAY) {
+      if (j) sgl_json_free(j);
+      respond_error(fd, 400, "\"tokens\" array required");
+      return 1;
+    }
+    int n = t->count;
+    int *ids = (int *)sgl_xmalloc(sizeof(int) * (size_t)(n > 0 ? n : 1));
+    int m = 0;
+    for (int i = 0; i < n; i++)
+      if (t->items[i]->type == SGL_JSON_NUMBER) ids[m++] = (int)t->items[i]->num;
+    char *txt = sgl_sched_decode(srv->sched, ids, m);
+    sbuf b;
+    sb_init(&b);
+    sb_puts(&b, "{\"text\":");
+    sb_putjson(&b, txt ? txt : "");
+    sb_puts(&b, "}");
+    respond(fd, 200, "OK", b.buf);
+    sgl_xfree(b.buf);
+    sgl_xfree(txt);
+    sgl_xfree(ids);
+    sgl_json_free(j);
+    return 1;
+  }
+  if (is_post && !strcmp(p, "/encode")) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    const char *text = j ? sgl_json_get_str(j, "text", sgl_json_get_str(j, "input", NULL)) : NULL;
+    if (!text) {
+      if (j) sgl_json_free(j);
+      respond_error(fd, 400, "\"text\" required");
+      return 1;
+    }
+    int n = 0;
+    int *ids = sgl_sched_encode(srv->sched, text, strlen(text), &n);
+    sbuf b;
+    sb_init(&b);
+    sb_puts(&b, "{\"input_ids\":[");
+    for (int i = 0; i < n; i++) {
+      char t[16];
+      snprintf(t, sizeof(t), "%s%d", i ? "," : "", ids[i]);
+      sb_puts(&b, t);
+    }
+    char tail[96];
+    snprintf(tail, sizeof(tail), "],\"length\":%d,\"attention_mask\":%d}" , n, n);
+    sb_puts(&b, tail);
+    respond(fd, 200, "OK", b.buf);
+    sgl_xfree(b.buf);
+    sgl_xfree(ids);
+    sgl_json_free(j);
+    return 1;
+  }
+  if (is_post && !strcmp(p, "/v1/messages/count_tokens")) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    const sgl_json *msgs = j ? sgl_json_get(j, "messages") : NULL;
+    if (!msgs || msgs->type != SGL_JSON_ARRAY) {
+      if (j) sgl_json_free(j);
+      respond_error(fd, 400, "\"messages\" array required");
+      return 1;
+    }
+    char *ml = render_chat_simple(srv, j, msgs);
+    int n = 0;
+    int *ids = ml ? sgl_sched_encode(srv->sched, ml, strlen(ml), &n) : NULL;
+    char out[96];
+    snprintf(out, sizeof(out), "{\"input_tokens\":%d}", n);
+    respond(fd, 200, "OK", out);
+    sgl_xfree(ids);
+    sgl_xfree(ml);
+    sgl_json_free(j);
+    return 1;
+  }
+
+  /* ---- 解析工具：/separate_reasoning /parse_function_call ---- */
+  if (is_post && (!strcmp(p, "/separate_reasoning") || !strcmp(p, "/parse_function_call"))) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    const char *text = j ? sgl_json_get_str(j, "text", NULL) : NULL;
+    if (!text) {
+      if (j) sgl_json_free(j);
+      respond_error(fd, 400, "\"text\" required");
+      return 1;
+    }
+    sbuf b;
+    sb_init(&b);
+    if (!strcmp(p, "/parse_function_call")) {
+      int n = 0;
+      char *calls = sgl_parse_tool_calls(text, &n);
+      sb_puts(&b, "{\"tool_calls\":");
+      sb_puts(&b, calls ? calls : "[]");
+      sb_puts(&b, "}");
+      sgl_xfree(calls);
+    } else {
+      char *reason = NULL;
+      const char *body = NULL;
+      int had = sgl_parse_reasoning(text, &reason, &body, NULL);
+      sb_puts(&b, "{\"reasoning_content\":");
+      sb_putjson(&b, had && reason ? reason : "");
+      sb_puts(&b, ",\"content\":");
+      sb_putjson(&b, body ? body : text);
+      sb_puts(&b, "}");
+      sgl_xfree(reason);
+    }
+    respond(fd, 200, "OK", b.buf);
+    sgl_xfree(b.buf);
+    sgl_json_free(j);
+    return 1;
+  }
+
+  /* ---- 生命周期与运维开关 ---- */
+  if (is_post && !strcmp(p, "/pause_generation")) {
+    sgl_sched_set_paused(srv->sched, 1);
+    respond(fd, 200, "OK", "{\"success\":true,\"paused\":true}");
+    return 1;
+  }
+  if (is_post && !strcmp(p, "/continue_generation")) {
+    sgl_sched_set_paused(srv->sched, 0);
+    pthread_mutex_lock(&srv->lock);
+    pthread_cond_broadcast(&srv->cv_work);
+    pthread_mutex_unlock(&srv->lock);
+    respond(fd, 200, "OK", "{\"success\":true,\"paused\":false}");
+    return 1;
+  }
+  if (is_post && !strcmp(p, "/slow_down")) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    int ms = j ? sgl_json_get_int(j, "delay_ms", sgl_json_get_int(j, "ms", 0)) : 0;
+    if (ms < 0) ms = 0;
+    if (ms > 1000) ms = 1000;
+    srv->step_delay_ms = ms;
+    sgl_json_free(j);
+    char out[64];
+    snprintf(out, sizeof(out), "{\"success\":true,\"delay_ms\":%d}", ms);
+    respond(fd, 200, "OK", out);
+    return 1;
+  }
+  if (is_post && (!strcmp(p, "/start_profile") || !strcmp(p, "/stop_profile"))) {
+    srv->profiling = p[1] == 's' && p[2] == 't' && p[3] == 'a'; /* start_* */
+    char out[64];
+    snprintf(out, sizeof(out), "{\"success\":true,\"profiling\":%s}",
+             srv->profiling ? "true" : "false");
+    respond(fd, 200, "OK", out);
+    return 1;
+  }
+  if (is_post && !strcmp(p, "/release_memory_occupation")) {
+    /* C 版权重与 KV 同进程、无分层后端；能释放的是 RadixCache 里的 KV 页 */
+    sgl_sched_flush_cache(srv->sched);
+    respond(fd, 200, "OK", "{\"success\":true,\"released\":[\"radix_cache\"]}");
+    return 1;
+  }
+  if (is_post && !strcmp(p, "/resume_memory_occupation")) {
+    respond(fd, 200, "OK", "{\"success\":true}");
+    return 1;
+  }
+
+  /* ---- 会话登记（/open_session /close_session）---- */
+  if (is_post && (!strcmp(p, "/open_session") || !strcmp(p, "/close_session"))) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    const char *name = j ? sgl_json_get_str(j, "session", sgl_json_get_str(j, "name", "")) : "";
+    int open = !strcmp(p, "/open_session");
+    int found = -1;
+    for (int i = 0; i < srv->n_sessions; i++)
+      if (!strcmp(srv->sessions[i].name, name)) { found = i; break; }
+    if (open) {
+      if (found < 0 && srv->n_sessions < 64) {
+        found = srv->n_sessions++;
+        snprintf(srv->sessions[found].name, sizeof(srv->sessions[found].name), "%s", name);
+        srv->sessions[found].created = (long)time(NULL);
+        srv->sessions[found].n_req = 0;
+      }
+      if (found < 0) { sgl_json_free(j); respond_error(fd, 400, "too many sessions (64 max)"); return 1; }
+      char out[160];
+      snprintf(out, sizeof(out), "{\"success\":true,\"session\":%s,\"session_id\":\"%s\",\"note\":\"registration only: sglang-c keeps no cross-request KV\"}",
+               name[0] ? "true" : "false", srv->sessions[found].name);
+      respond(fd, 200, "OK", out);
+    } else {
+      if (found >= 0) {
+        for (int i = found; i < srv->n_sessions - 1; i++) srv->sessions[i] = srv->sessions[i + 1];
+        srv->n_sessions--;
+      }
+      respond(fd, 200, "OK", "{\"success\":true}");
+    }
+    sgl_json_free(j);
+    return 1;
+  }
+
+  /* ---- 运行时 LoRA（启动时 --lora 之外的增删）---- */
+  if (is_post && (!strcmp(p, "/load_lora_adapter") || !strcmp(p, "/unload_lora_adapter"))) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    const char *name = j ? sgl_json_get_str(j, "lora_name", sgl_json_get_str(j, "name", NULL)) : NULL;
+    if (!name || !*name) {
+      if (j) sgl_json_free(j);
+      respond_error(fd, 400, "\"lora_name\" required");
+      return 1;
+    }
+    int rc = -1;
+    if (!strcmp(p, "/load_lora_adapter")) {
+      const char *path = j ? sgl_json_get_str(j, "lora_path", NULL) : NULL;
+      if (!path) {
+        sgl_json_free(j);
+        respond_error(fd, 400, "\"lora_path\" required");
+        return 1;
+      }
+      if (!srv->model_dir[0]) {
+        sgl_json_free(j);
+        respond_error(fd, 500, "server has no base model dir");
+        return 1;
+      }
+      rc = sgl_sched_add_lora(srv->sched, name, srv->model_dir, path);
+      if (rc >= 0) srv->n_load_lora++;
+    } else {
+      rc = sgl_sched_remove_lora(srv->sched, name);
+      if (rc == 0) srv->n_unload_lora++;
+    }
+    sgl_json_free(j);
+    if (rc >= 0) respond(fd, 200, "OK", "{\"success\":true}");
+    else if (rc == -2) respond_error(fd, 409, "adapter busy (in-flight requests on this instance)");
+    else respond_error(fd, 400, "load/unload failed (duplicate name, unknown name, or bad path)");
+    return 1;
+  }
+
+  /* ---- /model_info（GET）：模型目录与 config.json 原文 ---- */
+  if (is_get && !strcmp(p, "/model_info")) {
+    sbuf b;
+    sb_init(&b);
+    sb_puts(&b, "{\"model_path\":");
+    sb_putjson(&b, srv->model_dir);
+    sb_puts(&b, ",\"model_name\":");
+    sb_putjson(&b, srv->model_name);
+    sb_puts(&b, ",\"config\":");
+    char path[600];
+    snprintf(path, sizeof(path), "%s/config.json", srv->model_dir);
+    FILE *f = srv->model_dir[0] ? fopen(path, "rb") : NULL;
+    if (f) {
+      fseek(f, 0, SEEK_END);
+      long n = ftell(f);
+      fseek(f, 0, SEEK_SET);
+      if (n > 0 && n < 262144) {
+        char *txt = (char *)sgl_xmalloc((size_t)n + 1);
+        size_t got = fread(txt, 1, (size_t)n, f);
+        txt[got] = 0;
+        sb_puts(&b, txt);
+        sgl_xfree(txt);
+      } else {
+        sb_puts(&b, "null");
+      }
+      fclose(f);
+    } else {
+      sb_puts(&b, "null");
+    }
+    sb_puts(&b, "}");
+    respond(fd, 200, "OK", b.buf);
+    sgl_xfree(b.buf);
+    return 1;
+  }
+
+  /* ---- /v1/responses（OpenAI Responses API，非流式）---- */
+  if (is_post && !strcmp(p, "/v1/responses")) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    if (!j) { respond_error(fd, 400, "invalid JSON body"); return 1; }
+    if (json_bool(j, "stream")) {
+      sgl_json_free(j);
+      respond_error(fd, 501, "/v1/responses stream=true: use /v1/chat/completions with stream=true");
+      return 1;
+    }
+    sgl_json *msgs = build_msgs(j, "input", sgl_json_get_str(j, "instructions", NULL));
+    if (!msgs) { sgl_json_free(j); respond_error(fd, 400, "\"input\" required (string or messages array)"); return 1; }
+    char *ml = render_chat_simple(srv, j, msgs);
+    if (!ml) { sgl_json_free(msgs); sgl_json_free(j); respond_error(fd, 400, "chat template render failed"); return 1; }
+    sgl_sampling_params sp;
+    memset(&sp, 0, sizeof(sp));
+    int max_new = 256;
+    parse_sampling_json(j, &sp, &max_new, 256, 4096);
+    char str_stops[4][128];
+    int n_stops = 0;
+    collect_stops(j, "stop", str_stops, &n_stops);
+    char *out = NULL;
+    int npt = 0, ngen = 0;
+    if (gen_once(srv, ml, max_new, &sp, NULL, 0, &out, &npt, &ngen) != 0) {
+      sgl_xfree(ml); sgl_json_free(msgs); sgl_json_free(j);
+      respond_error(fd, 500, "generation failed");
+      return 1;
+    }
+    if (out && n_stops > 0) apply_stops(str_stops, n_stops, out);
+    sbuf b;
+    sb_init(&b);
+    pthread_mutex_lock(&srv->lock);
+    long seq = ++srv->req_counter;
+    pthread_mutex_unlock(&srv->lock);
+    char head[256];
+    snprintf(head, sizeof(head),
+             "{\"id\":\"resp_%ld\",\"object\":\"response\",\"created_at\":%ld,\"status\":\"completed\",\"model\":\"%s\",",
+             seq, (long)time(NULL), srv->model_name[0] ? srv->model_name : "sglang-c");
+    sb_puts(&b, head);
+    sb_puts(&b, "\"output\":[{\"id\":\"msg_");
+    { char t[32]; snprintf(t, sizeof(t), "%ld", seq); sb_puts(&b, t); }
+    sb_puts(&b, "\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":");
+    sb_putjson(&b, out ? out : "");
+    sb_puts(&b, ",\"annotations\":[]}]}],\"usage\":{");
+    char u[160];
+    snprintf(u, sizeof(u), "\"input_tokens\":%d,\"output_tokens\":%d,\"total_tokens\":%d}}", npt, ngen, npt + ngen);
+    sb_puts(&b, u);
+    respond(fd, 200, "OK", b.buf);
+    sgl_xfree(b.buf);
+    sgl_xfree(out);
+    sgl_xfree(ml);
+    sgl_json_free(msgs);
+    sgl_json_free(j);
+    return 1;
+  }
+
+  /* ---- /v1/messages（Anthropic Messages API，含 SSE 流式）---- */
+  if (is_post && !strcmp(p, "/v1/messages")) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    if (!j) { respond_error(fd, 400, "invalid JSON body"); return 1; }
+    const char *system = sgl_json_get_str(j, "system", NULL);
+    sgl_json *msgs = build_msgs(j, "messages", system);
+    if (!msgs) { sgl_json_free(j); respond_error(fd, 400, "\"messages\" array required"); return 1; }
+    char *ml = render_chat_simple(srv, j, msgs);
+    if (!ml) { sgl_json_free(msgs); sgl_json_free(j); respond_error(fd, 400, "chat template render failed"); return 1; }
+    sgl_sampling_params sp;
+    memset(&sp, 0, sizeof(sp));
+    int max_new = sgl_json_get_int(j, "max_tokens", 256);
+    if (max_new <= 0 || max_new > 4096) max_new = 256;
+    parse_sampling_json(j, &sp, &max_new, max_new, 4096);
+    char str_stops[4][128];
+    int n_stops = 0;
+    collect_stops(j, "stop_sequences", str_stops, &n_stops);
+    int stream = json_bool(j, "stream");
+    pthread_mutex_lock(&srv->lock);
+    long seq = ++srv->req_counter;
+    pthread_mutex_unlock(&srv->lock);
+    char mid[64];
+    snprintf(mid, sizeof(mid), "msg_%ld", seq);
+    const char *model = srv->model_name[0] ? srv->model_name : "sglang-c";
+    if (stream) {
+      pthread_mutex_lock(&srv->lock);
+      int id = sgl_sched_submit_stream_prio(srv->sched, ml, max_new, &sp, NULL, 0);
+      if (id < 0) { pthread_mutex_unlock(&srv->lock); sgl_xfree(ml); sgl_json_free(msgs); sgl_json_free(j); respond_error(fd, 500, "submit failed"); return 1; }
+      pthread_cond_signal(&srv->cv_work);
+      pthread_mutex_unlock(&srv->lock);
+      respond_open_stream(fd);
+      sbuf b;
+      sb_init(&b);
+      sb_puts(&b, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"");
+      sb_puts(&b, mid);
+      sb_puts(&b, "\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"");
+      sb_puts(&b, model);
+      sb_puts(&b, "\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n");
+      sb_puts(&b, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+      send_all(fd, b.buf, b.len);
+      sgl_xfree(b.buf);
+      int ngen = 0;
+      for (;;) {
+        char *piece = NULL;
+        int tid = 0;
+        pthread_mutex_lock(&srv->lock);
+        sgl_stream_ev ev = sgl_sched_stream_next(srv->sched, id, &piece, &tid);
+        pthread_mutex_unlock(&srv->lock);
+        if (ev == SGL_STREAM_TOKEN) {
+          sbuf d;
+          sb_init(&d);
+          sb_puts(&d, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":");
+          sb_putjson(&d, piece ? piece : "");
+          sb_puts(&d, "}}\n\n");
+          send_all(fd, d.buf, d.len);
+          sgl_xfree(d.buf);
+          sgl_xfree(piece);
+          ngen++;
+        } else if (ev == SGL_STREAM_DONE) {
+          pthread_mutex_lock(&srv->lock);
+          sgl_sched_reclaim_stream(srv->sched, id);
+          pthread_mutex_unlock(&srv->lock);
+          break;
+        } else {
+          sgl_sleep_ms(20);
+        }
+      }
+      sbuf e;
+      sb_init(&e);
+      sb_puts(&e, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+      sb_puts(&e, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":");
+      sb_puts(&e, ngen >= max_new ? "\"max_tokens\"" : "\"end_turn\"");
+      sb_puts(&e, ",\"stop_sequence\":null},\"usage\":{\"output_tokens\":");
+      { char t[24]; snprintf(t, sizeof(t), "%d", ngen); sb_puts(&e, t); }
+      sb_puts(&e, "}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+      send_all(fd, e.buf, e.len);
+      sgl_xfree(e.buf);
+      sgl_xfree(ml);
+      sgl_json_free(msgs);
+      sgl_json_free(j);
+      return 1;
+    }
+    char *out = NULL;
+    int npt = 0, ngen = 0;
+    if (gen_once(srv, ml, max_new, &sp, NULL, 0, &out, &npt, &ngen) != 0) {
+      sgl_xfree(ml); sgl_json_free(msgs); sgl_json_free(j);
+      respond_error(fd, 500, "generation failed");
+      return 1;
+    }
+    int nstop = 0;
+    if (out && n_stops > 0) nstop = apply_stops(str_stops, n_stops, out);
+    sbuf b;
+    sb_init(&b);
+    sb_puts(&b, "{\"id\":\"");
+    sb_puts(&b, mid);
+    sb_puts(&b, "\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"");
+    sb_puts(&b, model);
+    sb_puts(&b, "\",\"content\":[{\"type\":\"text\",\"text\":");
+    sb_putjson(&b, out ? out : "");
+    sb_puts(&b, "}],\"stop_reason\":");
+    sb_puts(&b, nstop ? "\"stop_sequence\"" : (ngen >= max_new ? "\"max_tokens\"" : "\"end_turn\""));
+    sb_puts(&b, ",\"stop_sequence\":null,\"usage\":{");
+    char u[160];
+    snprintf(u, sizeof(u), "\"input_tokens\":%d,\"output_tokens\":%d}}", npt, ngen);
+    sb_puts(&b, u);
+    respond(fd, 200, "OK", b.buf);
+    sgl_xfree(b.buf);
+    sgl_xfree(out);
+    sgl_xfree(ml);
+    sgl_json_free(msgs);
+    sgl_json_free(j);
+    return 1;
+  }
+
+  /* ---- Ollama（/api/tags /api/show /api/generate /api/chat）---- */
+  if (is_get && !strcmp(p, "/api/tags")) {
+    sbuf b;
+    sb_init(&b);
+    sb_puts(&b, "{\"models\":[{\"name\":");
+    sb_putjson(&b, srv->model_name[0] ? srv->model_name : "sglang-c");
+    sb_puts(&b, ",\"model\":");
+    sb_putjson(&b, srv->model_name[0] ? srv->model_name : "sglang-c");
+    sb_puts(&b, ",\"modified_at\":\"1970-01-01T00:00:00Z\",\"size\":0,\"digest\":\"\","
+                 "\"details\":{\"format\":\"safetensors\",\"family\":\"\",\"families\":null,"
+                 "\"parameter_size\":\"\",\"quantization_level\":\"\"}}]}");
+    respond(fd, 200, "OK", b.buf);
+    sgl_xfree(b.buf);
+    return 1;
+  }
+  if (is_post && !strcmp(p, "/api/show")) {
+    sbuf b;
+    sb_init(&b);
+    sb_puts(&b, "{\"modelfile\":\"# sglang-c\",\"parameters\":\"\",\"template\":");
+    sb_putjson(&b, srv->jinja ? sgl_jinja_source(srv->jinja) : "");
+    sb_puts(&b, ",\"details\":{\"format\":\"safetensors\",\"family\":\"\",\"families\":null,"
+                 "\"parameter_size\":\"\",\"quantization_level\":\"\"},\"model_info\":{}}");
+    respond(fd, 200, "OK", b.buf);
+    sgl_xfree(b.buf);
+    return 1;
+  }
+  if (is_post && (!strcmp(p, "/api/generate") || !strcmp(p, "/invocations"))) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    if (!j) { respond_error(fd, 400, "invalid JSON body"); return 1; }
+    const char *prompt = sgl_json_get_str(j, "prompt", sgl_json_get_str(j, "inputs", NULL));
+    if (!prompt) { sgl_json_free(j); respond_error(fd, 400, "\"prompt\" (or \"inputs\") required"); return 1; }
+    sgl_sampling_params sp;
+    memset(&sp, 0, sizeof(sp));
+    int max_new = 256;
+    parse_sampling_json(j, &sp, &max_new, 256, 4096);
+    char *out = NULL;
+    int npt = 0, ngen = 0;
+    int rc = gen_once(srv, prompt, max_new, &sp, NULL, 0, &out, &npt, &ngen);
+    sgl_json_free(j);
+    if (rc != 0) { respond_error(fd, 500, "generation failed"); return 1; }
+    sbuf b;
+    sb_init(&b);
+    if (!strcmp(p, "/invocations")) {
+      sb_puts(&b, "{\"generated_text\":");
+      sb_putjson(&b, out ? out : "");
+      sb_puts(&b, "}");
+    } else {
+      sb_puts(&b, "{\"model\":");
+      sb_putjson(&b, srv->model_name[0] ? srv->model_name : "sglang-c");
+      sb_puts(&b, ",\"created_at\":\"1970-01-01T00:00:00Z\",\"response\":");
+      sb_putjson(&b, out ? out : "");
+      sb_puts(&b, ",\"done\":true,\"done_reason\":\"stop\",\"context\":[],");
+      char u[128];
+      snprintf(u, sizeof(u), "\"total_duration\":0,\"eval_count\":%d,\"prompt_eval_count\":%d}", ngen, npt);
+      sb_puts(&b, u);
+    }
+    respond(fd, 200, "OK", b.buf);
+    sgl_xfree(b.buf);
+    sgl_xfree(out);
+    return 1;
+  }
+  if (is_post && !strcmp(p, "/api/chat")) {
+    sgl_json *j = sgl_json_parse(req->body, req->body_len);
+    const sgl_json *msgs = j ? sgl_json_get(j, "messages") : NULL;
+    if (!msgs || msgs->type != SGL_JSON_ARRAY) {
+      if (j) sgl_json_free(j);
+      respond_error(fd, 400, "\"messages\" array required");
+      return 1;
+    }
+    char *ml = render_chat_simple(srv, j, msgs);
+    sgl_sampling_params sp;
+    memset(&sp, 0, sizeof(sp));
+    int max_new = 256;
+    parse_sampling_json(j, &sp, &max_new, 256, 4096);
+    char *out = NULL;
+    int npt = 0, ngen = 0;
+    int rc = ml ? gen_once(srv, ml, max_new, &sp, NULL, 0, &out, &npt, &ngen) : -1;
+    sgl_xfree(ml);
+    sgl_json_free(j);
+    if (rc != 0) { respond_error(fd, 500, "generation failed"); return 1; }
+    sbuf b;
+    sb_init(&b);
+    sb_puts(&b, "{\"model\":");
+    sb_putjson(&b, srv->model_name[0] ? srv->model_name : "sglang-c");
+    sb_puts(&b, ",\"created_at\":\"1970-01-01T00:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":");
+    sb_putjson(&b, out ? out : "");
+    sb_puts(&b, "},\"done\":true,\"done_reason\":\"stop\"}");
+    respond(fd, 200, "OK", b.buf);
+    sgl_xfree(b.buf);
+    sgl_xfree(out);
+    return 1;
+  }
+
+  /* ---- C 版没有后端支撑的上游端点：501 + 原因（不假装成功）---- */
+  if (is_post || is_get) {
+    static const struct { const char *path; const char *why; } ni[] = {
+      {"/v1/classify", "no reward head (only BERT embeddings/rerank)"},
+      {"/classify", "no reward head (only BERT embeddings/rerank)"},
+      {"/v1/decisions", "no reward head"},
+      {"/v1/audio/transcriptions", "no audio encoder (whisper) in this build"},
+      {"/v1/systemone", "no system-one policy backend"},
+      {"/vertex_generate", "no Vertex AI adapter"},
+      {"/get_weights_by_name", "no single-tensor accessor over HTTP"},
+      {"/weights_checker", "no weight checksum registry"},
+      {"/init_weights_update_group", "no distributed weight sync (no NCCL/TP)"},
+      {"/destroy_weights_update_group", "no distributed weight sync (no NCCL/TP)"},
+      {"/update_weights_from_tensor", "no tensor-level weight update path"},
+      {"/update_weights_from_distributed", "no distributed weight sync (no NCCL/TP)"},
+      {"/update_weights_from_ipc", "no IPC weight update path"},
+      {"/update_weight_version", "no weight versioning"},
+      {"/begin_weight_update", "no distributed weight sync"},
+      {"/end_weight_update", "no distributed weight sync"},
+      {"/send_weights_to_remote_instance", "no remote instance transport"},
+      {"/init_weights_send_group_for_remote_instance", "no remote instance transport"},
+      {"/get_remote_instance_transfer_engine_info", "no remote instance transport"},
+      {"/remote_instance_transfer_engine_info", "no remote instance transport"},
+      {"/pd_role_switch", "no PD disaggregation"},
+      {"/add_external_corpus", "no external corpus / hicache backend"},
+      {"/remove_external_corpus", "no external corpus / hicache backend"},
+      {"/list_external_corpora", "no external corpus / hicache backend"},
+      {"/hicache/storage-backend", "no hierarchical KV cache backend"},
+      {"/hicache/storage-backend/clear", "no hierarchical KV cache backend"},
+      {"/start_expert_distribution_record", "no expert distribution recorder"},
+      {"/stop_expert_distribution_record", "no expert distribution recorder"},
+      {"/dump_expert_distribution_record", "no expert distribution recorder"},
+      {"/freeze_gc", "no Python GC in this build"},
+      {"/set_trace_level", "no tracing backend"},
+      {"/configure_logging", "log level is set at startup (SGL_LOG)"},
+      {"/set_internal_state", "no Python-side internal state"},
+    };
+    for (size_t i = 0; i < sizeof(ni) / sizeof(ni[0]); i++)
+      if (!strcmp(p, ni[i].path)) { not_impl(fd, ni[i].path, ni[i].why); return 1; }
+    if (!strncmp(p, "/dumper/", 8)) { not_impl(fd, p, "no tensor dumper"); return 1; }
+  }
+
+  /* @@MORE@@ */
+  return 0;
+}
+
 /* ---------- 连接线程 ---------- */
 
 typedef struct {
@@ -1473,3 +2254,4 @@ void sgl_http_stop(sgl_http_server *srv) {
   sgl_xfree(srv);
   WSACleanup();
 }
+

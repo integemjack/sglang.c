@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "sgl/alloc.h"
+#include "sgl/json.h"
 #include "sgl/port.h"
 #include "sgl/qweight.h"
 #include "sgl/safetensors.h"
@@ -36,6 +37,90 @@ static int file_exists(const char *p) {
   if (fopen_s(&f, p, "rb") != 0 || !f) return 0;
   fclose(f);
   return 1;
+}
+
+/* ---- marlin 布局定值用例（tests/marlin_layout.py --emit-unit 生成）----
+ * 同一份数据由 Python 按三个独立参考打成 marlin（权重 / scales / 零点），
+ * 期望值是按**自然列序**算的 (q - z) * s。这里逐元素比，证明 C 的
+ * marlin 解包（含 64 列置换、零点二次 interleave、tile 内 word/nibble 序）
+ * 与参考完全一致。*/
+static void test_marlin_unit(const char *path) {
+  FILE *f = NULL;
+  if (fopen_s(&f, path, "rb") != 0 || !f) {
+    printf("SKIP: marlin 定值用例读不到 %s\n", path);
+    return;
+  }
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  rewind(f);
+  char *txt = (char *)sgl_xmalloc((size_t)sz + 1);
+  size_t rd = fread(txt, 1, (size_t)sz, f);
+  txt[rd] = 0;
+  fclose(f);
+  sgl_json *root = sgl_json_parse(txt, rd);
+  sgl_xfree(txt);
+  if (!root) {
+    check(0, "marlin 定值用例 JSON 解析失败");
+    return;
+  }
+  const sgl_json *cases = sgl_json_get(root, "cases");
+  int ncase = cases && cases->type == SGL_JSON_ARRAY ? cases->count : 0;
+  for (int ci = 0; ci < ncase; ci++) {
+    const sgl_json *c = cases->items[ci];
+    const int64_t K = sgl_json_get_int(c, "K", 0);
+    const int64_t N = sgl_json_get_int(c, "N", 0);
+    const int has_z = sgl_json_get_int(c, "has_z", 0);
+    const sgl_json *jw = sgl_json_get(c, "qweight");
+    const sgl_json *js = sgl_json_get(c, "scales");
+    const sgl_json *jz = sgl_json_get(c, "qzeros");
+    const sgl_json *je = sgl_json_get(c, "expected");
+    if (!jw || !js || !je || K <= 0 || N <= 0 || je->count != (int)(K * N)) {
+      check(0, "marlin 定值用例字段不全");
+      continue;
+    }
+    int32_t *qwv = (int32_t *)sgl_xmalloc(sizeof(int32_t) * (size_t)jw->count);
+    /* JSON 里可能是无符号 32 位数，先经 uint32 转再落 int32，避开越界转换的 UB */
+    for (int i = 0; i < jw->count; i++)
+      qwv[i] = (int32_t)(uint32_t)(unsigned long long)jw->items[i]->num;
+    float *scv = (float *)sgl_xmalloc(sizeof(float) * (size_t)js->count);
+    for (int i = 0; i < js->count; i++) scv[i] = (float)js->items[i]->num;
+    int32_t *qzv = NULL;
+    if (has_z && jz && jz->count > 0) {
+      qzv = (int32_t *)sgl_xmalloc(sizeof(int32_t) * (size_t)jz->count);
+      for (int i = 0; i < jz->count; i++)
+        qzv[i] = (int32_t)(uint32_t)(unsigned long long)jz->items[i]->num;
+    }
+    sgl_qcfg q;
+    memset(&q, 0, sizeof(q));
+    q.method = SGL_Q_AWQ;
+    q.bits = (int)sgl_json_get_int(c, "bits", 4);
+    q.group_size = sgl_json_get_int(c, "G", 8);
+    q.layout = SGL_QLAYOUT_MARLIN;
+    float *out = (float *)sgl_xmalloc(sizeof(float) * (size_t)(N * K));
+    int rc = sgl_qweight_dequant_marlin(&q, qwv, sgl_json_get_int(c, "qw_rows", 0),
+                                       sgl_json_get_int(c, "qw_cols", 0), qzv,
+                                       sgl_json_get_int(c, "qz_rows", 0),
+                                       sgl_json_get_int(c, "qz_cols", 0), scv,
+                                       sgl_json_get_int(c, "sc_rows", 0), N, N, K, out);
+    double maxd = 0;
+    if (rc == 0) {
+      for (int i = 0; i < (int)(N * K); i++) {
+        double d = fabs((double)out[i] - je->items[i]->num);
+        if (d > maxd) maxd = d;
+      }
+    }
+    char msg[256];
+    snprintf(msg, sizeof(msg), "marlin 定值用例[%s] K=%lld N=%lld has_z=%d（rc=%d, maxdiff=%.3g）",
+             sgl_json_get_str(c, "name", "?"), (long long)K, (long long)N, has_z, rc, maxd);
+    check(rc == 0 && maxd == 0.0, msg);
+    printf("%s %s maxdiff=%.3g\n", rc == 0 && maxd == 0.0 ? "PASS" : "FAIL",
+           sgl_json_get_str(c, "name", "?"), maxd);
+    sgl_xfree(out);
+    sgl_xfree(qwv);
+    sgl_xfree(scv);
+    sgl_xfree(qzv);
+  }
+  sgl_json_free(root);
 }
 
 /* ---------------- 1) 位布局单元测试 ---------------- */
@@ -312,8 +397,23 @@ static void test_cfg_parse(void) {
         "解析 GPTQ config（desc_act）");
   const char *v2 = "{\"quantization_config\":{\"bits\":4,\"group_size\":128,"
                    "\"quant_method\":\"gptq\",\"format\":\"gptq_v2\"}}";
-  check(sgl_qcfg_from_json(v2, strlen(v2), &q) == 0,
-        "gptq_v2 落盘格式被明确拒绝（而不是静默解错）");
+  check(sgl_qcfg_from_json(v2, strlen(v2), &q) == 1 && q.method == SGL_Q_GPTQ && q.v2,
+        "解析 gptq_v2（置 v2 标志）");
+  const char *bad = "{\"quantization_config\":{\"bits\":4,\"group_size\":128,"
+                    "\"quant_method\":\"gptq\",\"format\":\"gptq_marlin_v9\"}}";
+  check(sgl_qcfg_from_json(bad, strlen(bad), &q) == 0,
+        "不认识的 GPTQ format 被明确拒绝（而不是静默解错）");
+  /* marlin / gptq_marlin / awq version=marlin：认下来，置 layout=marlin */
+  const char *fm = "{\"quantization_config\":{\"bits\":4,\"group_size\":128,"
+                   "\"quant_method\":\"gptq\",\"format\":\"gptq_marlin\"}}";
+  check(sgl_qcfg_from_json(fm, strlen(fm), &q) == 1 && q.method == SGL_Q_GPTQ &&
+            q.layout == SGL_QLAYOUT_MARLIN,
+        "gptq format=gptq_marlin → layout=marlin");
+  const char *am = "{\"quantization_config\":{\"bits\":4,\"group_size\":128,"
+                   "\"quant_method\":\"awq\",\"version\":\"marlin\",\"zero_point\":false}}";
+  check(sgl_qcfg_from_json(am, strlen(am), &q) == 1 && q.method == SGL_Q_AWQ &&
+            q.layout == SGL_QLAYOUT_MARLIN,
+        "awq version=marlin → layout=marlin");
   const char *plain = "{\"hidden_size\":64}";
   check(sgl_qcfg_from_json(plain, strlen(plain), &q) == 0, "无量化信息的 config 返回 0");
 }
@@ -321,6 +421,13 @@ static void test_cfg_parse(void) {
 int main(void) {
   test_layout();
   test_cfg_parse();
+  const char *mu = getenv("SGL_TEST_MARLIN_UNIT");
+  if (mu && file_exists(mu)) {
+    test_marlin_unit(mu);
+  } else {
+    printf("SKIP: SGL_TEST_MARLIN_UNIT 未设置（marlin 定值用例，python tests/marlin_layout.py "
+           "--emit-unit tests/_marlin_unit.json）\n");
+  }
 
   const char *real = getenv("SGL_TEST_QWEIGHT_REAL");
   if (real && *real) {

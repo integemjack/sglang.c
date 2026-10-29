@@ -281,6 +281,25 @@ struct sgl_cuda_model {
   int spec_on;       /* 1 = 正在跑投机验证，lin kernel 要逐行快照 */
   int last_rows;     /* 上一次前向写了几行激活（prefill 末位 hidden 靠它定位）*/
   void *st;        /* llama 模型的 safetensors 上下文（MTP 加载用，不拥有）*/
+
+  /* G20: llama 系 MoE 层（Qwen3-MoE / Qwen3-Next / Mixtral / gpt-oss 风格）。
+   * CPU 侧 src/llama.c 的 moe_row() 是参考实现；这里逐层持有路由与专家权重。
+   * 权重一律 f32 上传（与 attn/MLP 的 f32 路径同一口径），use_w8 时专家走 int8。*/
+  unsigned char *lmoe;   /* [L] 1 = 该层 MLP 走 MoE */
+  int moe_ne, moe_topk, moe_mi, moe_si, moe_norm, moe_scale_set;
+  float moe_scale;       /* routed_scaling_factor */
+  float **m_router;      /* [L] [NE][E] */
+  float **m_egu;         /* [L] [NE][2*mi][E]（gate|up 融合，与 CPU 同布局）*/
+  float **m_edn;         /* [L] [NE][E][mi] */
+  float **m_sgw, **m_suw, **m_sdw, **m_sgate; /* [L] 共享专家 + sigmoid 门控 */
+  float *moe_rl;         /* [ws][NE] 路由概率 */
+  int *moe_sel;          /* [ws*topk] 选中专家 id */
+  float *moe_wt;         /* [ws*topk] top-k 权重（已归一 + 乘 routed_scale）*/
+  float *moe_mid;        /* [ws*topk][mi] 每任务 silu(gate)*up */
+  float *moe_shmid;      /* [ws][si] 共享专家的 silu(gate)*up */
+  float *moe_sg;         /* [ws] 共享专家门控 sigmoid */
+  float *moe_x;          /* [ws][E] 输入暂存（hin == out 时不能先清零输出）*/
+  int moe_cap;           /* 上面几个 scratch 覆盖的行数 */
 };
 
 __global__ void k_embed(const float *wte, const int *tok, float *x, int n, int E) {
@@ -2385,6 +2404,177 @@ __global__ void k_residual(float *x, const float *h, long n) {
   x[i] += h[i];
 }
 
+/* ================= G20：llama 系 MoE 前向 =================
+ *
+ * 参考实现是 CPU 侧 src/llama.c 的 moe_row()（逐行）：
+ *   rl = softmax(h @ router^T)              [NE]
+ *   top-k 选专家 → 权重（norm_topk 时再归一）→ × routed_scaling_factor
+ *   out = Σ_j w_j · ( silu(h @ gu[e_j]^T) * (h @ gu[e_j]^T 的后半) ) @ dn[e_j]^T
+ *   out += sigmoid(h @ sh_gate) · ( silu(h@sgw) * (h@suw) ) @ sdw
+ *
+ * 设备实现按「任务」并行：一个任务 = (token, topk 槽)。专家基地址在 kernel 内
+ * 用 e 算偏移（e 由 sel[] 在 device 侧读出），所以 host 不需要回读专家 id，
+ * 捕获成 CUDA Graph 后仍成立（启动次数只跟 rows×topk 有关）。*/
+
+/* softmax + top-k：每行一个 block。sel[t]=专家 id，wt[t]=权重（已缩放到最终系数）。
+ * bias 可 NULL（DeepSeek 的 e_score_correction_bias 在 CPU 侧也没用）。*/
+__global__ void k_moe_route(const float *rl, int NE, int topk, int norm_topk, float scale,
+                            int *sel, float *wt) {
+  int row = blockIdx.x;
+  const float *r = rl + (long)row * NE;
+  extern __shared__ float sh[];
+  /* softmax（稳定版，与 CPU 一致：最大相减）*/
+  float mx = r[0];
+  for (int i = threadIdx.x; i < NE; i += blockDim.x)
+    if (r[i] > mx) mx = r[i];
+  sh[threadIdx.x] = mx;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]);
+    __syncthreads();
+  }
+  mx = sh[0];
+  __syncthreads();
+  float ss = 0;
+  for (int i = threadIdx.x; i < NE; i += blockDim.x) ss += __expf(r[i] - mx);
+  sh[threadIdx.x] = ss;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+    __syncthreads();
+  }
+  float inv = 1.0f / sh[0];
+  /* top-k：单个线程选（NE 小、topk 小；串行选择排序与 CPU 的选法逐个一致）*/
+  if (threadIdx.x == 0) {
+    float best[32];
+    int bi[32];
+    int k = topk > 32 ? 32 : topk;
+    for (int j = 0; j < k; j++) {
+      bi[j] = -1;
+      best[j] = -1.0f;
+      for (int i = 0; i < NE; i++) {
+        int used = 0;
+        for (int q = 0; q < j; q++)
+          if (bi[q] == i) used = 1;
+        if (used) continue;
+        float v = __expf(r[i] - mx) * inv;
+        if (v > best[j]) {
+          best[j] = v;
+          bi[j] = i;
+        }
+      }
+    }
+    float t = 0;
+    if (norm_topk)
+      for (int j = 0; j < k; j++) t += best[j];
+    for (int j = 0; j < k; j++) {
+      float w = norm_topk ? (t > 0 ? best[j] / t : best[j]) : best[j];
+      sel[(long)row * topk + j] = bi[j];
+      wt[(long)row * topk + j] = w * scale;
+    }
+  }
+}
+
+/* 共享专家门控：sg[row] = sigmoid(h[row] · sh_gate) */
+__global__ void k_moe_sgate(const float *h, const float *g, float *sg, int E) {
+  int row = blockIdx.x;
+  const float *hr = h + (long)row * E;
+  float acc = 0;
+  for (int i = threadIdx.x; i < E; i += blockDim.x) acc += hr[i] * g[i];
+  extern __shared__ float sh[];
+  sh[threadIdx.x] = acc;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) sg[row] = 1.0f / (1.0f + __expf(-sh[0]));
+}
+
+/* 专家 gate_up：一个 block 算一个任务的 128 个 mid 元素
+ *   grid = (ceil(mi/128), rows*topk)，block = 128
+ *   mid[t][i] = silu( h_row · gu[e][i] ) * ( h_row · gu[e][mi+i] )
+ * gu 布局 [NE][2mi][E]，与 CPU 的 exp_gate_up 一致。*/
+__global__ void k_moe_gu(const float *h, const float *gu, const int *sel, float *mid, int ntopk,
+                         int E, int mi, int topk) {
+  int t = blockIdx.y;
+  if (t >= ntopk) return;
+  int row = t / topk;
+  int e = sel[t];
+  if (e < 0) return;
+  const float *hr = h + (long)row * E;
+  const float *ge = gu + (long)e * 2 * mi * E;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= mi) return;
+  /* gate = ge[i] · h，up = ge[mi+i] · h */
+  const float *wg = ge + (long)i * E;
+  const float *wu = ge + (long)(mi + i) * E;
+  float g = 0, u = 0;
+  for (int q = 0; q < E; q++) {
+    g += wg[q] * hr[q];
+    u += wu[q] * hr[q];
+  }
+  mid[(long)t * mi + i] = (g / (1.0f + __expf(-g))) * u;
+}
+
+/* 共享专家 gate_up：每行一个任务，权重 sh_gw / sh_up 均为 [si][E] */
+__global__ void k_moe_gu_shared(const float *h, const float *gw, const float *uw, float *mid,
+                                int E, int si) {
+  int row = blockIdx.y;
+  const float *hr = h + (long)row * E;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= si) return;
+  const float *wg = gw + (long)i * E;
+  const float *wu = uw + (long)i * E;
+  float g = 0, u = 0;
+  for (int q = 0; q < E; q++) {
+    g += wg[q] * hr[q];
+    u += wu[q] * hr[q];
+  }
+  mid[(long)row * si + i] = (g / (1.0f + __expf(-g))) * u;
+}
+
+/* 专家 down：out[row][*] += w · dn[e] @ mid[t]
+ *   grid = (ceil(E/256), rows*topk)，block = 256；atomicAdd 因为同一行的
+ *   topk 个任务会同时写（CPU 侧是串行累加，这里顺序不同但浮点顺序也变了 ——
+ *   对拍阈值按 1e-5 看，不做逐位相等）。*/
+__global__ void k_moe_down(const float *mid, const float *dn, const int *sel, const float *wt,
+                           float *out, int ntopk, int E, int mi, int topk) {
+  int t = blockIdx.y;
+  if (t >= ntopk) return;
+  int row = t / topk;
+  int e = sel[t];
+  if (e < 0) return;
+  float w = wt[t];
+  const float *mr = mid + (long)t * mi;
+  const float *de = dn + (long)e * E * mi;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= E) return;
+  const float *dr = de + (long)i * mi;
+  float acc = 0;
+  for (int q = 0; q < mi; q++) acc += dr[q] * mr[q];
+  atomicAdd(&out[(long)row * E + i], w * acc);
+}
+
+/* 共享专家 down：out[row][*] += sg[row] · sdw @ mid_sh[row] */
+__global__ void k_moe_down_shared(const float *mid, const float *dw, const float *sg, float *out,
+                                  int E, int si) {
+  int row = blockIdx.y;
+  const float *mr = mid + (long)row * si;
+  float w = sg[row];
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= E) return;
+  const float *dr = dw + (long)i * si;
+  float acc = 0;
+  for (int q = 0; q < si; q++) acc += dr[q] * mr[q];
+  atomicAdd(&out[(long)row * E + i], w * acc);
+}
+
+__global__ void k_zero(float *p, long n) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i < n) p[i] = 0.0f;
+}
+
 /* M3：device 侧 argmax。MTP 每步要为每个草稿算一次 lm_head（V=248320），
  * 把 1 MB 的 logits D2H 每草稿一次不划算；在 device 上取完只回 4 字节。*/
 __global__ void k_argmax(const float *v, int n, int *out) {
@@ -2848,8 +3038,23 @@ static int sgl_cuda_reserve(sgl_cuda_model *g, int n) {
   }
   if (g->use_w8) {
     /* G2: IMMA scratch. invalidate_graphs() already ran at the top of this
-     * function, so growing these buffers is graph-safe (rule 4). */
+     * function, so growing these buffers is graph-safe (rule 4).
+     * 列宽必须是「所有 W8 投影里最宽的 N 和 K」：原来只取 max(E,I)，
+     * 但 t11 的 lin 层 qkvz 宽度 = 2*nk*kd + 2*nh*vd，对 Qwen3-Next 是
+     * 192 > max(E,I)=128，cublas 的 int8 GEMM 会写越界（compute-sanitizer
+     * 在 qwen3next-rand 上报 gemmSN_kernel_int32 out-of-bounds）。
+     * MoE 层的 gate_up 宽 2*mi、共享专家宽 si 同理。*/
     int EI = g->E > g->I ? g->E : g->I;
+    if (g->QD > EI) EI = g->QD;
+    if (g->q_gate && 2 * g->QD > EI) EI = 2 * g->QD;
+    if (g->lin_nh > 0) {
+      int rowN = 2 * g->lin_nk * g->lin_kd + 2 * g->lin_nh * g->lin_vd;
+      int vald = g->lin_nh * g->lin_vd;
+      if (rowN > EI) EI = rowN;
+      if (vald > EI) EI = vald;
+    }
+    if (g->moe_mi > 0 && 2 * g->moe_mi > EI) EI = 2 * g->moe_mi;
+    if (g->moe_si > EI) EI = g->moe_si;
     int8_t *a8 = NULL;
     int32_t *c32 = NULL;
     float *as = NULL;
@@ -2880,6 +3085,31 @@ static int sgl_cuda_reserve(sgl_cuda_model *g, int n) {
     }
     cudaFree(g->l_qkvz_all); cudaFree(g->l_o_all); cudaFree(g->l_ba_all);
     g->l_qkvz_all = qa; g->l_o_all = oa; g->l_ba_all = bba;
+  }
+  /* G20: MoE scratch（按行数增长：任务数 = rows×topk）*/
+  if (g->moe_ne > 0 && g->moe_topk > 0 && g->moe_mi > 0 && n > g->moe_cap) {
+    int ntopk = n * g->moe_topk;
+    int si = g->moe_si > 0 ? g->moe_si : g->moe_mi;
+    float *rl = NULL, *wt = NULL, *mid = NULL, *shmid = NULL, *sg = NULL, *mx = NULL;
+    int *sel = NULL;
+    int ok = cudaMalloc((void **)&rl, sizeof(float) * (size_t)n * g->moe_ne) == cudaSuccess &&
+             cudaMalloc((void **)&wt, sizeof(float) * (size_t)ntopk) == cudaSuccess &&
+             cudaMalloc((void **)&sel, sizeof(int) * (size_t)ntopk) == cudaSuccess &&
+             cudaMalloc((void **)&mid, sizeof(float) * (size_t)ntopk * g->moe_mi) == cudaSuccess &&
+             cudaMalloc((void **)&shmid, sizeof(float) * (size_t)n * si) == cudaSuccess &&
+             cudaMalloc((void **)&sg, sizeof(float) * (size_t)n) == cudaSuccess &&
+             cudaMalloc((void **)&mx, sizeof(float) * (size_t)n * g->E) == cudaSuccess;
+    if (!ok) {
+      cudaFree(rl); cudaFree(wt); cudaFree(sel); cudaFree(mid); cudaFree(shmid); cudaFree(sg);
+      cudaFree(mx);
+      fprintf(stderr, "sgl_cuda_reserve(%d): out of VRAM (moe scratch)\n", n);
+      return -1;
+    }
+    cudaFree(g->moe_rl); cudaFree(g->moe_wt); cudaFree(g->moe_sel);
+    cudaFree(g->moe_mid); cudaFree(g->moe_shmid); cudaFree(g->moe_sg); cudaFree(g->moe_x);
+    g->moe_rl = rl; g->moe_wt = wt; g->moe_sel = sel;
+    g->moe_mid = mid; g->moe_shmid = shmid; g->moe_sg = sg; g->moe_x = mx;
+    g->moe_cap = n;
   }
   g->ws_cap = n;
   return 0;
@@ -3369,6 +3599,273 @@ static int prof_nogemm(void) {
     gemm_nt_any(g, A, Wf, Wh, bias, C, M, N, K);                                   \
   } while (0)
 
+/* G20: 一层的 MoE MLP（输入已 RMSNorm，输出写 out，调用方再做 residual）。
+ * 与 CPU 的 moe_row() 同一公式、同一权重布局。返回 0 = 已算完。*/
+static int moe_forward(sgl_cuda_model *g, int l, const float *hin, float *out, int rows) {
+  if (!g->lmoe || !g->lmoe[l]) return -1;
+  int E = g->E, NE = g->moe_ne, topk = g->moe_topk, mi = g->moe_mi, si = g->moe_si;
+  if (NE <= 0 || topk <= 0 || mi <= 0) return -1;
+  int ntopk = rows * topk;
+  /* 调用方常常传 hin == out（norm 后的激活缓冲同时也是 MLP 的输出位），
+   * 而下面要先清零输出 —— 先把输入拷到 moe_x，避免自己把自己的输入抹掉。*/
+  if (hin == out) {
+    if (!g->moe_x || g->moe_cap < rows) return -1;
+    CK(cudaMemcpyAsync(g->moe_x, hin, sizeof(float) * (size_t)rows * E,
+                       cudaMemcpyDeviceToDevice, g->stream));
+    hin = g->moe_x;
+  }
+
+  /* 1. 路由 logits → probs → top-k（kernel 内，不回 CPU）。
+   * 不用 PROJ：PROJ/gemm_nt_any 在 SGL_CUDA_FP16 下只读 half 权重，
+   * 而 MoE 权重一律是 f32（现成模型也不会给 MoE 权重做 fp16 镜像）。*/
+  gemm_nt_cublas(g->blas, g->stream, hin, g->m_router[l], NULL, g->moe_rl, rows, NE, E);
+  CK(cudaGetLastError());
+  k_moe_route<<<rows, 128, 128 * sizeof(float), g->stream>>>(
+      g->moe_rl, NE, topk, g->moe_norm, g->moe_scale, g->moe_sel, g->moe_wt);
+  CK(cudaGetLastError());
+
+  /* 2. 清零输出（后续全部用 atomicAdd 累加）*/
+  {
+    long n = (long)rows * E;
+    k_zero<<<(int)((n + 255) / 256), 256, 0, g->stream>>>(out, n);
+    CK(cudaGetLastError());
+  }
+
+  /* 3. 专家：gate_up → down（按任务并行）*/
+  {
+    int gx = (mi + 127) / 128;
+    dim3 gd((unsigned)gx, (unsigned)ntopk);
+    k_moe_gu<<<gd, 128, 0, g->stream>>>(hin, g->m_egu[l], g->moe_sel, g->moe_mid, ntopk, E, mi,
+                                        topk);
+    CK(cudaGetLastError());
+    int dx = (E + 255) / 256;
+    dim3 gd2((unsigned)dx, (unsigned)ntopk);
+    k_moe_down<<<gd2, 256, 0, g->stream>>>(g->moe_mid, g->m_edn[l], g->moe_sel, g->moe_wt, out,
+                                           ntopk, E, mi, topk);
+    CK(cudaGetLastError());
+  }
+
+  /* 4. 共享专家（若有）：out += sigmoid(h·gate) · (silu(h@sgw)*h@suw) @ sdw */
+  if (g->m_sgw[l] && si > 0) {
+    k_moe_sgate<<<rows, 256, 256 * sizeof(float), g->stream>>>(hin, g->m_sgate[l], g->moe_sg, E);
+    CK(cudaGetLastError());
+    int sx = (si + 127) / 128;
+    dim3 sd((unsigned)sx, (unsigned)rows);
+    k_moe_gu_shared<<<sd, 128, 0, g->stream>>>(hin, g->m_sgw[l], g->m_suw[l], g->moe_shmid, E, si);
+    CK(cudaGetLastError());
+    int dx = (E + 255) / 256;
+    dim3 sd2((unsigned)dx, (unsigned)rows);
+    k_moe_down_shared<<<sd2, 256, 0, g->stream>>>(g->moe_shmid, g->m_sdw[l], g->moe_sg, out, E, si);
+    CK(cudaGetLastError());
+  }
+  return 0;
+}
+
+/* G20 自测：不经过完整模型，直接给 MoE 层随机输入，与 CPU 朴素实现逐值对比。
+ * 返回 max|diff|（<0 表示出错）。用来证明 MoE kernel 本身正确，
+ * 不受 attention 的 int8 量化误差干扰（整模型对拍 qwen3next-rand 时
+ * 误差 ~6e-3 全部来自 w8 的 attn 权重）。*/
+int sgl_cuda_moe_selftest(int rows, int E, int NE, int topk, int mi, int si, int norm_topk,
+                          float scale, int seed, double *out_maxerr) {
+  sgl_cuda_model *g = (sgl_cuda_model *)calloc(1, sizeof(*g));
+  size_t nrouter = (size_t)NE * E, ngu = (size_t)NE * 2 * mi * E, ndn = (size_t)NE * E * mi;
+  size_t nsgw = (size_t)si * E, nsdw = (size_t)E * si;
+  float *h_router = (float *)malloc(sizeof(float) * nrouter);
+  float *h_egu = (float *)malloc(sizeof(float) * ngu);
+  float *h_edn = (float *)malloc(sizeof(float) * ndn);
+  float *h_sgw = (float *)malloc(sizeof(float) * nsgw);
+  float *h_suw = (float *)malloc(sizeof(float) * nsgw);
+  float *h_sdw = (float *)malloc(sizeof(float) * nsdw);
+  float *h_sgate = (float *)malloc(sizeof(float) * (size_t)E);
+  float *h_in = (float *)malloc(sizeof(float) * (size_t)rows * E);
+  float *h_out = (float *)malloc(sizeof(float) * (size_t)rows * E);
+  float *h_ref = (float *)malloc(sizeof(float) * (size_t)rows * E);
+  float *h_rl = (float *)malloc(sizeof(float) * (size_t)NE);
+  float *h_gu = (float *)malloc(sizeof(float) * (size_t)2 * mi);
+  float *h_mid = (float *)malloc(sizeof(float) * (size_t)mi);
+  float *h_dn = (float *)malloc(sizeof(float) * (size_t)E);
+  int ok = 0;
+  if (!h_router || !h_egu || !h_edn || !h_sgw || !h_suw || !h_sdw || !h_sgate || !h_in ||
+      !h_out || !h_ref || !h_rl || !h_gu || !h_mid || !h_dn)
+    goto done;
+
+  /* 固定种子的 LCG（可重现，不依赖 rand() 的实现）*/
+  unsigned st = (unsigned)seed;
+#define NX() (st = st * 1664525u + 1013904223u, ((float)((st >> 8) & 0xFFFF) / 32768.0f - 1.0f) * 0.12f)
+  for (size_t i = 0; i < nrouter; i++) h_router[i] = NX();
+  for (size_t i = 0; i < ngu; i++) h_egu[i] = NX();
+  for (size_t i = 0; i < ndn; i++) h_edn[i] = NX();
+  for (size_t i = 0; i < nsgw; i++) h_sgw[i] = h_suw[i] = NX();
+  for (size_t i = 0; i < nsdw; i++) h_sdw[i] = NX();
+  for (int i = 0; i < E; i++) h_sgate[i] = NX();
+  for (size_t i = 0; i < (size_t)rows * E; i++) h_in[i] = NX();
+#undef NX
+
+  g->E = E; g->I = mi; g->moe_ne = NE; g->moe_topk = topk; g->moe_mi = mi; g->moe_si = si;
+  g->moe_norm = norm_topk; g->moe_scale = scale;
+  g->lmoe = (unsigned char *)calloc(1, 1);
+  g->m_router = (float **)calloc(1, sizeof(float *));
+  g->m_egu = (float **)calloc(1, sizeof(float *));
+  g->m_edn = (float **)calloc(1, sizeof(float *));
+  g->m_sgw = (float **)calloc(1, sizeof(float *));
+  g->m_suw = (float **)calloc(1, sizeof(float *));
+  g->m_sdw = (float **)calloc(1, sizeof(float *));
+  g->m_sgate = (float **)calloc(1, sizeof(float *));
+  if (!g->lmoe || !g->m_router || !g->m_egu || !g->m_edn || !g->m_sgw || !g->m_suw ||
+      !g->m_sdw || !g->m_sgate)
+    goto done;
+  g->lmoe[0] = 1;
+
+  if (cublasCreate(&g->blas) != CUBLAS_STATUS_SUCCESS) goto done;
+  if (cudaStreamCreate(&g->stream) != cudaSuccess) goto done;
+  cublasSetStream(g->blas, g->stream);
+  g->blas_ws_size = (size_t)4 << 20;
+  if (cudaMalloc(&g->blas_ws, g->blas_ws_size) == cudaSuccess)
+    cublasSetWorkspace(g->blas, g->blas_ws, g->blas_ws_size);
+
+  g->m_router[0] = dev_copy(h_router, nrouter);
+  g->m_egu[0] = dev_copy(h_egu, ngu);
+  g->m_edn[0] = dev_copy(h_edn, ndn);
+  g->m_sgw[0] = si > 0 ? dev_copy(h_sgw, nsgw) : NULL;
+  g->m_suw[0] = si > 0 ? dev_copy(h_suw, nsgw) : NULL;
+  g->m_sdw[0] = si > 0 ? dev_copy(h_sdw, nsdw) : NULL;
+  g->m_sgate[0] = si > 0 ? dev_copy(h_sgate, (size_t)E) : NULL;
+  if (!g->m_router[0] || !g->m_egu[0] || !g->m_edn[0]) goto done;
+  if (si > 0 && (!g->m_sgw[0] || !g->m_suw[0] || !g->m_sdw[0] || !g->m_sgate[0])) goto done;
+
+  /* scratch（不走 sgl_cuda_reserve：那需要整套 attn 字段）*/
+  g->wte = g->final_norm = g->lm_head = NULL;
+  g->moe_rl = (float *)dev_copy(NULL, sizeof(float) * (size_t)rows * NE);
+  g->moe_wt = (float *)dev_copy(NULL, sizeof(float) * (size_t)rows * topk);
+  g->moe_mid = (float *)dev_copy(NULL, sizeof(float) * (size_t)rows * topk * mi);
+  g->moe_shmid = (float *)dev_copy(NULL, sizeof(float) * (size_t)rows * (si > 0 ? si : 1));
+  g->moe_sg = (float *)dev_copy(NULL, sizeof(float) * (size_t)rows);
+  g->moe_x = (float *)dev_copy(NULL, sizeof(float) * (size_t)rows * E);
+  g->moe_cap = rows;
+  {
+    int *dsel = NULL;
+    if (cudaMalloc((void **)&dsel, sizeof(int) * (size_t)rows * topk) != cudaSuccess) goto done;
+    g->moe_sel = dsel;
+  }
+  if (!g->moe_rl || !g->moe_wt || !g->moe_mid || !g->moe_shmid || !g->moe_sg || !g->moe_x)
+    goto done;
+
+  {
+    float *d_in = dev_copy(h_in, (size_t)rows * E);
+    float *d_out = (float *)dev_copy(NULL, sizeof(float) * (size_t)rows * E);
+    if (!d_in || !d_out) goto done;
+    if (moe_forward(g, 0, d_in, d_out, rows) != 0 ||
+        cudaMemcpy(h_out, d_out, sizeof(float) * (size_t)rows * E, cudaMemcpyDeviceToHost) !=
+            cudaSuccess)
+      goto done;
+    cudaFree(d_in);
+    cudaFree(d_out);
+  }
+
+  /* CPU 参考：与 src/llama.c moe_row() 逐句对应 */
+  for (int r = 0; r < rows; r++) {
+    const float *hrow = h_in + (long)r * E;
+    for (int e = 0; e < NE; e++) {
+      float s = 0;
+      for (int i = 0; i < E; i++) s += h_router[(long)e * E + i] * hrow[i];
+      h_rl[e] = s;
+    }
+    float mx = h_rl[0];
+    for (int e = 1; e < NE; e++)
+      if (h_rl[e] > mx) mx = h_rl[e];
+    float sum = 0;
+    for (int e = 0; e < NE; e++) {
+      h_rl[e] = expf(h_rl[e] - mx);
+      sum += h_rl[e];
+    }
+    for (int e = 0; e < NE; e++) h_rl[e] /= sum;
+    int sel[32];
+    float sw[32];
+    for (int j = 0; j < topk; j++) {
+      int best = -1;
+      float bv = -1.0f;
+      for (int e = 0; e < NE; e++) {
+        int used = 0;
+        for (int q = 0; q < j; q++)
+          if (sel[q] == e) used = 1;
+        if (!used && h_rl[e] > bv) {
+          bv = h_rl[e];
+          best = e;
+        }
+      }
+      sel[j] = best;
+      sw[j] = bv;
+    }
+    if (norm_topk) {
+      float t = 0;
+      for (int j = 0; j < topk; j++) t += sw[j];
+      if (t > 0)
+        for (int j = 0; j < topk; j++) sw[j] /= t;
+    }
+    memset(h_ref + (long)r * E, 0, sizeof(float) * (size_t)E);
+    for (int j = 0; j < topk; j++) {
+      int e = sel[j];
+      if (e < 0) continue;
+      const float *gu = h_egu + (size_t)e * 2 * mi * E;
+      for (int i = 0; i < 2 * mi; i++) {
+        float s = 0;
+        for (int q = 0; q < E; q++) s += gu[(long)i * E + q] * hrow[q];
+        h_gu[i] = s;
+      }
+      for (int i = 0; i < mi; i++) {
+        float gg = h_gu[i];
+        h_mid[i] = (gg / (1.0f + expf(-gg))) * h_gu[mi + i];
+      }
+      const float *dn = h_edn + (size_t)e * E * mi;
+      for (int i = 0; i < E; i++) {
+        float s = 0;
+        for (int q = 0; q < mi; q++) s += dn[(long)i * mi + q] * h_mid[q];
+        h_dn[i] = s;
+      }
+      float w = sw[j] * scale;
+      for (int i = 0; i < E; i++) h_ref[(long)r * E + i] += w * h_dn[i];
+    }
+    if (si > 0) {
+      float sga = 0;
+      for (int i = 0; i < E; i++) sga += hrow[i] * h_sgate[i];
+      sga = 1.0f / (1.0f + expf(-sga));
+      for (int i = 0; i < si; i++) {
+        float g = 0, u = 0;
+        for (int q = 0; q < E; q++) {
+          g += h_sgw[(long)i * E + q] * hrow[q];
+          u += h_suw[(long)i * E + q] * hrow[q];
+        }
+        h_mid[i] = (g / (1.0f + expf(-g))) * u;
+      }
+      for (int i = 0; i < E; i++) {
+        float s = 0;
+        for (int q = 0; q < si; q++) s += h_sdw[(long)i * si + q] * h_mid[q];
+        h_ref[(long)r * E + i] += sga * s;
+      }
+    }
+  }
+
+  {
+    double me = 0;
+    for (size_t i = 0; i < (size_t)rows * E; i++) {
+      double d = fabs((double)h_out[i] - h_ref[i]);
+      if (d > me) me = d;
+    }
+    if (out_maxerr) *out_maxerr = me;
+  }
+  ok = 1;
+
+done:
+  free(h_router); free(h_egu); free(h_edn); free(h_sgw); free(h_suw); free(h_sdw);
+  free(h_sgate); free(h_in); free(h_out); free(h_ref);
+  free(h_rl); free(h_gu); free(h_mid); free(h_dn);
+  if (g) {
+    g->moe_cap = 0;
+    sgl_cuda_free(g);
+  }
+  return ok ? 0 : -1;
+}
+
 /* P1 诊断：SGL_CUDA_TRACE=1 时把上传每步打一行，定位「上传时进程崩」到底停在哪次 dev_copy。
  * （Windows + WDDM 下驱动内部段错误拿不到我们的栈，只能看走到哪。）*/
 static int cuda_trace_on(void) {
@@ -3498,6 +3995,28 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
   g->l_alog = (float **)calloc(g->L, sizeof(float *));
   g->l_dtb = (float **)calloc(g->L, sizeof(float *));
   g->lkind = (unsigned char *)calloc(g->L, 1);
+  CT("ptr arrays (L=%d) allocated", g->L);
+  /* G20：MoE 层的路由与专家权重指针（只在 m->n_experts>0 时分配）*/
+  g->lmoe = (unsigned char *)calloc(g->L, 1);
+  g->moe_ne = m->n_experts;
+  g->moe_topk = m->n_exp_topk;
+  g->moe_mi = m->moe_inter;
+  g->moe_si = m->shared_inter > 0 ? m->shared_inter : m->moe_inter;
+  g->moe_norm = m->norm_topk;
+  g->moe_scale = m->routed_scale != 0.0f ? m->routed_scale : 1.0f;
+  if (m->n_experts > 0) {
+    g->m_router = (float **)calloc(g->L, sizeof(float *));
+    g->m_egu = (float **)calloc(g->L, sizeof(float *));
+    g->m_edn = (float **)calloc(g->L, sizeof(float *));
+    g->m_sgw = (float **)calloc(g->L, sizeof(float *));
+    g->m_suw = (float **)calloc(g->L, sizeof(float *));
+    g->m_sdw = (float **)calloc(g->L, sizeof(float *));
+    g->m_sgate = (float **)calloc(g->L, sizeof(float *));
+    if (!g->m_router || !g->m_egu || !g->m_edn || !g->m_sgw || !g->m_suw || !g->m_sdw ||
+        !g->m_sgate)
+      goto fail;
+    CT("moe ptr arrays allocated");
+  }
   g->kvo = (int *)malloc(sizeof(int) * (size_t)g->L);
   g->linvo = (int *)malloc(sizeof(int) * (size_t)g->L);
   g->QD = m->q_dim > 0 ? m->q_dim : g->E;
@@ -3583,6 +4102,25 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
 
   for (int l = 0; l < g->L; l++) {
     const sgl_llama_layer *L = &m->layers[l];
+    /* G20：MoE 层的专家/路由/共享专家权重统一用 f32 上传（与 attn、norm 的
+     * f32 口径一致，也是与 CPU moe_row() 逐位对拍的前提）。dense MLP
+     * 的 gate/up/down 在 MoE 层上是空的，下面各模式分支里用 !L->is_moe 跳过。*/
+    if (L->is_moe && g->moe_ne > 0) {
+      int NE = g->moe_ne, mi = g->moe_mi, si = g->moe_si;
+      g->lmoe[l] = 1;
+      CT("moe layer %d: NE=%d topk=%d mi=%d si=%d", l, NE, g->moe_topk, mi, si);
+      g->m_router[l] = dev_copy(L->router_w.data, (size_t)NE * g->E);
+      g->m_egu[l] = dev_copy(L->exp_gate_up.data, (size_t)NE * 2 * mi * g->E);
+      g->m_edn[l] = dev_copy(L->exp_down.data, (size_t)NE * g->E * mi);
+      if (!g->m_router[l] || !g->m_egu[l] || !g->m_edn[l]) goto fail;
+      if (L->sh_gate_w.data && si > 0) {
+        g->m_sgw[l] = dev_copy(L->sh_gate_w.data, (size_t)si * g->E);
+        g->m_suw[l] = dev_copy(L->sh_up_w.data, (size_t)si * g->E);
+        g->m_sdw[l] = dev_copy(L->sh_down_w.data, (size_t)g->E * si);
+        g->m_sgate[l] = dev_copy(L->sh_gate.data, (size_t)g->E);
+        if (!g->m_sgw[l] || !g->m_suw[l] || !g->m_sdw[l] || !g->m_sgate[l]) goto fail;
+      }
+    }
     int is_lin = (m->layer_kind && m->layer_kind[l] == 2) ||
                  (!m->layer_kind && L->lin_idx >= 0);
     /* t11：投影宽度按层类型/门控定：lin 层 q 槽=qkvz、o 槽=[E,vald]；
@@ -3611,12 +4149,14 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
           if (L->o8 && L->so8) ro = dev_copy_w4_from_i8(L->o8, L->so8, g->E, lin_vald, &g->ow4[l]);
           else ro = dev_copy_w4(L->lin_out_w.data, g->E, lin_vald, &g->ow4[l]);
         }
-        if (L->g8 && L->sg8) rg = dev_copy_w4_from_i8(L->g8, L->sg8, g->I, g->E, &g->gw4[l]);
-        else rg = dev_copy_w4(L->gate_w.data, g->I, g->E, &g->gw4[l]);
-        if (L->u8 && L->su8) ru = dev_copy_w4_from_i8(L->u8, L->su8, g->I, g->E, &g->uw4[l]);
-        else ru = dev_copy_w4(L->up_w.data, g->I, g->E, &g->uw4[l]);
-        if (L->d8 && L->sd8) rd = dev_copy_w4_from_i8(L->d8, L->sd8, g->E, g->I, &g->dw4[l]);
-        else rd = dev_copy_w4(L->down_w.data, g->E, g->I, &g->dw4[l]);
+        if (!L->is_moe) {
+          if (L->g8 && L->sg8) rg = dev_copy_w4_from_i8(L->g8, L->sg8, g->I, g->E, &g->gw4[l]);
+          else rg = dev_copy_w4(L->gate_w.data, g->I, g->E, &g->gw4[l]);
+          if (L->u8 && L->su8) ru = dev_copy_w4_from_i8(L->u8, L->su8, g->I, g->E, &g->uw4[l]);
+          else ru = dev_copy_w4(L->up_w.data, g->I, g->E, &g->uw4[l]);
+          if (L->d8 && L->sd8) rd = dev_copy_w4_from_i8(L->d8, L->sd8, g->E, g->I, &g->dw4[l]);
+          else rd = dev_copy_w4(L->down_w.data, g->E, g->I, &g->dw4[l]);
+        }
         if (rq || rk || rv || ro || rg || ru || rd) goto fail;
         /* PROJ 靠这些指针转发到 FP4 kernel（int8 数据不上传）*/
         g->qw8[l].w4 = &g->qw4[l];
@@ -3632,9 +4172,9 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
       int rv = is_lin ? 0 : dev_copy_w8_i8(L->v8, L->sv8, g->KD, g->E, &g->vw8[l]);
       int ro = is_lin ? dev_copy_w8_i8(L->o8, L->so8, g->E, lin_vald, &g->ow8[l])
                       : dev_copy_w8_i8(L->o8, L->so8, g->E, g->QD, &g->ow8[l]);
-      int rg = dev_copy_w8_i8(L->g8, L->sg8, g->I, g->E, &g->gw8[l]);
-      int ru = dev_copy_w8_i8(L->u8, L->su8, g->I, g->E, &g->uw8[l]);
-      int rd = dev_copy_w8_i8(L->d8, L->sd8, g->E, g->I, &g->dw8[l]);
+      int rg = L->is_moe ? 0 : dev_copy_w8_i8(L->g8, L->sg8, g->I, g->E, &g->gw8[l]);
+      int ru = L->is_moe ? 0 : dev_copy_w8_i8(L->u8, L->su8, g->I, g->E, &g->uw8[l]);
+      int rd = L->is_moe ? 0 : dev_copy_w8_i8(L->d8, L->sd8, g->E, g->I, &g->dw8[l]);
       if (rq || rk || rv || ro || rg || ru || rd) {
         /* 无 host int8（小模型 f32 检查点且未设 SGL_W8）时回退现量化。
          * lin 层没有 q/k/v/o_proj——q 槽是 in_proj_qkvz、o 槽是 out_proj。*/
@@ -3648,9 +4188,10 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
               dev_copy_w8(L->o_w.data, g->E, g->QD, &g->ow8[l]) != 0)
             goto fail;
         }
-        if (dev_copy_w8(L->gate_w.data, g->I, g->E, &g->gw8[l]) != 0 ||
-            dev_copy_w8(L->up_w.data, g->I, g->E, &g->uw8[l]) != 0 ||
-            dev_copy_w8(L->down_w.data, g->E, g->I, &g->dw8[l]) != 0)
+        if (!L->is_moe &&
+            (dev_copy_w8(L->gate_w.data, g->I, g->E, &g->gw8[l]) != 0 ||
+             dev_copy_w8(L->up_w.data, g->I, g->E, &g->uw8[l]) != 0 ||
+             dev_copy_w8(L->down_w.data, g->E, g->I, &g->dw8[l]) != 0))
           goto fail;
       }
       }
@@ -3686,10 +4227,12 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
       g->kw_h[l] = dev_copy_h(L->k_w.data, (size_t)g->KD * g->E);
       g->vw_h[l] = dev_copy_h(L->v_w.data, (size_t)g->KD * g->E);
       g->ow_h[l] = dev_copy_h(L->o_w.data, (size_t)g->E * g->QD);
-      g->gw_h[l] = dev_copy_h(L->gate_w.data, (size_t)g->I * g->E);
-      g->uw_h[l] = dev_copy_h(L->up_w.data, (size_t)g->I * g->E);
-      g->dw_h[l] = dev_copy_h(L->down_w.data, (size_t)g->E * g->I);
-      if (!g->qw_h[l] || !g->gw_h[l] || !g->dw_h[l]) goto fail;
+      if (!L->is_moe) {
+        g->gw_h[l] = dev_copy_h(L->gate_w.data, (size_t)g->I * g->E);
+        g->uw_h[l] = dev_copy_h(L->up_w.data, (size_t)g->I * g->E);
+        g->dw_h[l] = dev_copy_h(L->down_w.data, (size_t)g->E * g->I);
+      }
+      if (!g->qw_h[l] || (!L->is_moe && (!g->gw_h[l] || !g->dw_h[l]))) goto fail;
       /* norms and biases stay fp32 (attention path is fp32 throughout) */
       g->ln1[l] = dev_copy(L->inp_norm.data, (size_t)g->E);
       g->ln2[l] = dev_copy(L->post_norm.data, (size_t)g->E);
@@ -3715,10 +4258,12 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
     g->qn[l] = L->q_norm.data ? dev_copy(L->q_norm.data, (size_t)g->D) : NULL;
     g->kn[l] = L->k_norm.data ? dev_copy(L->k_norm.data, (size_t)g->D) : NULL;
     g->ln2[l] = dev_copy(L->post_norm.data, (size_t)g->E);
-    g->gw[l] = dev_copy(L->gate_w.data, (size_t)g->I * g->E);
-    g->uw[l] = dev_copy(L->up_w.data, (size_t)g->I * g->E);
-    g->dw[l] = dev_copy(L->down_w.data, (size_t)g->E * g->I);
-    if (!g->ln1[l] || !g->qw[l] || !g->gw[l] || !g->dw[l]) goto fail;
+      if (!L->is_moe) {
+        g->gw[l] = dev_copy(L->gate_w.data, (size_t)g->I * g->E);
+        g->uw[l] = dev_copy(L->up_w.data, (size_t)g->I * g->E);
+        g->dw[l] = dev_copy(L->down_w.data, (size_t)g->E * g->I);
+      }
+    if (!g->ln1[l] || !g->qw[l] || (!L->is_moe && (!g->gw[l] || !g->dw[l]))) goto fail;
     CT("layer %d/%d uploaded", l + 1, g->L);
   }
 
@@ -4820,7 +5365,25 @@ void sgl_cuda_free(sgl_cuda_model *g) {
     if (g->gw_h && g->gw_h[l]) cudaFree(g->gw_h[l]);
     if (g->uw_h && g->uw_h[l]) cudaFree(g->uw_h[l]);
     if (g->dw_h && g->dw_h[l]) cudaFree(g->dw_h[l]);
+    /* G20: MoE 权重（专家张量是单块分配，直接 cudaFree）*/
+    if (g->m_router && g->m_router[l]) cudaFree(g->m_router[l]);
+    if (g->m_egu && g->m_egu[l]) cudaFree(g->m_egu[l]);
+    if (g->m_edn && g->m_edn[l]) cudaFree(g->m_edn[l]);
+    if (g->m_sgw && g->m_sgw[l]) cudaFree(g->m_sgw[l]);
+    if (g->m_suw && g->m_suw[l]) cudaFree(g->m_suw[l]);
+    if (g->m_sdw && g->m_sdw[l]) cudaFree(g->m_sdw[l]);
+    if (g->m_sgate && g->m_sgate[l]) cudaFree(g->m_sgate[l]);
   }
+  free(g->lmoe);
+  free(g->m_router); free(g->m_egu); free(g->m_edn);
+  free(g->m_sgw); free(g->m_suw); free(g->m_sdw); free(g->m_sgate);
+  if (g->moe_rl) cudaFree(g->moe_rl);
+  if (g->moe_wt) cudaFree(g->moe_wt);
+  if (g->moe_sel) cudaFree(g->moe_sel);
+  if (g->moe_mid) cudaFree(g->moe_mid);
+  if (g->moe_shmid) cudaFree(g->moe_shmid);
+  if (g->moe_sg) cudaFree(g->moe_sg);
+  if (g->moe_x) cudaFree(g->moe_x);
   free(g->ln1); free(g->qw); free(g->kw); free(g->vw); free(g->ow);
   free(g->qb); free(g->kb); free(g->vb);
   free(g->ln2); free(g->gw); free(g->uw); free(g->dw);
@@ -5320,6 +5883,10 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
         k_rmsnorm<<<n, 256, 256 * sizeof(float), g->stream>>>(g->x, g->ln2[l], g->h, n, E,
                                                               g->eps);
       CK(cudaGetLastError());
+      if (g->lmoe && g->lmoe[l]) {
+        /* G20：MoE 层（路由 + top-k 专家 + 共享专家），输出写 g->h */
+        if (moe_forward(g, l, g->h, g->h, n) != 0) return -1;
+      } else {
       PROJ(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, g->gw8 ? &g->gw8[l] : NULL,
            NULL, g->gate, n, g->I, E);
       PROJ(g, g->h, g->uw[l], g->uw_h ? g->uw_h[l] : NULL, g->uw8 ? &g->uw8[l] : NULL,
@@ -5329,6 +5896,7 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
           g->gate, g->up, (long)n * g->I);
       PROJ(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, g->dw8 ? &g->dw8[l] : NULL,
            NULL, g->h, n, E, g->I);
+      }
       CK(cudaGetLastError());
       k_residual<<<(int)(((long)n * E + 255) / 256), 256, 0, g->stream>>>(g->x, g->h,
                                                                           (long)n * E);
@@ -5463,6 +6031,9 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
                                                                g->eps);
     else
       k_rmsnorm<<<n, 256, 256 * sizeof(float), g->stream>>>(g->x, g->ln2[l], g->h, n, E, g->eps);
+    if (g->lmoe && g->lmoe[l]) {
+      if (moe_forward(g, l, g->h, g->h, n) != 0) return -1;
+    } else {
     PROJ(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, g->gw8 ? &g->gw8[l] : NULL, NULL,
          g->gate, n, g->I, E);
     PROJ(g, g->h, g->uw[l], g->uw_h ? g->uw_h[l] : NULL, g->uw8 ? &g->uw8[l] : NULL, NULL,
@@ -5471,6 +6042,7 @@ static int fwd_seg_llama(sgl_cuda_model *g, const int *tokens, const float *emb,
     k_silu_mul<<<(int)(((long)n * g->I + 255) / 256), 256, 0, g->stream>>>(g->gate, g->up, (long)n * g->I);
     PROJ(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, g->dw8 ? &g->dw8[l] : NULL, NULL,
          g->h, n, E, g->I);
+    }
     CK(cudaGetLastError());
     k_residual<<<(int)(((long)n * E + 255) / 256), 256, 0, g->stream>>>(g->x, g->h, (long)n * E);
     CK(cudaGetLastError());
@@ -5729,6 +6301,9 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
         k_rmsnorm_p1<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln2[l], g->h, B, E, g->eps);
       else
         k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln2[l], g->h, B, E, g->eps);
+      if (g->lmoe && g->lmoe[l]) {
+        if (moe_forward(g, l, g->h, g->h, B) != 0) return -1;
+      } else {
       PROJ(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, g->gw8 ? &g->gw8[l] : NULL,
            NULL, g->gate, B, g->I, E);
       PROJ(g, g->h, g->uw[l], g->uw_h ? g->uw_h[l] : NULL, g->uw8 ? &g->uw8[l] : NULL,
@@ -5738,6 +6313,7 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
                                                                     (long)B * g->I);
       PROJ(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, g->dw8 ? &g->dw8[l] : NULL,
            NULL, g->h, B, E, g->I);
+      }
       CK(cudaGetLastError());
       k_residual<<<(int)(((long)B * E + 255) / 256), 256, 0, s>>>(g->x, g->h, (long)B * E);
       CK(cudaGetLastError());
@@ -5860,6 +6436,9 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
       k_rmsnorm_p1<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln2[l], g->h, B, E, g->eps);
     else
       k_rmsnorm<<<B, 256, 256 * sizeof(float), s>>>(g->x, g->ln2[l], g->h, B, E, g->eps);
+    if (g->lmoe && g->lmoe[l]) {
+      if (moe_forward(g, l, g->h, g->h, B) != 0) return -1;
+    } else {
     PROJ(g, g->h, g->gw[l], g->gw_h ? g->gw_h[l] : NULL, g->gw8 ? &g->gw8[l] : NULL, NULL,
          g->gate, B, g->I, E);
     PROJ(g, g->h, g->uw[l], g->uw_h ? g->uw_h[l] : NULL, g->uw8 ? &g->uw8[l] : NULL, NULL,
@@ -5868,6 +6447,7 @@ static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
     k_silu_mul<<<(int)(((long)B * g->I + 255) / 256), 256, 0, s>>>(g->gate, g->up, (long)B * g->I);
     PROJ(g, g->gate, g->dw[l], g->dw_h ? g->dw_h[l] : NULL, g->dw8 ? &g->dw8[l] : NULL, NULL,
          g->h, B, E, g->I);
+    }
     CK(cudaGetLastError());
     k_residual<<<(int)(((long)B * E + 255) / 256), 256, 0, s>>>(g->x, g->h, (long)B * E);
     CK(cudaGetLastError());

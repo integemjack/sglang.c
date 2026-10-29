@@ -116,16 +116,29 @@ foreach(t ${SGL_TESTS})
   add_executable(${name} ${t})
   target_link_libraries(${name} PRIVATE sgl)
   add_test(NAME ${name} COMMAND ${name})
-  set_tests_properties(${name} PROPERTIES ENVIRONMENT "SGL_TEST_MODEL=${SGL_MODELS_DIR}/gpt2;SGL_TEST_LLAMA=${SGL_MODELS_DIR}/tiny-llama;SGL_TEST_LLAMA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_tinyllama.json;SGL_TEST_TINYLLAMA=${SGL_MODELS_DIR}/tinyllama;SGL_TEST_QWEN=${SGL_MODELS_DIR}/qwen05;SGL_TEST_LORA=${SGL_MODELS_DIR}/test-lora;SGL_TEST_LORA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora.json;SGL_TEST_LORA_S1=${SGL_MODELS_DIR}/test-lora-s1;SGL_TEST_LORA_S2=${SGL_MODELS_DIR}/test-lora-s2;SGL_TEST_LORA_REF_S1=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s1.json;SGL_TEST_LORA_REF_S2=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s2.json;SGL_TEST_LLAVA=${SGL_MODELS_DIR}/llava-rand;SGL_TEST_CLIP_REAL=${SGL_MODELS_DIR}/clip-vit-base-patch32;SGL_TEST_GGUF=${SGL_MODELS_DIR}/smollm2-135m-gguf;SGL_TEST_GGUF_REF=${SGL_MODELS_DIR}/smollm2-135m;SGL_TEST_GGUF_SINGLE=${SGL_MODELS_DIR}/gguf-quants/Q2_K;SGL_TEST_QWEIGHT_REAL=${SGL_MODELS_DIR}/qweight-real;SGL_TEST_QW_FIXTURES=${SGL_MODELS_DIR};SGL_TEST_QW_ORIGINAL=${SGL_MODELS_DIR}/mistral-rand")
+  set_tests_properties(${name} PROPERTIES ENVIRONMENT "SGL_TEST_MODEL=${SGL_MODELS_DIR}/gpt2;SGL_TEST_LLAMA=${SGL_MODELS_DIR}/tiny-llama;SGL_TEST_LLAMA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_tinyllama.json;SGL_TEST_TINYLLAMA=${SGL_MODELS_DIR}/tinyllama;SGL_TEST_QWEN=${SGL_MODELS_DIR}/qwen05;SGL_TEST_LORA=${SGL_MODELS_DIR}/test-lora;SGL_TEST_LORA_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora.json;SGL_TEST_LORA_S1=${SGL_MODELS_DIR}/test-lora-s1;SGL_TEST_LORA_S2=${SGL_MODELS_DIR}/test-lora-s2;SGL_TEST_LORA_REF_S1=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s1.json;SGL_TEST_LORA_REF_S2=${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_lora_s2.json;SGL_TEST_LLAVA=${SGL_MODELS_DIR}/llava-rand;SGL_TEST_CLIP_REAL=${SGL_MODELS_DIR}/clip-vit-base-patch32;SGL_TEST_GGUF=${SGL_MODELS_DIR}/smollm2-135m-gguf;SGL_TEST_GGUF_REF=${SGL_MODELS_DIR}/smollm2-135m;SGL_TEST_GGUF_SINGLE=${SGL_MODELS_DIR}/gguf-quants/Q2_K;SGL_TEST_QWEIGHT_REAL=${SGL_MODELS_DIR}/qweight-real;SGL_TEST_QW_FIXTURES=${SGL_MODELS_DIR};SGL_TEST_QW_ORIGINAL=${SGL_MODELS_DIR}/mistral-rand;SGL_TEST_MARLIN_UNIT=${CMAKE_CURRENT_SOURCE_DIR}/tests/_marlin_unit.json")
 endforeach()
 
+# ---- Unigram(SentencePiece) tokenizer 对照：夹具/参考任一缺失则测试自己 SKIP ----
+if(EXISTS ${SGL_MODELS_DIR}/unigram-t5/tokenizer.json AND
+   EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/_ref_unigram.json)
+  set_tests_properties(test_unigram PROPERTIES ENVIRONMENT
+    "SGL_TEST_UNIGRAM=${SGL_MODELS_DIR}/unigram-t5;SGL_TEST_UNIGRAM_REF=${CMAKE_CURRENT_SOURCE_DIR}/tests/_ref_unigram.json")
+endif()
+
 # ---- AWQ / GPTQ 夹具：存在就注册端到端对照（ref json 由 tests/gen_awq_gptq.py 生成）----
-foreach(qv awq gptq gptq-act)
+# gptq-v2 的参考直接用 v1 的 ref json：两份夹具的权重按定义完全相同，
+# 只有 qzeros 的落盘编码不同（tests/make_gptq_v2.py 生成）。
+foreach(qv awq gptq gptq-act gptq-v2 ct4 mxfp4 marlin marlin8)
   string(REPLACE "-" "_" _n ${qv})
+  set(_refname ${_n})
+  if(qv STREQUAL "gptq-v2")
+    set(_refname gptq)
+  endif()
   if(EXISTS ${SGL_MODELS_DIR}/mistral-rand-${qv}/model.safetensors AND
-     EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/_ref_mistral_${_n}.json)
+     EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/_ref_mistral_${_refname}.json)
     add_test(NAME test_family_qw_${_n} COMMAND test_llama ${SGL_MODELS_DIR}/mistral-rand-${qv}
-             ${CMAKE_CURRENT_SOURCE_DIR}/tests/_ref_mistral_${_n}.json)
+             ${CMAKE_CURRENT_SOURCE_DIR}/tests/_ref_mistral_${_refname}.json)
     set_tests_properties(test_family_qw_${_n} PROPERTIES DEPENDS test_llama)
   endif()
 endforeach()
@@ -134,6 +147,14 @@ endforeach()
 if(EXISTS ${SGL_MODELS_DIR}/llava-rand/clip_model.safetensors AND EXISTS ${SGL_MODELS_DIR}/llava-rand/_ref_proj.npy)
   set_tests_properties(test_llava PROPERTIES DEPENDS test_llama
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+
+# ---- G21 多图：需要带 <image> 的语言模型夹具（tests/make_llava_lm.py 生成）----
+if(EXISTS ${SGL_MODELS_DIR}/llava-lm/model.safetensors AND
+   EXISTS ${SGL_MODELS_DIR}/llava-rand/clip_model.safetensors)
+  set_tests_properties(test_llava_multi PROPERTIES DEPENDS test_llama
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ENVIRONMENT "SGL_TEST_LLAVA=${SGL_MODELS_DIR}/llava-rand")
 endif()
 
 # ---- G8 真实 CLIP 权重分层对照（下载 + 跑 tests/clip_real_ref.py 后才注册，防 fresh-clone 红）----
@@ -362,13 +383,18 @@ if(SGL_CUDA)
   target_link_libraries(cuda_cli PRIVATE sgl_cuda)
   add_executable(long_vcpu tests/long_vcpu.c)  # t2 acceptance: 8K prefill GPU vs CPU
   target_link_libraries(long_vcpu PRIVATE sgl_cuda)
+  # G20：GPU MoE 层自测（随机权重 vs CPU 朴素实现，不需模型文件；不是 ctest，需要真显卡）
+  add_executable(cuda_moe_test tests/cuda_moe_test.c)
+  target_link_libraries(cuda_moe_test PRIVATE sgl_cuda)
   add_executable(cuda_perf tests/cuda_perf.c)  # G1/G2/G3 perf A/B (no assertions)
   target_link_libraries(cuda_perf PRIVATE sgl_cuda)
-  add_executable(cuda_http apps/cuda_http.c)
+  # W1：服务层 apps/accel_http.c 后端无关（只经 sgl_accel_api 函数表调设备），
+  # 每个后端再加一个薄壳（apps/cuda_http.c）提供表与 main。
+  add_executable(cuda_http apps/accel_http.c apps/cuda_http.c)
   # ---- sglc 单 exe：内嵌 GPU 引擎（sglc --serve --device auto 时优先用它）----
   # cuda_http.c 的 main 被 SGL_EMBED_CUDA_HTTP 包住，sglc 只调它的 sgl_cuda_http_serve()。
   # 只链 sgl_cuda（含 CPU 侧全部源），不再链 sgl：同一份源进两个静态库会撞符号。
-  target_sources(sglc PRIVATE apps/cuda_http.c)
+  target_sources(sglc PRIVATE apps/accel_http.c apps/cuda_http.c)
   target_compile_definitions(sglc PRIVATE SGL_EMBED_CUDA_HTTP=1)
   set_target_properties(sglc PROPERTIES LINK_LIBRARIES "")
   target_link_libraries(sglc PRIVATE sgl_cuda)
@@ -393,7 +419,7 @@ if(SGL_CUDA)
       message(FATAL_ERROR "cublas.lib not found under ${CUDA_TOOLKIT_DIR}/lib (arch ${SGL_WIN_CUDA_ARCH_DIR})")
     endif()
     message(STATUS "CUDA libs: ${SGL_WIN_CUDA_LIBDIR}")
-    foreach(t cuda_test cuda_qwen35_test cuda_deepseek_test cuda_cli long_vcpu cuda_perf cuda_http sglc)
+    foreach(t cuda_test cuda_qwen35_test cuda_deepseek_test cuda_moe_test cuda_cli long_vcpu cuda_perf cuda_http sglc)
       target_link_libraries(${t} PRIVATE
           "${SGL_WIN_CUDA_LIBDIR}/cudart_static.lib"
           "${SGL_WIN_CUDA_LIBDIR}/cublas.lib")
@@ -442,9 +468,90 @@ if(SGL_CUDA)
     # 才报 "undefined reference to __cxa_guard_acquire"。
     set(SGL_CUDA_RUNTIME_LIBS ${SGL_CUDART_STATIC} ${SGL_CUBLAS_LIB} stdc++ pthread dl rt m)
     message(STATUS "CUDA link libs: ${SGL_CUDA_RUNTIME_LIBS}")
-    foreach(t cuda_test cuda_qwen35_test cuda_deepseek_test cuda_cli long_vcpu cuda_perf cuda_http sglc)
+    foreach(t cuda_test cuda_qwen35_test cuda_deepseek_test cuda_moe_test cuda_cli long_vcpu cuda_perf cuda_http sglc)
       target_link_libraries(${t} PRIVATE ${SGL_CUDA_RUNTIME_LIBS})
     endforeach()
   endif()
   message(STATUS "CUDA backend: enabled (sm_${SGL_CUDA_ARCH})")
+endif()
+
+# ---- MLX 后端（SGL_MLX=ON，Apple Silicon / Metal）----
+# 与 CUDA 块同构：sgl_mlx = CPU 库同一份源 + src/mlx_backend.cpp（C++20）+ 服务层薄壳。
+# MLX 的 C++ 头与 dylib 随 `pip install mlx` 一起装在 site-packages/mlx/{include,lib} 下，
+# 默认从 python 探测；也可 -DSGL_MLX_ROOT=<.../site-packages/mlx> 指定。
+# T1 出 mlx_test / mlx_http 两个独立程序；T2 起把 MLX 引擎内嵌进 sglc
+# （--device auto → cuda → mlx → cpu；显式 --device mlx 也可）。
+option(SGL_MLX "Build MLX backend (Apple Silicon; needs mlx C++ headers/libs)" OFF)
+if(SGL_MLX)
+  if(NOT APPLE)
+    message(FATAL_ERROR "SGL_MLX=ON 只支持 Apple Silicon（MLX 的 GPU 后端是 Metal）")
+  endif()
+  if(NOT SGL_MLX_ROOT)
+    foreach(_py python3 python)
+      execute_process(
+        COMMAND ${_py} -c "import mlx,os;print(os.path.dirname(mlx.__file__))"
+        OUTPUT_VARIABLE _mxroot OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+      if(_mxroot AND EXISTS "${_mxroot}/include/mlx/mlx.h")
+        set(SGL_MLX_ROOT "${_mxroot}")
+        break()
+      endif()
+    endforeach()
+  endif()
+  set(SGL_MLX_ROOT "${SGL_MLX_ROOT}" CACHE PATH
+      "MLX 安装根（含 include/mlx 与 lib/libmlx.dylib）；留空则从 python 探测")
+  if(NOT SGL_MLX_ROOT OR NOT EXISTS "${SGL_MLX_ROOT}/include/mlx/mlx.h")
+    message(FATAL_ERROR
+      "找不到 MLX 的 C++ 头。装：pip install mlx；或 -DSGL_MLX_ROOT=<site-packages/mlx>")
+  endif()
+  find_library(SGL_MLX_LIB NAMES mlx PATHS "${SGL_MLX_ROOT}/lib" NO_DEFAULT_PATH)
+  if(NOT SGL_MLX_LIB)
+    message(FATAL_ERROR "找不到 libmlx（应在 ${SGL_MLX_ROOT}/lib）")
+  endif()
+  message(STATUS "MLX: root=${SGL_MLX_ROOT} lib=${SGL_MLX_LIB}")
+
+  enable_language(CXX)
+  set(CMAKE_CXX_STANDARD 20)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+  add_library(sgl_mlx STATIC ${SGL_SOURCES} src/mlx_backend.cpp)
+  target_include_directories(sgl_mlx PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
+    ${SGL_MLX_ROOT}/include)
+  target_compile_options(sgl_mlx PUBLIC -O2 -funroll-loops)
+  if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(sgl_mlx PUBLIC -fopenmp)
+    target_link_options(sgl_mlx INTERFACE -fopenmp)
+  endif()
+  # MLX 头要求这两个宏（Accelerate 的新 LAPACK 接口 + Metal 后端），与 tools/mlx_smoke 一致
+  target_compile_definitions(sgl_mlx PUBLIC ACCELERATE_NEW_LAPACK _METAL_)
+  target_link_libraries(sgl_mlx PUBLIC ${SGL_MLX_LIB} m)
+  # libmlx.dylib 不在系统路径里，rpath 指过去，免得运行时 dyld 找不到
+  set_target_properties(sgl_mlx PROPERTIES
+    BUILD_RPATH "${SGL_MLX_ROOT}/lib" INSTALL_RPATH "${SGL_MLX_ROOT}/lib")
+
+  add_executable(mlx_test tests/mlx_test.c)
+  target_link_libraries(mlx_test PRIVATE sgl_mlx)
+  add_executable(mlx_q4_test tests/mlx_q4_test.c)
+  target_link_libraries(mlx_q4_test PRIVATE sgl_mlx)
+  add_executable(mlx_http apps/accel_http.c apps/mlx_http.c)
+  target_link_libraries(mlx_http PRIVATE sgl_mlx)
+  # ---- sglc 单 exe：内嵌 MLX 引擎（--device auto 的 cuda → **mlx** → cpu 第二档）----
+  # 与 CUDA 块同构：mlx_http.c 的 main 被 SGL_EMBED_MLX_HTTP 包住，sglc 只调
+  # sgl_mlx_http_serve()。同一个 sglc 目标（CUDA 与 MLX 不会同时启用：前者要
+  # nvcc、后者要 Apple Silicon），所以不另建 sglc_mlx，免得用户记两个程序名。
+  if(TARGET sglc)
+    target_sources(sglc PRIVATE apps/accel_http.c apps/mlx_http.c)
+    target_compile_definitions(sglc PRIVATE SGL_EMBED_MLX_HTTP=1)
+    # sglc 默认链的是 sgl（纯 CPU 库）；sgl_mlx 已经把同一份 CPU 源加自己的
+    # 后端对象。两个静态库一起链会撞符号（与 CUDA 块同样的处理：先清空再重设）。
+    set_target_properties(sglc PROPERTIES LINK_LIBRARIES "")
+    target_link_libraries(sglc PRIVATE sgl_mlx)
+    set_target_properties(sglc PROPERTIES BUILD_RPATH "${SGL_MLX_ROOT}/lib")
+    message(STATUS "sglc: embedded MLX engine (--device auto → cuda → mlx → cpu)")
+  endif()
+  foreach(_t mlx_test mlx_http)
+    set_target_properties(${_t} PROPERTIES BUILD_RPATH "${SGL_MLX_ROOT}/lib")
+  endforeach()
+  message(STATUS "MLX backend: enabled")
 endif()

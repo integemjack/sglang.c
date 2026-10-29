@@ -159,6 +159,11 @@ void sgl_cuda_gemm_bench(void);
 /* 自由显存（MB，调试/规划用）*/
 long sgl_cuda_free_mem_mb(void);
 
+/* G20 MoE 层自测：随机权重 + 随机输入，GPU 结果与 CPU 朴素实现逐值对比。
+ * 不依赖模型文件；成功返回 0 并把最大绝对误差写入 *out_maxerr。*/
+int sgl_cuda_moe_selftest(int rows, int E, int NE, int topk, int mi, int si, int norm_topk,
+                          float scale, int seed, double *out_maxerr);
+
 #ifdef __cplusplus
 }
 #endif

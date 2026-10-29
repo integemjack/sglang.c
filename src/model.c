@@ -84,6 +84,13 @@ int sgl_model_ctx(const sgl_model *m) {
   return ((sgl_llama *)m->impl)->n_ctx;
 }
 
+/* G21：文本隐藏维（视觉 emb 的行宽也是它 —— projector 输出就是 E）。*/
+int sgl_model_hidden(const sgl_model *m) {
+  if (m->kind == 0) return ((sgl_gpt2 *)m->impl)->n_embd;
+  if (m->kind == 2) return sgl_deepseek_hidden((sgl_deepseek *)m->impl);
+  return ((sgl_llama *)m->impl)->n_embd;
+}
+
 int sgl_model_pages_alloc(sgl_model *m, int *idx, int n) {
   if (m->kind == 0) return sgl_gpt2_pages_alloc((sgl_gpt2 *)m->impl, idx, n);
   if (m->kind == 2) return sgl_deepseek_pages_alloc((sgl_deepseek *)m->impl, idx, n);
