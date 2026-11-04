@@ -233,9 +233,13 @@ static void mxw_open(const char *dir) {
       if (b == std::string::npos) break;
       std::string tok = js.substr(a + 1, b - a - 1);
       i = b + 1;
-      if (tok.size() > 11 && tok.compare(tok.size() - 11, 11, ".safetensors") == 0 &&
+      /* ".safetensors" 是 12 个字符（之前写成 11，扫描器从未命中过 ——
+       * 多分片分支一直是死代码，直到第一个真多分片模型进来才暴露）。
+       * 去重要拿文件名比对：这里先存名字，加载时再拼 dir（之前存的已是
+       * 全路径却拿文件名去重，永远不命中，同一分片被加载几百遍）。*/
+      if (tok.size() > 12 && tok.compare(tok.size() - 12, 12, ".safetensors") == 0 &&
           std::find(shards.begin(), shards.end(), tok) == shards.end())
-        shards.push_back(dir + ("/" + tok));
+        shards.push_back(tok);
     }
     if (shards.empty()) {
       MLX_ERR("index.json 里没提取到分片名");
@@ -245,9 +249,10 @@ static void mxw_open(const char *dir) {
   }
   g_mxw = new std::unordered_map<std::string, mx::array>();
   for (auto &s : shards) {
-    auto ld = mx::load_safetensors(s.c_str());
+    std::string full = s[0] == '/' ? s : dir + ("/" + s);
+    auto ld = mx::load_safetensors(full.c_str());
     for (auto &kv : ld.first) g_mxw->insert_or_assign(kv.first, kv.second);
-    if (dbg()) MLX_LOG("分片 %s: %zu 张量", s.c_str(), ld.first.size());
+    if (dbg()) MLX_LOG("分片 %s: %zu 张量", full.c_str(), ld.first.size());
   }
 }
 

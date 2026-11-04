@@ -91,18 +91,25 @@ HTTP 端到端 290 token：37.8 tok/s（decode 23.5 ms + 调度 gap 3.3 ms）。
 - 「量子纠缠」→ 正确的中文解释
 - 「What is the capital of France?」→「The capital of France is Paris.」
 
-## T2 剩余（进行中）
+## T2 剩余 —— ✅ 2026-11-04 完成（多分片 + 7B）
 
-- **多分片**：7B-4bit 下载验收中
-- **MXFP4**：代码支持 + 单测（无现成小检查点）
+- **多分片**：2-shard 合成检查点 logits 与单文件逐位一致（修掉两个死代码 bug，
+  见 NOTES §8.1）；7B 单分片 + index.json 也走此路径 ✓
+- **7B 验收**：Qwen2.5-7B-4bit 生成与官方逐字一致，单条 8.5 tok/s、并发 4 条
+  14.8 tok/s（带宽上限 ~15.8）；修复分数矩阵 fp16 溢出（→ f32），0.5B 4-bit
+  decode 反而升到 97.4 tok/s ✓
+- **MXFP4**：合成检查点验证链路（抓出 MLX 0.29.3 mxfp4 kernel 对 f16 输入给
+  垃圾值的 bug，已规避）✓
 
 ## 还没做
 
-### T2 剩余
+### T3
 - **现有 AWQ/GPTQ → MLX 量化**（现在只读 mlx-community 的格式）
 - **前缀缓存**（`copy_kv` 已通，但 radix/前缀命中还没接进 MLX 路径）、
   多模态 emb（接口已有 `emb` 参数）、gpt2 后端（`from_gpt2`）
-- **embed 的 `gather_qmm`**：现在 wte 存的是解量化的 fp16，7B 上会到 1 GB
+- **embed 的 `gather_qmm`**：现在 wte 存的是解量化副本，7B 上约 1.06 GB
+- **mxfp4 真实检查点**对拍（待 mlx-community 出小模型）
+- **GDN（metal_kernel）、MLA、MTP 投机解码、mx::compile 再调优**
 
 ### T3
 - GDN（`mx::fast::metal_kernel` 自定义）、MLA（DeepSeek 系）、MTP 投机解码

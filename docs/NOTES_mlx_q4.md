@@ -172,11 +172,50 @@ mlx-community 没有 0.5B 级的 mxfp4 检查点，用 Python 手写 safetensors
 | 加载 | 0.4 s（config-only + 惰性 safetensors） |
 | fp16 回归 | 6 个模型 12~13 项对拍全绿（紧凑化没碰坏单/多序列路径） |
 
-## 8. 没做的
+## 8. 多分片（.index.json）与 7B 验收
 
-- **多分片**（`.index.json`）：`mxw_open` 的多分片支持已写（逐 shard
-  `load_safetensors` 合并），正在用 Qwen2.5-7B-4bit（4 个 shard）验收中。
+### 8.1 多分片分支的两个死代码 bug（合成 2-shard 首次踩到）
+
+`mxw_open` 的 index.json 分支此前**从未真正跑过**（单文件和 7B 单分片都走了
+`model.safetensors` 的 fopen 分支），一进来就暴露两个 bug：
+
+1. `tok.compare(tok.size()-11, 11, ".safetensors")` —— 后缀是 **12** 个字符，
+   比较长度错了，扫描器**从未命中过任何分片名**（死代码的根因）；
+2. 去重拿文件名和**全路径**比 → 永不命中，同一分片被加载几百遍
+   （实测 index 里 314 个张量 → 「多分片：628 个」）。
+
+修好后：0.5B-4bit 拆成 2 shard + index.json，logits 与单文件**逐位一致**
+（2328:14.2578 …全同），加载路径 mxw（MLX 自己 mmap），不走 CPU 侧的
+U32 拒收路径。
+
+### 8.2 7B（Qwen2.5-7B-Instruct-4bit，单分片 4.28GB）
+
+| 项 | 结果 |
+|---|---|
+| logits vs `mlx_lm`（token 9707） | mean/std/min/max 五位全同（-4.98968/2.51581/-20.156/+11.312），top1 一致（1052:11.3125） |
+| 贪心生成（chat prompt） | **与官方逐字一致**：「我是Qwen，由阿里云开发的大型语言模型……」 |
+| 单条 HTTP | 8.5 tok/s（bench 口径 100ms/步 = 10 tok/s） |
+| 并发 4 条 | 14.8 tok/s 合计 |
+| 加载 | 4.6s（含 prewarm） |
+
+M1 带宽上限 ~15.8 tok/s（4.28GB/68GB/s），已在同量级。
+
+### 8.3 7B 曾报 NaN 的真相（两层叠加）
+
+1. **真问题**：hidden 的 max\|x\| 达 12032，QK^T 的分数矩阵若存回 fp16 直接
+   inf → NaN（Metal matmul 内部 f32 累加但输出按输入 dtype 存储官方 sdpa 的
+   分数留在 f32 寄存器）。修法：分数矩阵显式 f32（prefill 与 decode 两处）。
+   顺带效果：0.5B 的 4-bit decode 反而变快（13.30 → 10.26 ms/步 = **97.4 tok/s**）。
+2. **假象**：修完后仍见过 NaN —— 后来发现跑的是旧二进制（sync 后目标列表
+   漏了 sglc/mlx_q4_test，或 build 失败被过滤掉没看到）。教训：**每次报数字前
+   先核对远端二进制 mtime**。
+
+排查工具：`SGL_MLX_TRACE=1` 逐层 sum/max（与 Python 对照），`=2` 逐算子
+maxabs；`SGL_MLX_EVAL=位掩码`（1=KV写 2=分数 4=层尾）可插桩强制同步做对照。
+
+## 9. 没做的
+
 - **mxfp4 真实检查点**：合成数据已验证链路，待 mlx-community 出 0.5B 级
   mxfp4 后补端到端对拍。
-- **embed_tokens 的 gather_qmm**：现在 wte 是解量化的 272 MB，7B 级模型上
-  embed 会到 1 GB。MLX 有 `gather_qmm` 可以避免，属于 T3。
+- **embed_tokens 的 gather_qmm**：现在 wte 是解量化的稠密副本，7B 上 embed
+  约 1.06GB。MLX 有 `gather_qmm` 可以避免，属于 T3。

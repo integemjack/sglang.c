@@ -13,13 +13,19 @@ llama 系模型走 Metal。详见 [docs/PROGRESS_mlx.md](docs/PROGRESS_mlx.md)�
   Mistral/Gemma/Gemma-2 系 dense 层，含 GQA、qk-norm、q_gate、partial rotary、
   逐层不同 RoPE 表、sliding window、gemma softcap）。MoE / MLA / hybrid linear
   attention **明确拒绝并说明原因**（T3）。
-- **量化检查点（4-bit / 8-bit / MXFP4）**：直接读 `mlx-community` 格式
+- **量化检查点（4-bit / 8-bit / MXFP4，含多分片）**：直接读 `mlx-community` 格式
   （`.weight` U32 打包 + `.scales`/`.biases`），走 `mx::quantized_matmul`，
-  不解成 fp16；位宽与 group 从形状现场推断。Qwen2.5-0.5B：4-bit 磁盘 276 MB、
-  8-bit 525 MB（fp16 是 951 MB）；多分片（`.index.json`）已支持。
+  不解成 fp16；位宽与 group 从形状现场推断；`.index.json` 多分片支持
+  （修掉了两个死代码 bug：后缀长度 11→12、去重拿文件名与全路径比）。
+  Qwen2.5-0.5B：4-bit 磁盘 276 MB、8-bit 525 MB（fp16 是 951 MB）；
+  **Qwen2.5-7B-4bit（4.28GB）已验收**：生成与官方逐字一致，单条 8.5 tok/s、
+  并发 4 条 14.8 tok/s（M1 带宽上限 ~15.8）。
   MXFP4（无 biases、scales=U8）已验证：**顺带抓出 MLX 0.29.3 的 kernel bug ——
   mxfp4 的 `quantized_matmul` 对 f16/bf16 输入给垃圾值（f32 才对），已强制
   f32 输入规避**；`dequantize(mxfp4)` 输出 bf16 也已统一转回 wdt。
+- **分数矩阵 f32（7B 的 NaN 根因）**：7B-4bit 的 hidden max\|x\| 达 12032，
+  QK^T 存回 fp16 直接 inf。分数矩阵显式 f32 后 7B 正常，且 0.5B 4-bit decode
+  反而更快（13.30 → 10.26 ms/步 = **97.4 tok/s**）。
 - **mlx_lm 自身的 1D/2D 差异**：同一 token，1D 输入（`mx.array([id])`）与
   2D（`[[id]]）在 8-bit 下走出不同数值路径（batch=1 语义上应一致）。
   对拍脚本统一 2D。
@@ -32,8 +38,9 @@ llama 系模型走 Metal。详见 [docs/PROGRESS_mlx.md](docs/PROGRESS_mlx.md)�
   统计量全同。
 - **性能（M1，Qwen2.5-0.5B）**：
   - fp16 decode 69.0 → **23.2 ms/步**（43.2 tok/s），同机官方 `mlx_lm` 41.9；
-  - 4-bit decode **75.2 tok/s**，官方 80.7（差 6%）；并发 4 条 **111 tok/s**；
-  - 8-bit decode **58.3 tok/s**，官方 65.3。
+  - 4-bit decode **97.4 tok/s**（10.26 ms/步），官方 80.7；并发 4 条 **111 tok/s**；
+  - 8-bit decode **59.2 tok/s**，官方 65.3；
+  - 7B-4bit 单条 8.5 tok/s，并发 4 条 14.8 tok/s（上限 ~15.8）。
 - **四个每层 48 次强制同步点**：`decode_batch` 里 `krows.eval()` 把整步切成
   24×2 段，删掉后 MLX 才能跨层融合 kernel（45.4 → 23.2 ms/步）。
   教训：**MLX 里除最后一次取结果，中间不要 eval**。
