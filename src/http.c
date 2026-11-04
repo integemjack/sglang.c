@@ -1261,6 +1261,21 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
   /* ---- 流式分支（仅 ids[0]；n=1 已限制）---- */
   if (is_stream) {
     int id = ids[0];
+    /* G22 conformance：流式 stop 截断（与非流式同语义：截在停止串之前、不含
+     * 停止串；尾部凑出停止串前缀的字符扣住不发）+ 真实 finish_reason +
+     * stream_options.include_usage 的 usage 帧（对齐上游 openai 协议）*/
+    const sgl_json *so = sgl_json_get(j, "stream_options");
+    int include_usage = so ? json_bool(so, "include_usage") : 0;
+    int ptok = 0;
+    if (text) {
+      int nn = 0;
+      int *enc = sgl_sched_encode(srv->sched, text, (int)strlen(text), &nn);
+      if (enc) { ptok = nn; sgl_xfree(enc); }
+    }
+    sbuf acc;            /* 已生成文本累积（stop 判定基于全文，与非流式一致）*/
+    sb_init(&acc);
+    size_t emitted = 0;  /* acc 里已发出去的字节数 */
+    int ntok = 0, stop_hit = 0, finished = 0;
     respond_open_stream(fd);
     pthread_mutex_lock(&srv->lock);
     long seq = ++srv->req_counter;
@@ -1268,65 +1283,123 @@ static void route(sgl_http_server *srv, SOCKET fd, const http_req *req) {
     char idbuf[64];
     snprintf(idbuf, sizeof(idbuf), "%s-%ld", chat ? "chatcmpl" : "cmpl", seq);
     long created = (long)time(NULL);
-    for (;;) {
+    while (!finished) {
       char *piece = NULL;
       int tid;
       pthread_mutex_lock(&srv->lock);
       sgl_stream_ev ev = sgl_sched_stream_next(srv->sched, id, &piece, &tid);
       pthread_mutex_unlock(&srv->lock);
       if (ev == SGL_STREAM_TOKEN) {
-        sbuf b;
-        sb_init(&b);
-        sb_puts(&b, "data: {\"id\":\"");
-        sb_puts(&b, idbuf);
-        char head[160];
-        if (chat)
-          snprintf(head, sizeof(head),
-                   "\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
-                   "\"choices\":[{\"index\":0,\"delta\":{\"content\":",
-                   created, srv->model_name[0] ? srv->model_name : "sglang-c");
-        else
-          snprintf(head, sizeof(head),
-                   "\",\"object\":\"text_completion\",\"created\":%ld,\"model\":\"%s\","
-                   "\"choices\":[{\"index\":0,\"text\":",
-                   created, srv->model_name[0] ? srv->model_name : "sglang-c");
-        sb_puts(&b, head);
-        sb_putjson(&b, piece ? piece : "");
-        sb_puts(&b, chat ? "},\"finish_reason\":null}]}\n\n" : ",\"finish_reason\":null}]}\n\n");
-        send(fd, b.buf, (int)b.len, 0);
-        sgl_xfree(b.buf);
+        if (stop_hit) { sgl_xfree(piece); continue; } /* 已截断：丢弃余量 */
+        ntok++;
+        sb_puts(&acc, piece ? piece : "");
         sgl_xfree(piece);
+        size_t pend_to = acc.len;
+        if (n_stops > 0) {
+          /* 完整命中：全文最早出现的停止串 → 截在它之前（不含）*/
+          size_t hit_at = (size_t)-1;
+          for (int i = 0; i < n_stops; i++) {
+            if (!stops[i][0]) continue;
+            const char *m = strstr(acc.buf, stops[i]);
+            if (m && (hit_at == (size_t)-1 || (size_t)(m - acc.buf) < hit_at))
+              hit_at = (size_t)(m - acc.buf);
+          }
+          if (hit_at != (size_t)-1) {
+            acc.len = hit_at;
+            acc.buf[hit_at] = 0;
+            pend_to = hit_at;
+            stop_hit = 1;
+            pthread_mutex_lock(&srv->lock);
+            sgl_sched_abort(srv->sched, id); /* 提前掐掉后台生成 */
+            pthread_mutex_unlock(&srv->lock);
+          } else {
+            /* 尾部悬挂：acc 后缀是某停止串的真前缀时扣住不发（"th" 可能变 "the"）*/
+            size_t hold = 0;
+            for (int i = 0; i < n_stops; i++) {
+              size_t sl = strlen(stops[i]);
+              if (sl < 2 || acc.len < 1) continue;
+              size_t kmax = sl - 1 < acc.len ? sl - 1 : acc.len;
+              for (size_t k = kmax; k >= 1; k--) {
+                if (memcmp(acc.buf + acc.len - k, stops[i], k) == 0) {
+                  if (k > hold) hold = k;
+                  break;
+                }
+              }
+            }
+            pend_to = acc.len > hold ? acc.len - hold : 0;
+          }
+        }
+        while (emitted < pend_to) {
+          size_t n = pend_to - emitted;
+          if (n > 400) n = 400;
+          char tmp[401];
+          memcpy(tmp, acc.buf + emitted, n);
+          tmp[n] = 0;
+          sbuf b;
+          sb_init(&b);
+          sb_puts(&b, "data: {\"id\":\"");
+          sb_puts(&b, idbuf);
+          char head[160];
+          if (chat)
+            snprintf(head, sizeof(head),
+                     "\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
+                     "\"choices\":[{\"index\":0,\"delta\":{\"content\":",
+                     created, srv->model_name[0] ? srv->model_name : "sglang-c");
+          else
+            snprintf(head, sizeof(head),
+                     "\",\"object\":\"text_completion\",\"created\":%ld,\"model\":\"%s\","
+                     "\"choices\":[{\"index\":0,\"text\":",
+                     created, srv->model_name[0] ? srv->model_name : "sglang-c");
+          sb_puts(&b, head);
+          sb_putjson(&b, tmp);
+          sb_puts(&b, chat ? "},\"finish_reason\":null}]}\n\n" : ",\"finish_reason\":null}]}\n\n");
+          send(fd, b.buf, (int)b.len, 0);
+          sgl_xfree(b.buf);
+          emitted += n;
+        }
       } else if (ev == SGL_STREAM_DONE) {
-        sbuf b;
-        sb_init(&b);
-        sb_puts(&b, "data: {\"id\":\"");
-        sb_puts(&b, idbuf);
-        char tail[256];
-        if (chat)
-          snprintf(tail, sizeof(tail),
-                   "\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
-                   "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\n"
-                   "data: [DONE]\n\n",
-                   created, srv->model_name[0] ? srv->model_name : "sglang-c",
-                   "stop");
-        else
-          snprintf(tail, sizeof(tail),
-                   "\",\"object\":\"text_completion\",\"created\":%ld,\"model\":\"%s\","
-                   "\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"%s\"}]}\n\n"
-                   "data: [DONE]\n\n",
-                   created, srv->model_name[0] ? srv->model_name : "sglang-c",
-                   "stop");
-        sb_puts(&b, tail);
-        send(fd, b.buf, (int)b.len, 0);
-        sgl_xfree(b.buf);
-        pthread_mutex_lock(&srv->lock);
-        sgl_sched_reclaim_stream(srv->sched, id);
-        pthread_mutex_unlock(&srv->lock);
-        break;
+        finished = 1;
       } else {
         sgl_sleep_ms(25); /* MORE：等下一批 */
       }
     }
+    /* 收尾：真实 finish_reason（stop 命中=stop / 达 max_new=length / EOS=stop），
+     * include_usage 时再补一个空 choices 的 usage 帧（上游 openai 协议顺序）*/
+    const char *fin = stop_hit ? "stop" : (ntok >= max_new ? "length" : "stop");
+    const char *mname = srv->model_name[0] ? srv->model_name : "sglang-c";
+    sbuf b;
+    sb_init(&b);
+    char tail[320];
+    if (chat)
+      snprintf(tail, sizeof(tail),
+               "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,"
+               "\"model\":\"%s\",\"choices\":[{\"index\":0,\"delta\":{},"
+               "\"finish_reason\":\"%s\"}]}\n\n",
+               idbuf, created, mname, fin);
+    else
+      snprintf(tail, sizeof(tail),
+               "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,"
+               "\"model\":\"%s\",\"choices\":[{\"index\":0,\"text\":\"\","
+               "\"finish_reason\":\"%s\"}]}\n\n",
+               idbuf, created, mname, fin);
+    sb_puts(&b, tail);
+    if (include_usage) {
+      char u[320];
+      snprintf(u, sizeof(u),
+               "data: {\"id\":\"%s\",\"object\":\"%s\",\"created\":%ld,\"model\":\"%s\","
+               "\"choices\":[],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+               "\"total_tokens\":%d}}\n\n",
+               idbuf, chat ? "chat.completion.chunk" : "text_completion",
+               created, mname, ptok, ntok, ptok + ntok);
+      sb_puts(&b, u);
+    }
+    sb_puts(&b, "data: [DONE]\n\n");
+    send(fd, b.buf, (int)b.len, 0);
+    sgl_xfree(b.buf);
+    pthread_mutex_lock(&srv->lock);
+    sgl_sched_reclaim_stream(srv->sched, id);
+    pthread_mutex_unlock(&srv->lock);
+    sgl_xfree(acc.buf);
     sgl_xfree(prompt_copy);
     return;
   }

@@ -100,6 +100,7 @@ struct sgl_tokenizer {
   int eos_id;
   /* Llama/SentencePiece 路径（style=1）*/
   int style;            /* 0 = GPT-2 byte-level，1 = Llama metaspace，2 = Unigram(SP) */
+  int pre_qwen;         /* style=0 时：1 = Qwen/GPT-4o 风格预分词（按 Split Regex 签名判定）*/
   int bos_id;
   int byte_tok_ids[256]; /* "<0xXX>" token id；-1 不存在 */
   /* Unigram（SentencePiece）路径（style=2）：tokenizer.json 的 model.vocab 是
@@ -267,6 +268,24 @@ sgl_tokenizer *sgl_tokenizer_load(const char *path) {
   if (t->style != 2) {
     if (strcmp(pretype, "Metaspace") == 0) t->style = 1;
     if (sm_get(&t->vocab, "<s>") >= 0 && sm_get(&t->vocab, "<0x41>") >= 0) t->style = 1;
+  }
+  /* Qwen/GPT-4o 风格判定：Split 的 Regex 带 [^\r\n\p{L}\p{N}]?\p{L}+ 签名
+   * （符号挂词头 / 单数字 / 符号串吞换行），与 GPT-2 经典款切法不同 */
+  if (t->style == 0) {
+    const sgl_json *arr = NULL;
+    if (strcmp(pretype, "Sequence") == 0) arr = sgl_json_get(pre, "pretokenizers");
+    if (arr) {
+      for (int i = 0; i < arr->count && !t->pre_qwen; i++) {
+        const sgl_json *sp = arr->items[i];
+        const sgl_json *pat = sp ? sgl_json_get(sp, "pattern") : NULL;
+        const char *rx = pat ? sgl_json_get_str(pat, "Regex", "") : "";
+        if (rx && strstr(rx, "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")) t->pre_qwen = 1;
+      }
+    } else if (strcmp(pretype, "Split") == 0) {
+      const sgl_json *pat = sgl_json_get(pre, "pattern");
+      const char *rx = pat ? sgl_json_get_str(pat, "Regex", "") : "";
+      if (rx && strstr(rx, "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")) t->pre_qwen = 1;
+    }
   }
   t->bos_id = sm_get(&t->vocab, "<s>");
   t->eos_id = sm_get(&t->vocab, "</s>");
@@ -509,6 +528,146 @@ static int scan_next(scanner *s, int *start, int *end) {
   if (j < len && j - i > 1) j--;
   if (j == i) j++; /* 防死循环 */
   s->pos = j; *end = j;
+  return 1;
+}
+
+/* ---------- Qwen/GPT-4o 风格预分词 ----------
+ * (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} |
+ *  ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+ * 与 GPT-2 经典款的差别：单个前导符号可挂字母段（"(x"）；数字按单码点切
+ * （"123"→三个段）；符号段吞尾部换行（"):\n"）；含换行的空白段整体成块。
+ * \p{L}/\p{N} 用实用码点区间表（ASCII+拉丁扩展+希腊/西里尔+CJK+谬文…），
+ * 冷门文字会落到符号类——切分仍合法，但与 HF 可能不同。 */
+
+static int cp_is_letter(unsigned c) {
+  if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) return 1;
+  if (c == 0xAA || c == 0xB5 || c == 0xBA) return 1;
+  if (c >= 0xC0 && c <= 0x24F) return 1;    /* 拉丁扩展 */
+  if (c >= 0x370 && c <= 0x52F) return 1;   /* 希腊/西里尔/亚美尼亚 */
+  if (c >= 0x5D0 && c <= 0x5EA) return 1;   /* 希伯来 */
+  if (c >= 0x620 && c <= 0x64A) return 1;   /* 阿拉伯 */
+  if (c >= 0x900 && c <= 0x97F) return 1;   /* 天城文 */
+  if (c >= 0xE00 && c <= 0xE7F) return 1;   /* 泰文 */
+  if (c >= 0x1E00 && c <= 0x1FFF) return 1;
+  if (c >= 0x3040 && c <= 0x30FF) return 1; /* 假名 */
+  if (c >= 0x3400 && c <= 0x4DBF) return 1;
+  if (c >= 0x4E00 && c <= 0x9FFF) return 1; /* CJK */
+  if (c >= 0xA000 && c <= 0xA48F) return 1;
+  if (c >= 0xAC00 && c <= 0xD7A3) return 1; /* 谚文 */
+  if (c >= 0xF900 && c <= 0xFAFF) return 1;
+  if (c >= 0xFF21 && c <= 0xFF3A) return 1; /* 全角字母 */
+  if (c >= 0xFF41 && c <= 0xFF5A) return 1;
+  if (c >= 0x20000 && c <= 0x2FA1F) return 1;
+  return 0;
+}
+static int cp_is_digit(unsigned c) {
+  if (c >= '0' && c <= '9') return 1;
+  if (c >= 0x660 && c <= 0x669) return 1;
+  if (c >= 0x6F0 && c <= 0x6F9) return 1;
+  if (c >= 0xFF10 && c <= 0xFF19) return 1;
+  return 0;
+}
+static int cp_is_space(unsigned c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+/* (?i:'s|'t|'re|'ve|'m|'ll|'d)：大小写不敏感 */
+static int match_abbr_ci(const unsigned char *p, int i, int len) {
+  static const char *ab[] = {"s", "t", "re", "ve", "m", "ll", "d", NULL};
+  for (int a = 0; ab[a]; a++) {
+    int l = (int)strlen(ab[a]);
+    if (i + 1 + l > len) continue;
+    int ok = 1;
+    for (int k = 0; k < l; k++) {
+      char x = (char)p[i + 1 + k];
+      if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+      if (x != ab[a][k]) { ok = 0; break; }
+    }
+    if (ok) return 1 + l;
+  }
+  return 0;
+}
+
+/* 取 [i,len) 处 codepoint；越界返回 0 */
+static int cp_peek(const unsigned char *p, int i, int len, unsigned *cp, int *w) {
+  if (i >= len) return 0;
+  *cp = utf8_next(p + i, (size_t)(len - i), w);
+  return 1;
+}
+
+static int scan_next_qwen(scanner *s, int *start, int *end) {
+  if (s->pos >= (int)s->len) return 0;
+  *start = s->pos;
+  const unsigned char *p = s->p;
+  int i = s->pos, len = (int)s->len;
+  unsigned cp; int w;
+
+  /* 1 缩写（大小写不敏感）*/
+  if (p[i] == '\'' && i + 1 < len) {
+    int m = match_abbr_ci(p, i, len);
+    if (m) { s->pos = i + m; *end = s->pos; return 1; }
+  }
+
+  /* 2 [^\r\n L N]? L+：单个前导符号挂字母段（"(x"、" f"）*/
+  {
+    int j = i;
+    if (cp_peek(p, j, len, &cp, &w) &&
+        cp != '\r' && cp != '\n' && !cp_is_letter(cp) && !cp_is_digit(cp)) {
+      unsigned c2; int w2;
+      if (cp_peek(p, j + w, len, &c2, &w2) && cp_is_letter(c2)) j += w;
+    }
+    if (cp_peek(p, j, len, &cp, &w) && cp_is_letter(cp)) {
+      while (cp_peek(p, j, len, &cp, &w) && cp_is_letter(cp)) j += w;
+      s->pos = j; *end = j; return 1;
+    }
+  }
+
+  /* 3 \p{N}：单码点（"123"→三段）*/
+  if (cp_peek(p, i, len, &cp, &w) && cp_is_digit(cp)) {
+    s->pos = i + w; *end = s->pos; return 1;
+  }
+
+  /* 4 ` ?[^\s L N]+[\r\n]*`：可选前导空格 + 符号串 + 尾部换行（"+:\n"）*/
+  {
+    int j = i;
+    if (p[j] == ' ' && j + 1 < len) j++;
+    int k = j;
+    while (k < len) {
+      if ((unsigned char)p[k] < 0x80) {
+        unsigned c = (unsigned char)p[k];
+        if (cp_is_space(c) || cp_is_letter(c) || cp_is_digit(c)) break;
+        k++;
+      } else {
+        unsigned c; int ww;
+        cp_peek(p, k, len, &c, &ww);
+        if (cp_is_space(c) || cp_is_letter(c) || cp_is_digit(c)) break;
+        k += ww;
+      }
+    }
+    if (k > j) {
+      while (k < len && (p[k] == '\r' || p[k] == '\n')) k++;
+      s->pos = k; *end = k; return 1;
+    }
+  }
+
+  /* 5 \s*[\r\n]+：整段空白切在最后一个 \r\n 之后（"  \n  "→"  \n"+余）*/
+  {
+    int j = i;
+    while (j < len && is_space_b(p[j])) j++;
+    int lastnl = -1;
+    for (int k = j - 1; k >= i; k--)
+      if (p[k] == '\r' || p[k] == '\n') { lastnl = k; break; }
+    if (lastnl >= 0) { s->pos = lastnl + 1; *end = lastnl + 1; return 1; }
+    if (j > i) {
+      /* 6 \s+(?!\S)：段尾后是非空白则留最后一个空白给后续段当 ` ?` */
+      int e = j;
+      if (j < len && e - i > 1) e--;
+      s->pos = e; *end = e; return 1;
+    }
+  }
+
+  /* 7 兜底：单字节（防死循环；正常到不了这里）*/
+  s->pos = i + 1; *end = i + 1;
   return 1;
 }
 
@@ -780,7 +939,9 @@ static void gpt2_encode_plain(const sgl_tokenizer *t, const char *text, size_t l
   while (i < len) {
     scanner sc = {(const unsigned char *)text, len, (int)i};
     int start, end;
-    if (!scan_next(&sc, &start, &end)) break;
+    int got = t->pre_qwen ? scan_next_qwen(&sc, &start, &end)
+                          : scan_next(&sc, &start, &end);
+    if (!got) break;
     i = (size_t)sc.pos;
 
     /* 段内：bytes → unicode 空间的单字符串序列，再 BPE 合并 */

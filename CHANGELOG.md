@@ -2,6 +2,19 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — 与上游语义对拍：套件 + 三处修正（2026-11-05）
+
+新套件 `tests/conformance_upstream.py`（HF 分词器/模板当真值 + 上游源码语义断言，
+35 项）；顺带修了它抓出的三个 bug，详见 [docs/NOTES_conformance.md](docs/NOTES_conformance.md)：
+
+- **Qwen 系预分词**（`src/bpe.c`）：新增 `scan_next_qwen`（符号挂词头/单数字/符号
+  串吞换行），按 tokenizer.json 的 Split Regex 签名派发；经典 GPT-2/Metaspace/
+  Unigram 路径零改动。修前缩进代码的 token 序列与 HF 不一致。
+- **流式 stop**（`src/http.c`）：流式分支加累积缓冲 + 尾部悬挂回扣（停止串前缀
+  不先吐），命中即截并 `sgl_sched_abort` 提前掐掉后台生成；非流式语义不变。
+- **流式协议**：finish 帧不再硬编码 `"stop"`（max_tokens→`"length"`）；
+  `stream_options.include_usage` 补上（`[DONE]` 前空 choices 的 usage 帧）。
+
 ## [v0.5.0] — 2026-11-04 「补齐上游能力面 + MLX 后端 + 投机解码采样 + 页级 KV」
 
 v0.4.0 之后的两周把 GAP_vs_upstream 盘点的差距大头补掉：权重/服务面/多模态/MoE 对齐上游
