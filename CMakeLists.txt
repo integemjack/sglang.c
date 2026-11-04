@@ -153,9 +153,10 @@ endif()
 if(EXISTS ${SGL_MODELS_DIR}/llava-lm/model.safetensors AND
    EXISTS ${SGL_MODELS_DIR}/llava-rand/clip_model.safetensors)
   set_tests_properties(test_llava_multi PROPERTIES DEPENDS test_llama
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..
     ENVIRONMENT "SGL_TEST_LLAVA=${SGL_MODELS_DIR}/llava-rand")
 endif()
+# G21: no WORKING_DIRECTORY here - CI has models inside the checkout; the test
+# resolves llava-lm as a sibling of SGL_TEST_LLAVA instead.
 
 # ---- G8 真实 CLIP 权重分层对照（下载 + 跑 tests/clip_real_ref.py 后才注册，防 fresh-clone 红）----
 if(EXISTS ${SGL_MODELS_DIR}/clip-vit-base-patch32/model.safetensors AND

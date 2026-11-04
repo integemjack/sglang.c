@@ -52,6 +52,22 @@ static long read_raw(const char *path, float *dst, long n) {
 int main(void) {
   const char *dir = getenv("SGL_TEST_LLAVA");
   if (!dir || !*dir) dir = "models/llava-rand";
+  /* llava-lm 目录：从 SGL_TEST_LLAVA 的同级目录解析（dirname(llava-rand)/llava-lm）。
+   * 不能写死相对路径——CTest 的 CWD 在本地是 <root>/sglang-c/build、在 CI 是
+   * checkout/build，两者「models 在哪」不同，同级解析两边都对。*/
+  char lmdir[512];
+  {
+    const char *sl = strrchr(dir, '/');
+#ifdef _WIN32
+    const char *bs = strrchr(dir, '\\');
+    if (!sl || (bs && bs > sl)) sl = bs;
+#endif
+    if (sl && (size_t)(sl - dir) < sizeof(lmdir) - 32) {
+      snprintf(lmdir, sizeof(lmdir), "%.*s/llava-lm", (int)(sl - dir), dir);
+    } else {
+      snprintf(lmdir, sizeof(lmdir), "llava-lm");
+    }
+  }
   char p[512];
   snprintf(p, sizeof(p), "%s/clip_model.safetensors", dir);
   FILE *probe = fopen(p, "rb");
@@ -116,7 +132,7 @@ int main(void) {
   sgl_projector_apply(&pj, feats_b, NP, vb);
 
   /* ---- 3) 调度器：两图 vs 单图 ---- */
-  sgl_scheduler *s = sgl_sched_new("models/llava-lm", 42);
+  sgl_scheduler *s = sgl_sched_new(lmdir, 42);
   CHECK(s != NULL, "sched new");
   if (!s) return 1;
   int img_tok = sgl_sched_piece_id(s, "<image>");
@@ -172,10 +188,10 @@ int main(void) {
 
   /* ---- 4) 手工参考：把两个占位符各换成对应视觉段，跑 unimodal emb 前向 ---- */
   {
-    sgl_model *m = sgl_model_load("models/llava-lm");
+    sgl_model *m = sgl_model_load(lmdir);
     CHECK(m != NULL, "model load");
     if (m) {
-      sgl_llama *g_lm = sgl_llama_load("models/llava-lm");
+      sgl_llama *g_lm = sgl_llama_load(lmdir);
       CHECK(g_lm != NULL, "llama load（取 wte 行用）");
       int ntok = 0;
       int *tt = sgl_sched_encode(s, prompt2, strlen(prompt2), &ntok);
