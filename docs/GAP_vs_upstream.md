@@ -184,11 +184,13 @@ KV 默认仍是连续 FP32 池，`SGL_KVQ=1` 才切到分页量化池（M2，默
 CPU 侧倒是完整的页级 radix + refcount + LRU + chunked prefill + 抢占。
 补法：把 `radix.c` 的页表语义搬到设备显存（`DESIGN_1M_32C.md` §5.1/§7 已有设计）。
 
-**B3 排队与公平性（CPU 已补，GPU 无）**
+**B3 排队与公平性（CPU 已补，GPU 已验证同义）**
 
-CPU 调度器现在有优先级：`sgl_sched_submit_prio`（HTTP body 的 `priority` 字段），等待队列按优先级取
-（同优先级 FIFO），抢占先抢优先级最低、生成最少的。仍未做：prefill delayer、`min_free_slots_delayer`、
-请求分池（上游 `schedule_policy.py` 里那套）。GPU 服务的段租约调度器仍然没有优先级。
+CPU 调度器有优先级：`sgl_sched_submit_prio`（HTTP body 的 `priority` 字段），等待队列按优先级取
+（同优先级 FIFO），抢占先抢优先级最低、生成最少的。**GPU 服务的段租约调度器同样有优先级**
+（W2：HTTP `priority` 字段 + 等待队列按优先级插队），2026-11-05 实测验证
+（tools/prio_serve_check.py：CONC=1 单槽下 prio5 先于 prio0 被准入）。仍未做：
+prefill delayer、`min_free_slots_delayer`、请求分池（上游 `schedule_policy.py` 里那套）。
 
 **B4 KV 分层（P2 视场景）**
 
