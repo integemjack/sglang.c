@@ -79,16 +79,18 @@ static void test_marlin_unit(const char *path) {
       continue;
     }
     int32_t *qwv = (int32_t *)sgl_xmalloc(sizeof(int32_t) * (size_t)jw->count);
-    /* JSON 里可能是无符号 32 位数，先经 uint32 转再落 int32，避开越界转换的 UB */
+    /* JSON 里是带符号十进制 int32。不能走 (unsigned long long)num：负 double 转
+     * 无符号是 UB——x86 回绕恰好还原位型，arm64（FCVTZU 饱和）会归零，四用例
+     * 全挂（2026-11-05 CI 实证）。先转 int64（值域内精确定义）再落 int32。*/
     for (int i = 0; i < jw->count; i++)
-      qwv[i] = (int32_t)(uint32_t)(unsigned long long)jw->items[i]->num;
+      qwv[i] = (int32_t)(int64_t)jw->items[i]->num;
     float *scv = (float *)sgl_xmalloc(sizeof(float) * (size_t)js->count);
     for (int i = 0; i < js->count; i++) scv[i] = (float)js->items[i]->num;
     int32_t *qzv = NULL;
     if (has_z && jz && jz->count > 0) {
       qzv = (int32_t *)sgl_xmalloc(sizeof(int32_t) * (size_t)jz->count);
       for (int i = 0; i < jz->count; i++)
-        qzv[i] = (int32_t)(uint32_t)(unsigned long long)jz->items[i]->num;
+        qzv[i] = (int32_t)(int64_t)jz->items[i]->num;
     }
     sgl_qcfg q;
     memset(&q, 0, sizeof(q));

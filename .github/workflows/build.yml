@@ -111,6 +111,7 @@ jobs:
           python3 tests/gen_random_gemma.py     --out models/gemma2-rand    --tokenizer models/qwen3-06 --variant dynamic
           python3 tests/gen_random_qwen3next.py --out models/qwen3next-rand --tokenizer models/qwen3-06
           python3 tests/gen_random_llava.py     --out models/llava-rand
+          python3 tests/make_llava_lm.py
           python3 tests/ref_llava.py models/llava-rand tests/_ref_llava.json
           ls -d models/*-rand
 
@@ -176,6 +177,7 @@ jobs:
           python tests/gen_random_gemma.py     --out models/gemma2-rand    --tokenizer models/qwen3-06 --variant dynamic
           python tests/gen_random_qwen3next.py --out models/qwen3next-rand --tokenizer models/qwen3-06
           python tests/gen_random_llava.py     --out models/llava-rand
+          python tests/make_llava_lm.py
           python tests/ref_llava.py models/llava-rand tests/_ref_llava.json
           Get-ChildItem -Directory models/*-rand | Select-Object Name
 
