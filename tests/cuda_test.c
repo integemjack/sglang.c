@@ -502,9 +502,11 @@ int main(int argc, char **argv) {
   fclose(f);
 
   /* SGL_CUDA_ONLY_SPEC=1：只跑文末的真实组合投机段（greedy + 修正采样）。
-   * 全量 cuda_test 在显存被桌面/其他进程挤占时，会在 gemm-bench 之后的
-   * pure-decode 段 AV 崩溃（HEAD 亦然，非 spec 改动引起）；这个开关让
-   * spec 段的验证不依赖前面的段落。 */
+   * 历史：全量 cuda_test 在显存被桌面挤占时带 0xC0000409/0xC0000005 崩溃，
+   * 曾误判为「pure-decode 段 forward 崩溃」；2026-11-05 经 WER 偏移+map+反
+   * 汇编定位到真因：gemm-bench 的 Af_h 越界写（float 存入 2 字节/half 的
+   * pinned 缓冲，堆布局紧张时打穿未提交页）——已修。这个开关仍保留：
+   * 让 spec 段验证不依赖前面的段落（快速迭代/低显存场景）。 */
   {
     const char *os = getenv("SGL_CUDA_ONLY_SPEC");
     if (os && atoi(os)) {
@@ -665,11 +667,14 @@ int main(int argc, char **argv) {
    * steps. Runs when the suite itself is fp32 (uploads a second fp16 model);
    * when SGL_CUDA_FP16=1 the whole suite above already IS the fp16 case
    * (compared against the fp32 CPU reference with gap-aware assertions). */
-  if (!FP16) {
+  if (!FP16 && !getenv("SGL_TEST_NO_CROSS")) {
     printf("[fp16] uploading second (fp16) model for cross-check...\n");
     _putenv("SGL_CUDA_FP16=1");
     sgl_cuda_model *gpu16 = sgl_cuda_from_llama(cpu);
     _putenv("SGL_CUDA_FP16=0");
+    if (!gpu16 && sgl_cuda_last_refusal_near_oom()) {
+      printf("[fp16] SKIP: not enough VRAM for a second model (near-OOM refusal)\n");
+    } else {
     CHECK(gpu16, "fp16 upload");
     if (gpu16) {
       float *l16 = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
@@ -717,6 +722,7 @@ int main(int argc, char **argv) {
       sgl_xfree(l16);
       sgl_cuda_free(gpu16);
     }
+    }
   }
   /* ---- G2 W8A8 int8 projections ----
    * t8 established W8 == fp32 greedy for 10 steps with the dp4a GEMV used at
@@ -729,11 +735,14 @@ int main(int argc, char **argv) {
    *   (a) W8/IMMA prefill vs W8/dp4a prefill: maxerr ~ 0 (path equivalence),
    *   (b) W8 prefill top1 + logits budget vs the fp32 GPU model,
    *   (c) greedy 10 decode steps W8 vs fp32: 10/10 (t8 acceptance re-run). */
-  {
+  if (!getenv("SGL_TEST_NO_CROSS")) {
     printf("[w8] uploading int8 model...\n");
     _putenv("SGL_CUDA_W8=1");
     sgl_cuda_model *gw8 = sgl_cuda_from_llama(cpu);
     _putenv("SGL_CUDA_W8=0");
+    if (!gw8 && sgl_cuda_last_refusal_near_oom()) {
+      printf("[w8] SKIP: not enough VRAM for a third model (near-OOM refusal)\n");
+    } else {
     CHECK(gw8, "w8 upload");
     if (gw8) {
       float *l8 = (float *)sgl_xmalloc(sizeof(float) * (size_t) V);
@@ -777,6 +786,7 @@ int main(int argc, char **argv) {
       CHECK(g8 == 10, "W8 changed greedy decode");
       sgl_xfree(l8); sgl_xfree(l8b);
       sgl_cuda_free(gw8);
+    }
     }
   }
   /* GEMM bench (sgemm vs hgemm on real shapes; also hand M=1 kernels) */

@@ -165,6 +165,9 @@ int sgl_cuda_mtp_hlast_save(sgl_cuda_model *m, float *host);
 int sgl_cuda_mtp_hlast_restore(sgl_cuda_model *m, const float *host);
 /* 隐藏维 E（hsnap 缓冲大小依据；<0 = 无效）*/
 int sgl_cuda_hidden(const sgl_cuda_model *m);
+/* G22c：最近一次 sgl_cuda_from_llama 返回 NULL 是否因为「上传后余量低于工作区
+ * 下限」的主动拒绝（非权重/拷贝真失败）。测试据此 SKIP 而非 FAIL。*/
+int sgl_cuda_last_refusal_near_oom(void);
 
 /* 一次验证：对 toks[0..n-1]（= [t0, 草稿...]）在 pos0 处做带因果掩码的前向，
  * 每行一份 logits（host，[n][V]），同时开启逐行状态快照。

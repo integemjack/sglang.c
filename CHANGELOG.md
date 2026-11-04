@@ -2,6 +2,28 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — G22c：cuda_test 历次 AV 崩溃根因修复（gemm-bench 越界写）+ 显存护栏（2026-11-05）
+
+**根因（WER 偏移 + map + 反汇编实证）**：`sgl_cuda_gemm_bench` 的 `Af_h` 声明为
+`float*`，但分配是 `cudaMallocHost(MMAX*K*2)`（2 字节/half）——`Af_h[i] =
+__float2half(ta[i])` 里 `__half` 隐式转回 float 后按 4 字节写入，**2× 越界写穿
+pinned 缓冲**。堆布局宽松时静默污染周边（大显存机器「能过」），紧张时打穿
+未提交页（0xC0000005）或污染 CRT 堆元数据（0xC0000409 fail-fast）。这就是
+从第一天起所有「gemm-bench 后 pure-decode 段 AV/0xC0000409」的真因——当时
+被 stdout 管道缓冲误导成「forward 崩溃」。修复：声明改 `__half*`。
+
+- **定位方法存档**（可复用）：Windows 事件日志 Id=1000 拿崩溃偏移（固定
+  0x34f9e/0x34f5e，模块 cuda_test.exe 自己）→ link /MAP 拿符号区间 →
+  dumpbin /disasm 拿指令（`movss [rax+rbx*4],xmm0` 的写入循环）→源码对照。
+- **配套**：`sgl_cuda_from_llama` 上传后显存余量护栏（reserve(1024行) 激活 +
+  cuBLAS 工作区，下限校准为 128MB 起步；历史依据：qwen3-06@ctx8192 上传后
+  ~409MB 长期稳定服务全绿）；`sgl_cuda_last_refusal_near_oom()` +
+  `dev_copy` 的 cudaErrorMemoryAllocation 也置标志——cuda_test 的 fp16/w8
+  交叉验证段据此 SKIP 而非 FAIL（低显存机器不再假红）。
+- **验收**：同样低显存条件（桌面占 ~1GB、ctx=4096），修复前第 3 个 gemm shape
+  必崩，修复后全量 `test_cuda: all OK`（exit 0，含 batch 265+ tok/s、spec 三段）；
+  conformance 双栈、kvq_serve_check、spec_serve_check 全绿。
+
 ## [Unreleased] — G22b：混跑投机（MTP 多请求共存 + hlast 按行快照）（2026-11-05）
 
 以前投机解码只在「单请求 + 贪心」时触发（nb==1 的门槛）：一旦有第二个请求在跑，

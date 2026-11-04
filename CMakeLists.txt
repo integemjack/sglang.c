@@ -372,6 +372,7 @@ if(SGL_CUDA)
     endif()
   endif()
   add_executable(cuda_test tests/cuda_test.c)
+  target_link_options(cuda_test PRIVATE "/MAP:$<TARGET_FILE_DIR:cuda_test>/cuda_test.map")
   target_link_libraries(cuda_test PRIVATE sgl_cuda)
   # 迷你 qwen3_5（hybrid + q_gate）CPU vs GPU 逐层数值对比
   add_executable(cuda_qwen35_test tests/cuda_qwen35_test.c)

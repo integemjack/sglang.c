@@ -28,6 +28,9 @@
     }                                                                    \
   } while (0)
 
+/* G22c：from_llama 的 near-OOM 拒绝标志（定义在 from_llama 前，见 cuda.h）*/
+static int g_last_refusal_near_oom = 0;
+
 /* M26a: attention path split. upto = positions attended by the last row.
  * <= SHORT_MAX keeps the original shared-scores kernel (numerics unchanged);
  * beyond that the two-pass chunked kernel removes the shared-memory cap.
@@ -2905,6 +2908,8 @@ static float *dev_copy(const float *src, size_t n) {
   cudaError_t e = cudaMalloc(&d, n * sizeof(float));
   if (e != cudaSuccess) {
     printf("[ZZ alloc-fail] %zu floats: %s\n", n, cudaGetErrorString(e));
+    if (e == cudaErrorMemoryAllocation) /* G22c：真 OOM 也算显存耗尽，测试据此 SKIP */
+      g_last_refusal_near_oom = 1;
     return NULL;
   }
   if (src) {
@@ -3885,6 +3890,7 @@ static int cuda_trace_on(void) {
 
 sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
   const sgl_llama *m = (const sgl_llama *)llama_model;
+  g_last_refusal_near_oom = 0; /* G22c：每次尝试重置，只反映最近一次*/
   if (!m) return NULL;
   sgl_cuda_model *g = (sgl_cuda_model *)calloc(1, sizeof(*g));
   size_t ctx = 0; /* declared up front: goto fail below must not bypass it */
@@ -4390,6 +4396,33 @@ sgl_cuda_model *sgl_cuda_from_llama(const void *llama_model) {
        hs * 4.0 / 1048576);
   }
   if (g->use_fp16) printf("[cuda] fp16 weights ON (SGL_CUDA_FP16=1)\n");
+  /* G22c：上传后显存余量护栏。边缘 OOM（权重/KV 刚好挤进去、剩余低于工作区
+   * 需求）时，后续 reserve/gemm/图捕获会在驱动层 fail-fast（宿主拿到
+   * 0xC0000409、无调用栈可查——实测桌面占 ~1GB 时 qwen3-06 全量 cuda_test
+   * 在 pure-decode 段即如此）。与其被驱动杀进程，不如在这里拒绝：算出工作区
+   * 下限，不够就干净释放返回 NULL（调用方各自给出可操作的错误）。*/
+  {
+    long free_mb = sgl_cuda_free_mem_mb();
+    /* 下限 = reserve(1024 行) 的激活缓冲 + cuBLAS 工作区 + decode 图余量。
+     * 行宽按最大列数（QD>KD 时 q/attn 半边更宽）保守估计。*/
+    size_t row_b = (size_t)(g->QD > g->E ? g->QD : g->E) * 4 * 2 /* q2/qgate 半边 */
+                 + (size_t)g->E * 4 * 3 /* x/h/attn */
+                 + (size_t)g->KD * 4 * 2 + (size_t)g->I * 4 * 2;
+    long need_mb = (long)((size_t)1024 * row_b / 1048576) + 96;
+    if (need_mb < 128) need_mb = 128;
+    /* 下限校准：reserve(1024 行) 激活 + cuBLAS 工作区 + decode 图余量。历史依据：
+     * qwen3-06@ctx8192 上传后剩 ~409MB 长期稳定服务（conformance 全绿）；而
+     * 「上传后 0MB 会崩」的老假设 2026-11-05 被推翻——那些崩溃全是 gemm-bench
+     * 的 Af_h 越界写（已修），不是 near-OOM。故下限取保守的工作区需求而非大余量。*/
+    if (free_mb >= 0 && free_mb < need_mb) {
+      fprintf(stderr,
+              "sgl_cuda_from_llama: upload ok but only %ld MB free < workspace "
+              "floor %ld MB - refusing near-OOM (smaller SGL_CUDA_CTX or "
+              "SGL_CUDA_W8=1)\n", free_mb, need_mb);
+      g_last_refusal_near_oom = 1;
+      goto fail;
+    }
+  }
   g->st = (void *)m->st; /* M3：MTP 加载复用主模型的 safetensors 上下文 */
   return g;
 
@@ -4572,6 +4605,9 @@ int sgl_cuda_mtp_hlast_restore(sgl_cuda_model *g, const float *host) {
                     cudaMemcpyHostToDevice) == cudaSuccess ? 0 : -1;
 }
 int sgl_cuda_hidden(const sgl_cuda_model *g) { return g ? g->E : -1; }
+
+/* G22c：from_llama 的 near-OOM 拒绝标志（见 cuda.h）*/
+int sgl_cuda_last_refusal_near_oom(void) { return g_last_refusal_near_oom; }
 
 /* 一步草稿：给定位置 pos 的 hidden（device [E] 单行）与该位置的 token，
  * 预测 pos+1 的 token。
@@ -6885,7 +6921,13 @@ void sgl_cuda_gemm_bench(void) {
          ITERS);
   for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
     int N = shapes[si].N, K = shapes[si].K;
-    float *Wf = NULL, *Af = NULL, *Cf = NULL, *Af_h = NULL;
+    float *Wf = NULL, *Af = NULL, *Cf = NULL;
+    __half *Af_h = NULL; /* t8 修复：half 暂存区。原声明 float* ——
+     * 「Af_h[i] = __float2half(ta[i])」里 __half 隐式转回 float 后按 4 字节写入
+     * 2 字节/元素分配的 pinned 缓冲（2× 越界写）。堆布局宽松时静默污染周边，
+     * 紧张时打穿未提交页（0xC0000005）或污染 CRT 堆元数据（0xC0000409
+     * fail-fast）——即「gemm-bench 后 AV」历次崩溃的真因（2026-11-05
+     * 经 WER 偏移+map+反汇编定位到 0x140034F9E movss）。*/
     __half *Wh = NULL, *Ah = NULL;
     int8_t *Wi8 = NULL, *Ai8 = NULL; /* t8: IMMA vs dp4a bench buffers */
     int *Ci32 = NULL;
