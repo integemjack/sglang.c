@@ -3691,13 +3691,15 @@ int sgl_cuda_moe_selftest(int rows, int E, int NE, int topk, int mi, int si, int
   float *h_mid = (float *)malloc(sizeof(float) * (size_t)mi);
   float *h_dn = (float *)malloc(sizeof(float) * (size_t)E);
   int ok = 0;
+  /* 固定种子的 LCG（可重现，不依赖 rand() 的实现）。声明必须在下面 goto done
+   * 之前：C++ 不允许 goto 跳过带初始化的声明进入其作用域（MSVC 容忍，nvcc 拒绝
+   * ——linux-cuda CI 自 MoE 随机初始化合入起一直红的原因，2026-11-05）。*/
+  unsigned st = (unsigned)seed;
+#define NX() (st = st * 1664525u + 1013904223u, ((float)((st >> 8) & 0xFFFF) / 32768.0f - 1.0f) * 0.12f)
   if (!h_router || !h_egu || !h_edn || !h_sgw || !h_suw || !h_sdw || !h_sgate || !h_in ||
       !h_out || !h_ref || !h_rl || !h_gu || !h_mid || !h_dn)
     goto done;
 
-  /* 固定种子的 LCG（可重现，不依赖 rand() 的实现）*/
-  unsigned st = (unsigned)seed;
-#define NX() (st = st * 1664525u + 1013904223u, ((float)((st >> 8) & 0xFFFF) / 32768.0f - 1.0f) * 0.12f)
   for (size_t i = 0; i < nrouter; i++) h_router[i] = NX();
   for (size_t i = 0; i < ngu; i++) h_egu[i] = NX();
   for (size_t i = 0; i < ndn; i++) h_edn[i] = NX();

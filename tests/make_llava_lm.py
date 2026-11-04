@@ -40,7 +40,8 @@ def main():
                       "lstrip": False, "rstrip": False, "normalized": False,
                       "special": True})
     json.dump(tok, open(os.path.join(DST, "tokenizer.json"), "w", encoding="utf-8"))
-    print("wrote %s（分词器加了 <image>，id=%d）" % (DST, added[-1]["id"]))
+    # print 全 ASCII：Windows runner 的 stdout 是 cp1252，中文会 UnicodeEncodeError
+    print("wrote %s (tokenizer gained <image>, id=%d)" % (DST, added[-1]["id"]))
     return 0
 
 

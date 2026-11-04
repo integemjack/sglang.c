@@ -755,10 +755,14 @@ int sgl_sched_reload_weights(sgl_scheduler *s, int inst, const char *model_dir) 
       SGL_ERROR("reload_weights: load failed (%s), instance %d unchanged", model_dir, k);
       return -1;
     }
-    sgl_model_free(s->insts[k].model);
-    s->insts[k].model = nm;
+    /* 顺序：先 radix_free（把页释放回旧模型的池）再 model_free——反过来的话
+     * radix_free 会写进已释放的池（UAF；macOS allocator 立即解除大块映射，
+     * CI 的 test_reload SEGFAULT 即此，2026-11-05；Linux/Windows 靠 freed-仍映射
+     * 侥幸不崩）。与 sched_free/卸 lora 路径的顺序对齐。*/
     sgl_radix_free(s->insts[k].radix); /* 旧 KV 页属于旧模型的池 */
     s->insts[k].radix = sgl_radix_new(nm);
+    sgl_model_free(s->insts[k].model);
+    s->insts[k].model = nm;
     SGL_INFO("weights reloaded on instance %d (%s)", k, model_dir);
   }
   return 0;
