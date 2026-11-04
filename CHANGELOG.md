@@ -2,6 +2,29 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [v0.5.0] · CI 修复：五处根因，9 目标全绿（2026-11-05）
+
+CI 自 10-28 起全红（发版后首次完整盯完才发现），五层根因逐个修掉：
+
+1. **workflow 缺夹具**：test_llava_multi 需要的 models/llava-lm（make_llava_lm.py
+   生成）从没进过 CI 夹具步骤；且脚本路径按本地布局写死（repo 外 models/），
+   加 --src/--out + 测试改为从 SGL_TEST_LLAVA 同级目录解析。
+2. **产品 UAF（真 bug）**：`sgl_sched_reload_weights` 先 `sgl_model_free` 后
+   `radix_free`——而 radix_free 要把页释放回旧模型的池，写进已释放内存。
+   macOS allocator 立即解除大块映射 → test_reload SEGFAULT；Linux/Windows 靠
+   freed-仍映射侥幸不崩。已按 sched_free 的正确顺序对齐。
+3. **UB（arm64 现形）**：test_qweight 把负 double 经 `(unsigned long long)` 转
+   int32——x86 回绕恰好还原位型，arm64 FCVTZU 饱和归零 → 4 个 marlin 用例全挂。
+   改为先转 int64。
+4. **nvcc 拒收 goto 跳过初始化**（MSVC 容忍）：cuda_backend.cu MoE 随机初始化的
+   LCG 声明在 goto 之后，linux-cuda 自该代码合入起红；声明上移。
+5. 脚本 print ASCII 化（Windows runner cp1252）+ 删排障遗留的 MSVC /MAP 链接旗标
+   （linux ld 当路径）。
+
+验证：run
+[41900893470](https://github.com/integemjack/sglang.c/actions/runs/41900893470)
+9 目标全绿（含 macos-mlx 的 MLX/Metal 参考链）；本地 CPU ctest 相关子集 6/6。
+
 ## [v0.5.0] · 与 HF 参考实现的端到端生成对拍（双栈 4/4）（2026-11-05）
 
 - **`tools/hf_ref_check.py`**：qwen3-06 贪心 24 token，CPU/GPU 双栈的服务输出 vs
