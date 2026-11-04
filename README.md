@@ -129,7 +129,9 @@ on GitHub's arm64 Windows runner. Every push builds and packages all of them; th
 cannot run on the GPU-less runners, so they are smoke-checked instead (binaries present, `ldd`/`dumpbin`
 architecture and dependencies, `sglc` usage exit code) and left to be run on real hardware. All nine targets
 are green as of v0.4.0 (run
-[40456249230](https://github.com/integemjack/sglang.c/actions/runs/40456249230)).
+[40456249230](https://github.com/integemjack/sglang.c/actions/runs/40456249230));
+v0.5.0 is verified on real hardware only (Windows x64 CPU + CUDA stacks, see
+[CHANGELOG](CHANGELOG.md)) — the CI matrix has not been re-run for this tag.
 
 What was verified on real hardware and how: [docs/PROGRESS_g11_g19.md](docs/PROGRESS_g11_g19.md).
 `linux-x64`, `linux-arm64`, `windows-x64` and `windows-x64-cuda` have all been run for real; **macos-arm64

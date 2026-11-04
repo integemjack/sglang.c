@@ -2,7 +2,19 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — 投机解码补上 temperature>0 的修正采样（2026-11-04）
+## [v0.5.0] — 2026-11-04 「补齐上游能力面 + MLX 后端 + 投机解码采样 + 页级 KV」
+
+v0.4.0 之后的两周把 GAP_vs_upstream 盘点的差距大头补掉：权重/服务面/多模态/MoE 对齐上游
+（10-27～10-29 的九轮），再叠上今天的投机解码修正采样、GPU 页级 KV 与 MLX 后端。下方
+各节按时间从新到旧，全部归入本版。
+
+要点：GGUF/AWQ/GPTQ/CT/MXFP4/marlin 落盘格式 · 单可执行 `sglc` 双引擎 · /v1 面补齐
+（tokenize/responses/messages/运维端点）· Unigram tokenizer · YaRN/交错 RoPE ·
+GPU MoE + 多图 LLaVA · Qwen3.8 GDN 修复 + MTP · **MLX 后端 T1+T2（Metal）** ·
+**投机解码 temperature>0 修正采样（CPU+GPU）** · **G20 页级 KV 零拷贝前缀 +
+动态准入**（附 G21 量化 KV numerics 边界）。
+
+## [v0.5.0] · 投机解码补上 temperature>0 的修正采样（2026-11-04）
 
 - **`sgl_spec_sample_generate`（CPU）/ `sgl_cuda_spec_sample_generate`（GPU）**：
   标准拒绝采样（`u<min(1,p̃/q̃)`，拒绝处从 norm((p̃−q̃)₊) 重采样），产出分布
@@ -18,7 +30,7 @@
 - cuda_test 新增 `SGL_CUDA_ONLY_SPEC=1`：显存被桌面挤占时全量会在 gemm-bench 后
   pure-decode 段 AV（HEAD 亦然，与本改动无关），该开关可单独验证 spec 段。
 
-## [Unreleased] — G20：GPU 页级 KV（零拷贝前缀 + 页池动态准入）（2026-11-04）
+## [v0.5.0] · G20：GPU 页级 KV（零拷贝前缀 + 页池动态准入）（2026-11-04）
 
 - **后端**（仅 kvq 恒等页表模式）：`sgl_cuda_pages_map/unmap` ——前缀复用从逐页
   D2D 拷贝（copy_kv）变为【只改页表】的零拷贝挂页（实测快 190-1296×），
@@ -97,7 +109,7 @@ llama 系模型走 Metal。详见 [docs/PROGRESS_mlx.md](docs/PROGRESS_mlx.md)�
      均匀看不出来，真模型上差到 8e-2；
   3. `now_s()` 用 `clock()`（CPU 时间）而不是墙钟，把 decode 报快 1.5 倍。
 
-## [Unreleased] — CI 修复（2026-10-29）
+## [v0.5.0] · CI 修复（2026-10-29）
 
 本地复现（Linux 用全新 checkout + CI 同款夹具串行 ctest；Windows 用 VS2022 BuildTools 的
 MSVC + CUDA 13.3、MinGW gcc 16），四个问题各自独立：
@@ -112,7 +124,7 @@ MSVC + CUDA 13.3、MinGW gcc 16），四个问题各自独立：
 - **`test_jinja`（Windows）**：runner 的 `core.autocrlf=true` 把 `tests/ref_chat_*.txt` 转成 CRLF，
   与按字节比对的渲染结果对不上。加 `.gitattributes` 让这些参考文件不做换行转换。
 
-## [Unreleased] — marlin 8bit 分支（2026-10-29 第九轮）
+## [v0.5.0] · marlin 8bit 分支（2026-10-29 第九轮）
 
 上一版把 marlin 限制在 4bit（8bit 直接报错）。这轮补上 8bit。
 
@@ -320,7 +332,7 @@ GPU 侧跑 GDN hybrid 模型需要 `SGL_CUDA_W8=1`（线性注意力层的权重
 - **多图 LLaVA**：已支持（G21，第六轮：每个 `<image>` 占位符各插自己的视觉段，已实测），
   CPU batch-invariant 已用 `tests/batch_invariant.py` 验过（4/4）。
 
-## [Unreleased] — 服务面补齐（对齐上游路由表）+ Unigram tokenizer（2026-10-29 第四轮）
+## [v0.5.0] · 服务面补齐（对齐上游路由表）+ Unigram tokenizer（2026-10-29 第四轮）
 
 本轮只动「能在本机编译并验证」的部分（本机 = Windows + RTX 2060 sm_75 + GCC/MSVC）。
 每一项都跑了实测，命令见 `tests/ext_endpoints_test.py`。
@@ -362,7 +374,7 @@ GPU 侧跑 GDN hybrid 模型需要 `SGL_CUDA_W8=1`（线性注意力层的权重
 - GPU 侧 DeepSeek 接线（`cuda_deepseek.cu` 仍未接 `cuda_http`）、GPU MoE 层前向。
 - W4A16 / compressed-tensors / MXFP4 权重、AWQ marlin / GPTQ v2 落盘、多图 LLaVA、batch-invariant。
 
-## [Unreleased] — Qwen3.8 GPU：GDN 门控修复 + M3 MTP 投机解码（2026-10-29）
+## [v0.5.0] · Qwen3.8 GPU：GDN 门控修复 + M3 MTP 投机解码（2026-10-29）
 
 详细数据见 [docs/DESIGN_1M_32C.md](docs/DESIGN_1M_32C.md) §17。
 
@@ -393,7 +405,7 @@ GPU 侧跑 GDN hybrid 模型需要 `SGL_CUDA_W8=1`（线性注意力层的权重
 - **`/v1/completions` 流式**改发 OpenAI `text_completion` 块（`choices[0].text`），不再是 chat 的
   `delta.content`；排队中的流式请求也能收到 token（之前只收到结束块）。
 
-## [Unreleased] — AWQ / GPTQ 权重：落盘位布局解包（2026-10-27 第五轮）
+## [v0.5.0] · AWQ / GPTQ 权重：落盘位布局解包（2026-10-27 第五轮）
 
 接上一轮的 GGUF，把 P0-1 的另一半（AWQ / GPTQ）做完。至此市面上主流的三种量化权重
 （gguf、AWQ、GPTQ）都能直接 `sglc --model <dir>` 加载，仍然只动加载侧：解成 f32 后
@@ -430,7 +442,7 @@ GPU 侧跑 GDN hybrid 模型需要 `SGL_CUDA_W8=1`（线性注意力层的权重
   `order='K'`，对转置视图会返回 F-contiguous 数组，而 safetensors 按原始字节落盘（不看 strides），
   于是 scales 会被写成转置顺序——必须逐张量 `np.ascontiguousarray`。
 
-## [Unreleased] — GGUF 权重格式：容器 + 12 种量化反解 + 内嵌 tokenizer（2026-10-27 第四轮）
+## [v0.5.0] · GGUF 权重格式：容器 + 12 种量化反解 + 内嵌 tokenizer（2026-10-27 第四轮）
 
 起点是 `docs/GAP_vs_upstream.md` 的 P0 第一项（权重格式太窄：只有 safetensors + 自研 int8，
 市面上下载量最大的那批 gguf 一个都打不开）。本轮把 **GGUF 全链路** 做掉，AWQ/GPTQ 留到下一轮。
@@ -465,7 +477,7 @@ GPU 侧跑 GDN hybrid 模型需要 `SGL_CUDA_W8=1`（线性注意力层的权重
 - 测试素材不在 git 里（模型太大）：`tests/gguf_ref_dequant.py` 的输出 `.refmeta/.refbin` 由你自己生成，
   没有时测试会 SKIP 并说明；原始权重缺失时对照段也 SKIP。
 
-## [Unreleased] — GPU 服务对齐 CPU：模板 / 约束解码 / logprobs / 监控（2026-10-27 第三轮）
+## [v0.5.0] · GPU 服务对齐 CPU：模板 / 约束解码 / logprobs / 监控（2026-10-27 第三轮）
 
 发现 `apps/cuda_http.c` 是 CPU `src/http.c` 的**独立实现**，前面几轮做的 Jinja 模板、约束解码、logprobs、
 解析器、监控端点全靠 CPU 引擎，GPU 服务里全没有（`--serve` 走 GPU 时这些能力直接缺失）。本轮补齐并实测：
@@ -489,7 +501,7 @@ GPU 侧跑 GDN hybrid 模型需要 `SGL_CUDA_W8=1`（线性注意力层的权重
  （128）长，以前只得到含糊的 500 `generation failed`；现在提前拒掉并返 **400**：
  `prompt is 175 tokens but one KV segment holds 128 (SGL_CUDA_CTX / concurrency): raise SGL_CUDA_CTX or lower SGL_HTTP_CONC`。
 
-## [Unreleased] — YaRN / 交错 RoPE / 对 HF 逐位对齐（2026-10-27 第二轮）
+## [v0.5.0] · YaRN / 交错 RoPE / 对 HF 逐位对齐（2026-10-27 第二轮）
 
 起点是给 DeepSeek 后端找金标准：用 transformers 5.20 自己的 `DeepseekV2ForCausalLM`
 与 `LlamaForCausalLM` 生成小模型和参考 logits 对打，查出两个**真 bug** 和一个缺口：
@@ -514,7 +526,7 @@ GPU 侧跑 GDN hybrid 模型需要 `SGL_CUDA_W8=1`（线性注意力层的权重
   `gen_random_deepseek.py` 加 `--yarn`（numpy 参考直接用 HF 算出来的频率表，避免“参考和被测抄同一份错”）。
 - 此时全量 **39 个测试全绿**（CPU/MinGW），MSVC+CUDA 构建同样通过。
 
-## [Unreleased] — 对齐上游 sglang：P0/P1/P2 差距补齐（2026-10-27）
+## [v0.5.0] · 对齐上游 sglang：P0/P1/P2 差距补齐（2026-10-27）
 
 以 `docs/GAP_vs_upstream.md` 的差距清单为准，本轮把其中属于「能用起来」的部分实现并验证（CPU 侧 33/33 测试全绿，`src`+`include`+`apps` 从 11,440 行到 15,519 行）：
 
@@ -535,7 +547,7 @@ GPU 侧跑 GDN hybrid 模型需要 `SGL_CUDA_W8=1`（线性注意力层的权重
 - **修掉的问题**：`/v1/completions` 响应体里的 `model` 字段写死成 `sglang-c-gpt2`（现按实际模型目录名）；约束解码中「有 `required` 但未写 `additionalProperties`」的 schema 原先静默不强制 required（现在按严格模式处理，与 `additionalProperties:false` 同义）；`sgl_jinja_render` 的返回缓冲原先用 `malloc`，调用方却用 `sgl_xfree`（Windows 上是 `_aligned_free`）—— 堆损坏，`/v1/chat/completions` 拿到 200 之后进程崩（0xC0000374），现统一走 `sgl_xmalloc`。
 - **P0-5 DeepSeek MLA 注意力**：新增 `src/mla.c` —— 吸收式（W_UK/W_UV absorbed）MLA，解耦 RoPE（HF 的非交错 rotate_half，只打在 q/k 的 rope 部分），KV cache 每位置只存 `kv_lora_rank + qk_rope_head_dim` 个数。对 numpy 参考：prefill max rel 1.2e-05、KV cache 2.7e-05，全序列 / 逐 token / 分块 / 半段 prefill+decode 四条路径结果完全一致；`test_mla` 同时跑 `q_lora_rank=null` 变体（变异测试验过断言非空转：改 softmax scale 或改用交错 RoPE 都会 FAIL）。尚未接进 `sgl_model_load` 的模型分发（还差 MoE/共享专家/lm_head/`rope_scaling`-yarn）。
 
-## [Unreleased] — 单可执行文件：`sglc` 自带 CPU/GPU 双引擎与 HTTP 服务
+## [v0.5.0] · 单可执行文件：`sglc` 自带 CPU/GPU 双引擎与 HTTP 服务
 
 - **`sglc --serve` 在所有构建里可用（含 Windows/MSVC）**：`src/http.c` 原来依赖 MinGW 的
   winpthreads，MSVC 构建直接把 http.c 从库里剔除、`sglc --serve` 报
@@ -916,7 +928,7 @@ WDDM 溢出会把绝对时间放大 3–20x，所以性能结论一律用**同�
   0xc0000409），不采纳。维持 `-march=x86-64-v2`，实测记录见 ROADMAP.md。主树合并态另跑
   10 轮×23/23 全绿复验（0 SegFault / 0 fastfail）。
 
-## [Unreleased] — 2026-10-27 「t 系列收尾」
+## [v0.5.0] · 2026-10-27 「t 系列收尾」
 
 本批完成 TODO_PROMPTS.md 的 13 项任务（t0–t13），全程 numpy 独立参考对照。
 
