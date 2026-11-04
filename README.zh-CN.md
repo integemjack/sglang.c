@@ -53,8 +53,9 @@ bash sglang-c/quickstart.sh
 只做 smoke（产物存在 + `ldd`/`dumpbin` 架构与依赖 + `sglc` usage 退出码），实际推理留给真机。
 v0.4.0 时 9 个目标全绿（run
 [40456249230](https://github.com/integemjack/sglang.c/actions/runs/40456249230)）；
-v0.5.0 仅真机验证（Windows x64 的 CPU 与 CUDA 两栈，见
-[CHANGELOG](CHANGELOG.md)），CI 矩阵未随本 tag 重跑。
+v0.5.0 已真机验证（Windows x64 的 CPU 与 CUDA 两栈，见
+[CHANGELOG](CHANGELOG.md)），其 CI 矩阵由发版 push 触发，状态见
+[Actions](https://github.com/integemjack/sglang.c/actions)。
 
 真机实测过的项与验法：`docs/PROGRESS_g11_g19.md`。linux-x64 / linux-arm64 / windows-x64 /
 windows-msvc-cuda 均已实跑；**macos-arm64 已在真机 iMac（macOS 27.0.1 / AppleClang 21）上编译并
