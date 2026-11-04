@@ -2,7 +2,7 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — G22c：cuda_test 历次 AV 崩溃根因修复（gemm-bench 越界写）+ 显存护栏（2026-11-05）
+## [v0.5.0] · G22c：cuda_test 历次 AV 崩溃根因修复（gemm-bench 越界写）+ 显存护栏（2026-11-05）
 
 **根因（WER 偏移 + map + 反汇编实证）**：`sgl_cuda_gemm_bench` 的 `Af_h` 声明为
 `float*`，但分配是 `cudaMallocHost(MMAX*K*2)`（2 字节/half）——`Af_h[i] =
@@ -24,7 +24,7 @@ pinned 缓冲**。堆布局宽松时静默污染周边（大显存机器「能�
   必崩，修复后全量 `test_cuda: all OK`（exit 0，含 batch 265+ tok/s、spec 三段）；
   conformance 双栈、kvq_serve_check、spec_serve_check 全绿。
 
-## [Unreleased] — G22b：混跑投机（MTP 多请求共存 + hlast 按行快照）（2026-11-05）
+## [v0.5.0] · G22b：混跑投机（MTP 多请求共存 + hlast 按行快照）（2026-11-05）
 
 以前投机解码只在「单请求 + 贪心」时触发（nb==1 的门槛）：一旦有第二个请求在跑，
 投机就整体退化为逐 token。现在 nb>1 时也能投机：
@@ -42,7 +42,7 @@ pinned 缓冲**。堆布局宽松时静默污染周边（大显存机器「能�
   （pos 交错、k=0）。工具：tests/gen_mtp_head.py + tools/spec_serve_check.py；
   回归全绿（kvq_serve_check、conformance 双栈、cuda_test spec 段）。
 
-## [Unreleased] — GPU 服务语义对齐（stop 字符串/include_usage）+ 对拍套件双引擎（2026-11-05）
+## [v0.5.0] · GPU 服务语义对齐（stop 字符串/include_usage）+ 对拍套件双引擎（2026-11-05）
 
 `apps/accel_http.c`（cuda_http/sglc --device cuda 共用的服务层）补齐与 CPU 版/上游的差距：
 
@@ -53,7 +53,7 @@ pinned 缓冲**。堆布局宽松时静默污染周边（大显存机器「能�
 - 对拍套件 `--engine cuda`：同一套 35 项断言直接打 GPU 服务（SGL_CUDA_CTX=8192），
   真模型 qwen3-06 双引擎全绿；G20 kvq 服务验收复跑 all OK。
 
-## [Unreleased] — 与上游语义对拍：套件 + 三处修正（2026-11-05）
+## [v0.5.0] · 与上游语义对拍：套件 + 三处修正（2026-11-05）
 
 新套件 `tests/conformance_upstream.py`（HF 分词器/模板当真值 + 上游源码语义断言，
 35 项）；顺带修了它抓出的三个 bug，详见 [docs/NOTES_conformance.md](docs/NOTES_conformance.md)：
@@ -75,8 +75,9 @@ v0.4.0 之后的两周把 GAP_vs_upstream 盘点的差距大头补掉：权重/�
 要点：GGUF/AWQ/GPTQ/CT/MXFP4/marlin 落盘格式 · 单可执行 `sglc` 双引擎 · /v1 面补齐
 （tokenize/responses/messages/运维端点）· Unigram tokenizer · YaRN/交错 RoPE ·
 GPU MoE + 多图 LLaVA · Qwen3.8 GDN 修复 + MTP · **MLX 后端 T1+T2（Metal）** ·
-**投机解码 temperature>0 修正采样（CPU+GPU）** · **G20 页级 KV 零拷贝前缀 +
-动态准入**（附 G21 量化 KV numerics 边界）。
+**投机解码 temperature>0 修正采样（CPU+GPU）+ 混跑投机（G22b）** · **G20 页级 KV 零拷贝前缀 +
+动态准入**（附 G21 量化 KV numerics 边界）· **G22a/c 服务语义补齐（stop/usage）+ 上游对拍套件、
+cuda_test 历次 AV 根因修复（gemm-bench 越界写）+ 显存护栏**。
 
 ## [v0.5.0] · 投机解码补上 temperature>0 的修正采样（2026-11-04）
 
