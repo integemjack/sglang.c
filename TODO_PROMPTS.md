@@ -375,6 +375,46 @@ SKIP。结果是 CI 实际只验了「能编译 + 不依赖模型的几个测试
 先把新特性的回归盯住。
 ```
 
+## 任务 G20 · GPU 页级 radix：slot 零拷贝挂页 + 页池动态准入（性能/容量，中大；仅 SGL_KVQ=1 路径）
+
+> 2026-11-04 侦察入册：架构事实全部核实过（带行号），下一轮可直接开工。
+
+```
+目标：GPU 服务的前缀缓存从「段粒度 + 整段拷贝」（G6/G15）升级为「页粒度 +
+slot 零拷贝挂页」，并在 slot 池上做动态准入（单请求可超 seg_len）。
+
+已核实的架构事实（不要重新侦察）：
+- SGL_KVQ=1 时 KV 是 4-bit 分页池：页 = SGL_KVQ_P(64) 位置；物理池
+  d_pool[nkv][n_slots][P][tok_stride]；页表 pt 按【ctx 全局 gpos 页号】索引，
+  pt[page]=slot，slot<0 = 未驻留直接跳过（cuda_backend.cu 117-146、4851+）。
+  写路径 k_kvq_write(:1309) 与全部量化 attention（k_attn_q_flash:1388 等）
+  都吃 pt —— kernel 层已完全页表化，本任务【一个 kernel 都不用改】。
+- h_pt 是 host 镜像，与 d_pt 同步更新。
+- copy_kv 的 kvq 分支(:5423-5446) 现在是逐页 D2D 拷贝（每页每层 slot_layer
+  字节）；页不对齐直接放弃复用返回 -1。
+- 服务层：seg_len = ctx/ACTIVE_CONC 静态划分（accel_http.c:3291），G15 租让
+  表按段登记（:352-460），命中时 copy_kv 整段拷到本段头（:722-740）。
+- MTP 自有 KV 是 f32 段布局，不随 kvq 分页（:5415 分支），挂页只针对主 KV。
+
+实施三步：
+1) 后端原语：sgl_cuda_pages_map(g, src_base, dst_base, npages)——页对齐时
+   h_pt[dst页]=h_pt[src页]（不拷数据，只改 pt + 上传 d_pt）+ slot 引用计数；
+   sgl_cuda_pages_unref(g, base, npages)；copy_kv 页对齐分支改走映射，
+   非对齐保留拷贝回退。COW 边界：共享止于页对齐前缀（G15 登记时按页取整，
+   尾半页不共享）——请求写共享页 = 越过命中前缀，新写落在自己新租的页。
+2) 服务层：租让表改页粒度（租 = 保留 pt 引用不回收 slot；命中 = map 零拷贝）；
+   SGL_KVQ=1 时准入改按 slot 池余量 + 每请求页预算（不再被 seg_len 钳死）；
+   KVQ 关时维持现状（静态段 + copy_kv）。
+3) 验收（全部断言，不是目测）：SGL_KVQ=1 下 ①同一前缀场景，map 路径与
+   copy 路径 logits 逐位一致；②命中前缀继续生成 vs 全量重算，输出逐字一致
+   （对齐 G6 验收口径）；③复用时零 D2D 拷贝（加个计数器/日志验证）；
+④单请求
+   超静态 seg_len 的用例跑通（solo 长 prompt）；⑤slot 引用计数在请求中断/
+   失败路径不泄漏（页池回收用例）。
+风险：refcount 泄漏 = 页池耗尽，务必覆盖异常路径；pt 改动只上传受影响页段，
+别整表重传。
+```
+
 ---
 
 ## 附注
