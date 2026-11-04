@@ -2,6 +2,17 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — GPU 服务语义对齐（stop 字符串/include_usage）+ 对拍套件双引擎（2026-11-05）
+
+`apps/accel_http.c`（cuda_http/sglc --device cuda 共用的服务层）补齐与 CPU 版/上游的差距：
+
+- **stop 字符串**（/v1/completions、/v1/chat/completions、/generate 同语义）：worker
+  每 token 喂入累积缓冲查命中，非流式也提前收尾（不再空转到 max_new）；流式走
+  发射窗口，尾部凑出停止串前缀的字符扣住不发，切片不拦腰截多字节字符。
+- **stream_options.include_usage**：finish → usage（空 choices）→ [DONE]，上游顺序。
+- 对拍套件 `--engine cuda`：同一套 35 项断言直接打 GPU 服务（SGL_CUDA_CTX=8192），
+  真模型 qwen3-06 双引擎全绿；G20 kvq 服务验收复跑 all OK。
+
 ## [Unreleased] — 与上游语义对拍：套件 + 三处修正（2026-11-05）
 
 新套件 `tests/conformance_upstream.py`（HF 分词器/模板当真值 + 上游源码语义断言，

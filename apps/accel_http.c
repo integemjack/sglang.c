@@ -266,11 +266,26 @@ typedef struct request {
   int streaming;
   int stream_text;     /* 1 = /v1/completions：SSE 块用 OpenAI text_completion 形状（choices[0].text）*/
   int n_streamed;
+  /* G22: stop 字符串（与 CPU 版同语义：截前不含、finish=stop）+ 流式累积/发射窗口 */
+  char stops[4][128];
+  int n_stops;
+  int stop_hit;
+  int stop_bytes;          /* 命中点（text_out 与流式窗口都截到这）*/
+  int sacc_fed;            /* 已喂进 sacc 的 token 数 */
+  char *sacc;              /* 已生成文本累积（realloc）*/
+  size_t sacc_len, sacc_cap, sacc_emit;
+  int incl_usage;          /* stream_options.include_usage */
   int prio;            /* W2: 优先级（大的先跑；同优先级 FIFO）*/
   int spec_ready;      /* M3: 已把 prefill 末位 hidden 存进 mtp.hlast，可开投机 */
   struct request *next_done;
   struct request *next_q; /* t5: wait-queue link */
 } request;
+
+/* G22：stop 字符串/流式窗口的前向声明（定义在 wait_done 前；worker 在前面用）*/
+static void sacc_append(request *r, const char *piece);
+static void sacc_stop_check(request *r);
+static void sacc_feed_upto(request *r);
+static void stream_emit_window(request *r, SOCKET fd, int final);
 
 typedef struct {
   sgl_llama *cpu;
@@ -581,6 +596,7 @@ static void req_free(request *r) {
   sgl_xfree(r->lp);
   sgl_grammar_free(r->gram);
   free(r->logits);
+  free(r->sacc); /* G22 */
   sgl_xfree(r->text_out); /* decode_gen 返回 sgl_xmalloc（对齐）——绝不能 free() */
   free(r);
 }
@@ -1037,6 +1053,20 @@ SGL_THREAD_SIG(worker) {
           continue;
         }
         r->gen[r->n_gen++] = t;
+        /* G22: stop 字符串——喂入累积缓冲，全文最早命中即收尾（非流式也提前停，
+ * 不再空转到 max_new；截断语义与 CPU 版一致：不含停止串）*/
+        if (r->n_stops > 0 && !r->stop_hit) {
+          sacc_feed_upto(r);
+          if (r->stop_hit) {
+            r->state = R_DONE;
+            strcpy_s(r->finish, sizeof(r->finish), "stop");
+            r->text_out = decode_gen(r);
+            if ((size_t)r->stop_bytes <= strlen(r->text_out))
+              r->text_out[r->stop_bytes] = 0;
+            E.tot_finished++;
+            continue;
+          }
+        }
         if (r->want_lp && r->lp && r->n_lp < r->max_new) r->lp[r->n_lp++] = lp;
         if (r->gram) {
           if (sgl_grammar_accept(r->gram, t) != 0)
@@ -1715,6 +1745,94 @@ static int sse_token_chunk(const request *r, const char *esc, char *chunk, size_
 }
 
 /* wait until request id reaches DONE/FAIL; optionally stream SSE meanwhile */
+/* ---- G22: stop 字符串（与 CPU 版同语义：截前不含、finish=stop）----
+ * worker 每 token 喂入 sacc 并查命中（非流式也提前收尾，不空转到 max_new）；
+ * 流式从 sacc 取发射窗口，未命中时扣住可能是停止串前缀的尾部（"th" 可能变 "the"）。*/
+static void sacc_append(request *r, const char *piece) {
+  size_t pl = piece ? strlen(piece) : 0;
+  if (r->sacc_len + pl + 1 > r->sacc_cap) {
+    size_t nc = r->sacc_cap ? r->sacc_cap : 1024;
+    while (nc < r->sacc_len + pl + 1) nc *= 2;
+    char *nb = (char *)realloc(r->sacc, nc);
+    if (!nb) return; /* OOM：丢这个 piece（不炸；后续 token 仍会被查）*/
+    r->sacc = nb;
+    r->sacc_cap = nc;
+  }
+  memcpy(r->sacc + r->sacc_len, piece, pl);
+  r->sacc_len += pl;
+  r->sacc[r->sacc_len] = 0;
+}
+static void sacc_stop_check(request *r) {
+  size_t hit_at = (size_t)-1;
+  if (r->stop_hit || !r->sacc) return;
+  for (int i = 0; i < r->n_stops; i++) {
+    if (!r->stops[i][0]) continue;
+    const char *m = strstr(r->sacc, r->stops[i]);
+    if (m && (hit_at == (size_t)-1 || (size_t)(m - r->sacc) < hit_at))
+      hit_at = (size_t)(m - r->sacc);
+  }
+  if (hit_at != (size_t)-1) {
+    r->stop_hit = 1;
+    r->stop_bytes = (int)hit_at;
+  }
+}
+/* 喂 gen[sacc_fed..n_gen)：worker 每步调（streaming 标晚了的 token 由这里补喂）*/
+static void sacc_feed_upto(request *r) {
+  while (r->sacc_fed < r->n_gen) {
+    int t = r->gen[r->sacc_fed++];
+    char *piece = sgl_tokenizer_decode(E.tok, &t, 1);
+    sacc_append(r, piece ? piece : "");
+    sgl_xfree(piece);
+  }
+  sacc_stop_check(r);
+}
+/* 流式发射窗口 [sacc_emit, cut)：未命中且非 final 时扣住停止串前缀尾部；
+ * 切片回退到 UTF-8 边界（JSON 字符串不能拦腰截多字节字符）。*/
+static void stream_emit_window(request *r, SOCKET fd, int final) {
+  if (!r->sacc) return;
+  size_t cut;
+  if (r->stop_hit) {
+    cut = (size_t)r->stop_bytes;
+  } else {
+    cut = r->sacc_len;
+    if (!final && r->n_stops > 0) {
+      size_t hold = 0;
+      for (int i = 0; i < r->n_stops; i++) {
+        size_t sl = strlen(r->stops[i]);
+        if (sl < 2 || r->sacc_len < 1) continue;
+        size_t kmax = sl - 1 < r->sacc_len ? sl - 1 : r->sacc_len;
+        for (size_t k = kmax; k >= 1; k--) {
+          if (memcmp(r->sacc + r->sacc_len - k, r->stops[i], k) == 0) {
+            if (k > hold) hold = k;
+            break;
+          }
+        }
+      }
+      cut = r->sacc_len > hold ? r->sacc_len - hold : 0;
+    }
+  }
+  while (r->sacc_emit < cut) {
+    size_t n = cut - r->sacc_emit;
+    if (n > 768) n = 768;
+    while (n > 0 && r->sacc_emit + n < r->sacc_len &&
+           ((unsigned char)r->sacc[r->sacc_emit + n] & 0xC0) == 0x80)
+      n--; /* 不切断多字节字符 */
+    char piecebuf[800];
+    if (n) memcpy(piecebuf, r->sacc + r->sacc_emit, n);
+    piecebuf[n] = 0;
+    char esc[2048];
+    json_escape(piecebuf, esc, sizeof(esc));
+    char chunk[2304];
+    int cn = sse_token_chunk(r, esc, chunk, sizeof(chunk));
+    r->sacc_emit += n;
+    int rid = r->id;
+    LeaveCriticalSection(&E.lock);
+    send_all(fd, chunk, cn);
+    EnterCriticalSection(&E.lock);
+    if (!find_req(rid)) return;
+  }
+}
+
 static int wait_done(SOCKET fd, int id, char **text, request **out_r) {
   static int dbgw = -1;
   unsigned long long t_w0 = GetTickCount64();
@@ -1734,6 +1852,10 @@ static int wait_done(SOCKET fd, int id, char **text, request **out_r) {
        * streaming loop — flush any un-streamed tokens first so the SSE client
        * gets the full content, not just the finish chunk. */
       if (r->streaming) {
+        if (r->n_stops > 0) {
+          sacc_feed_upto(r);
+          stream_emit_window(r, fd, 1);
+        } else
         while (r->n_streamed < r->n_gen) {
           int t = r->gen[r->n_streamed++];
           char *piece = sgl_tokenizer_decode(E.tok, &t, 1);
@@ -1757,6 +1879,11 @@ static int wait_done(SOCKET fd, int id, char **text, request **out_r) {
     if (r->state == R_FAIL) { LeaveCriticalSection(&E.lock); return -2; }
     /* stream out new tokens while running */
     if (r->streaming) {
+      if (r->n_stops > 0) {
+        sacc_feed_upto(r);
+        stream_emit_window(r, fd, 0);
+        if (r->stop_hit) r->n_streamed = r->n_gen;
+      } else
       while (r->n_streamed < r->n_gen) {
         int t = r->gen[r->n_streamed++];
         char *piece = sgl_tokenizer_decode(E.tok, &t, 1);
@@ -3047,6 +3174,23 @@ static int route(SOCKET fd, const http_req *req) {
     const sgl_json *sv = sgl_json_get(j, "stream");
     is_stream = sv && sv->type == SGL_JSON_BOOL && sv->boolean;
   }
+  /* G22: stop 字符串（string | string[]，最多 4 个；三个生成端点同语义）*/
+  char stops[4][128];
+  int n_stops = 0;
+  {
+    const sgl_json *sj = sgl_json_get(j, "stop");
+    if (sj && sj->type == SGL_JSON_STRING && sj->str)
+      snprintf(stops[n_stops++], 128, "%s", sj->str);
+    else if (sj && sj->type == SGL_JSON_ARRAY)
+      for (int i = 0; i < sj->count && n_stops < 4; i++)
+        if (sj->items[i]->type == SGL_JSON_STRING && sj->items[i]->str)
+          snprintf(stops[n_stops++], 128, "%s", sj->items[i]->str);
+  }
+  int incl_usage = 0;
+  if (is_stream) {
+    const sgl_json *so = sgl_json_get(j, "stream_options");
+    if (so) incl_usage = json_true(so, "include_usage");
+  }
   sgl_json_free(j);
   if (max_new <= 0 || max_new > MAX_NEW_CAP) max_new = 256;
 
@@ -3070,6 +3214,10 @@ static int route(SOCKET fd, const http_req *req) {
     gram = NULL;
     nr->want_lp = want_lp;
     if (want_lp) nr->lp = (float *)sgl_xmalloc(sizeof(float) * (size_t)nr->max_new);
+    /* G22 */
+    nr->n_stops = n_stops;
+    memcpy(nr->stops, stops, sizeof(stops));
+    nr->incl_usage = incl_usage;
   }
   LeaveCriticalSection(&E.lock);
   sgl_grammar_free(gram);
@@ -3099,16 +3247,25 @@ static int finish_request(SOCKET fd, int id, int is_stream, int chat, int openai
       json_escape(text, esc, sizeof(esc));
       (void)esc;
       const char *fin = r ? (r->finish[0] ? r->finish : "stop") : "stop";
-      char chunk[256];
+      char chunk[640];
       int n = (r && r->stream_text)
                   ? snprintf(chunk, sizeof(chunk),
                              "data: {\"object\":\"text_completion\",\"choices\":[{\"index\":0,\"text\":\"\","
-                             "\"finish_reason\":\"%s\"}]}\n\ndata: [DONE]\n\n",
+                             "\"finish_reason\":\"%s\"}]}\n\n",
                              fin)
                   : snprintf(chunk, sizeof(chunk),
-                             "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\ndata: [DONE]\n\n",
+                             "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\n",
                              fin);
-      send_all(fd, chunk, n);
+      if (r && r->incl_usage) { /* G22：上游顺序 finish → usage(空 choices) → [DONE] */
+        int pt = r->n_prompt, ct = r->n_gen;
+        n += snprintf(chunk + n, sizeof(chunk) - (size_t)n,
+                      "data: {\"object\":\"chat.completion.chunk\",\"choices\":[],"
+                      "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+                      "\"total_tokens\":%d}}\n\n",
+                      pt, ct, pt + ct);
+      }
+      snprintf(chunk + n, sizeof(chunk) - (size_t)n, "data: [DONE]\n\n");
+      send_all(fd, chunk, (int)strlen(chunk));
       free(text);
     }
     reclaim(id);

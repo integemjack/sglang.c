@@ -6,8 +6,9 @@
   * HF transformers（本机 pip 装的官方实现）当真值：分词器 encode/decode、
     chat template 渲染
 
-用法（脚本自己起 CPU 服务、跑完自己收）：
+用法（脚本自己起服务、跑完自己收；--engine cuda 用 cuda_http.exe 跑 GPU 栈）：
   python tests/conformance_upstream.py
+  python tests/conformance_upstream.py --engine cuda
   python tests/conformance_upstream.py --model <dir> --port 30121 --keep
 
 退出码 0 = 全过；1 = 有 FAIL（逐条打印）。
@@ -30,6 +31,11 @@ except Exception:  # noqa: BLE001
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DEFAULT = os.path.join(os.path.dirname(ROOT), "models", "qwen3-06")
 SGLC = os.path.join(ROOT, "build", "bin", "sglc.exe")
+# CUDA 栈在 build-cuda（SGL_CUDA=ON，MSVC 多配置 → bin/Release）
+CUDA_HTTP = next((p for p in (
+    os.path.join(ROOT, "build-cuda", "bin", "Release", "cuda_http.exe"),
+    os.path.join(ROOT, "build", "bin", "cuda_http.exe")) if os.path.exists(p)),
+    os.path.join(ROOT, "build-cuda", "bin", "Release", "cuda_http.exe"))
 
 PROMPTS = [
     "The quick brown fox jumps over the lazy dog",
@@ -117,19 +123,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL_DEFAULT)
     ap.add_argument("--port", type=int, default=30121)
+    ap.add_argument("--engine", default="cpu", choices=["cpu", "cuda"],
+                    help="cuda = 用 build/bin/cuda_http.exe 起 GPU 服务")
     ap.add_argument("--keep", action="store_true", help="跑完不关服务")
     a = ap.parse_args()
 
-    # ---- 起服务（CPU 引擎，串行唯一实例）----
+    # ---- 起服务（串行唯一实例；cuda_http.exe <model> <port>）----
+    exe = CUDA_HTTP if a.engine == "cuda" else SGLC
+    cmd = ([exe, a.model, str(a.port)] if a.engine == "cuda" else
+           [exe, "--model", a.model, "--serve", "--port", str(a.port), "--device", "cpu"])
     server = subprocess.Popen(
-        [SGLC, "--model", a.model, "--serve", "--port", str(a.port), "--device", "cpu"],
-        stdin=subprocess.PIPE,  # 「press Enter to stop」读 stdin：管道不写就永不 EOF，否则服务自退
+        cmd,
+        env=dict(os.environ, **({"SGL_CUDA_CTX": "8192"} if a.engine == "cuda" else {})),
+        # 「press Enter to stop」读 stdin：管道不写就永不 EOF，否则 CPU 服务自退
+        stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if not a.keep:
         atexit.register(lambda: (server.terminate(), server.wait(timeout=10)))
     if not wait_health(a.port):
-        print("FAIL 服务没起来 (sglc --serve port=%d)" % a.port)
+        print("FAIL 服务没起来 (%s port=%d)" %
+              ("cuda_http" if a.engine == "cuda" else "sglc --serve", a.port))
         return 1
 
     # HF 真值
