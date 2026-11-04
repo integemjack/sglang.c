@@ -4971,6 +4971,37 @@ void sgl_cuda_kvq_free(sgl_cuda_model *m) {
 
 int sgl_cuda_kvq_enabled(const sgl_cuda_model *m) { return m ? m->kvq.on : 0; }
 
+/* ================= G21: kvq dump（排障：对比执行路径写出的 KV 字节） ================= */
+long sgl_cuda_kvq_dump_size(const sgl_cuda_model *m, int base, int nrows) {
+  if (!m || !m->kvq.on || m->kvq.host_slots) return -1;
+  const sgl_kvq *q = &m->kvq;
+  if (base % q->P || nrows % q->P) return -1; /* 只支持页对齐区间 */
+  long np = (long)nrows / q->P;
+  if ((long)base + nrows > m->ctx) return -1;
+  return np * (long)q->nkv * q->slot_layer;
+}
+
+int sgl_cuda_kvq_dump(const sgl_cuda_model *m, int base, int nrows, unsigned char *out) {
+  if (!m || !out) return -1;
+  long need = sgl_cuda_kvq_dump_size(m, base, nrows);
+  if (need <= 0) return -1;
+  const sgl_kvq *q = &m->kvq;
+  long np = (long)nrows / q->P, pg0 = (long)base / q->P;
+  unsigned char *dst = out;
+  for (int l = 0; l < q->nkv; l++) {
+    const unsigned char *lay = q->d_pool + (long)l * q->layer_slots;
+    for (long p = 0; p < np; p++) {
+      int slot = q->h_pt[pg0 + p];
+      if (slot < 0) { memset(dst, 0xEE, q->slot_layer); dst += q->slot_layer; continue; }
+      if (cudaMemcpy(dst, lay + (long)slot * q->slot_layer, q->slot_layer,
+                     cudaMemcpyDeviceToHost) != cudaSuccess)
+        return -1;
+      dst += q->slot_layer;
+    }
+  }
+  return 0;
+}
+
 /* ================= M3: 投机解码 ================= */
 /* 把上一次前向末位的 hidden 存成草稿输入（row<0 = 末行）。*/
 int sgl_cuda_mtp_set_hidden(sgl_cuda_model *m, int row) {

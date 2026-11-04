@@ -35,9 +35,11 @@
 - **修复 pre-existing**：`sgl_cuda_lin_slots` 语义错位（返回槽数配置而非模型有
   无线性层）——CUDA 服务的前缀缓存自 t11 起 silently 关闭。dense 返回 0 修正
   后 copy 复用恢复（hits=1、输出逐字一致）。
-- **发现 pre-existing（未修，G21）**：kvq 分块 prefill 与一次算全不自洽
-  （maxerr ~3.5 vs f32 池 1.4e-05），copy/map 同样偏差；挡住 kvq 模式一切
-  复用/分块的质量验收。详见 TODO_PROMPTS.md G21。
+- **发现 pre-existing（G21，已定位闭环）**：kvq 下「一次算全」与「分块/复用」
+  不逐位（dump 实证：GEMM 按 M 选 kernel 的行级 fp 差被尾块 4-bit 量化跳档固化
+  放大；f32 池仅 1.4e-05）。修法取舍后选「接受 + 语义边界」：同路径请求输出
+  逐字一致（实测断言），与上游对量化 KV + prefix cache 的处理一致。排障工具
+  `sgl_cuda_kvq_dump` 入库；详见 NOTES_g20.md。
 
 ### MLX 后端 T1 + T2（fp16 + 量化）（2026-11-04）
 

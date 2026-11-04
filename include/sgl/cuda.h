@@ -90,6 +90,13 @@ int sgl_cuda_kvq_page_size(const sgl_cuda_model *m);
 int sgl_cuda_pages_map(sgl_cuda_model *m, int dst_base, int src_base, int npages);
 int sgl_cuda_pages_unmap(sgl_cuda_model *m, int base, int npages, int cow);
 
+/* G21 排障用：把 [base, base+nrows) 的量化 KV 原始字节（每层每页的
+ * slot_layer 字节，页对齐取整）拷到 out（容量 = n_pages*nkv*slot_layer，
+ * 由 sgl_cuda_kvq_dump_size 查）。非 kvq 模式返回 -1。用于对比不同执行
+ * 路径（一次算全 vs 分块）写出的 KV 是否逐位一致。 */
+long sgl_cuda_kvq_dump_size(const sgl_cuda_model *m, int base, int nrows);
+int sgl_cuda_kvq_dump(const sgl_cuda_model *m, int base, int nrows, unsigned char *out);
+
 /* G5: 上传前的显存估算（MB）。按与 sgl_cuda_from_llama 相同的分配口径算：
  * 权重（fp32/fp16/int8 按当前环境变量开关）+ KV 池(ctx) + 激活工作区(rows) +
  * logits 设备镜像 + cublas workspace。llama_model 为 sgl_llama*。 */

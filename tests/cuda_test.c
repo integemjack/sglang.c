@@ -237,6 +237,41 @@ static void kvq_pages_check(const char *dir) {
       printf("[kvq] chunked(512+64) vs full(576) in one segment: maxerr = %g, greedy %d vs %d %s\n",
              me_df, gd2, gf2, gd2 == gf2 ? "(same)" : "(DIFF)");
       sgl_xfree(ld2);
+      /* G21 定位：one-shot 与 chunked 写出的【KV 量化字节】逐字节对比。
+       * 布局：full 段（3072，一次 576 行）vs segD 段（4096，512+64 分块），
+       * 取前 512 行（8 页）的 K+V+scale 全部字节。差异形态说明根因：
+       *  - 完全一致 → KV 无差异，分歧在 attention 之后的 fp 路径（不可能：两者
+       *    attention 同 kernel）——留给上层再查；
+       *  - 从层 0 就差 → 层 0 的 k/v 投影（GEMM 按 M 分 kernel 的行级差异）被
+       *    量化档位跳变固化，逐层放大（量化系统对 fp 扰动的敏感性）；
+       *  - 个别字节差 → 罕见跳档；大面积差 → 系统性 kernel 差异。 */
+      {
+        long dsz = sgl_cuda_kvq_dump_size(g, 0, 576); /* 9 页含尾块：分块/一次算
+            的 GEMM 行差只可能出现在页 8（页 0-7 已证一致）*/
+        CHECK(dsz > 0, "kvq dump size");
+        unsigned char *d1 = (unsigned char *)sgl_xmalloc((size_t)dsz);
+        unsigned char *d2 = (unsigned char *)sgl_xmalloc((size_t)dsz);
+        CHECK(sgl_cuda_kvq_dump(g, segF, 576, d1) == 0, "kvq dump full");
+        CHECK(sgl_cuda_kvq_dump(g, segD2, 576, d2) == 0, "kvq dump chunked");
+        long first = -1, ndiff = 0;
+        for (long i = 0; i < dsz; i++)
+          if (d1[i] != d2[i]) { if (first < 0) first = i; ndiff++; }
+        long P = 64, tok_stride = 136, npg = 9; /* qwen05 实测，仅打印用 */
+        if (first < 0) {
+          printf("[kvq] G21 dump: KV bytes IDENTICAL over all 9 pages (%ld B) -> divergence is post-KV\n", dsz);
+        } else {
+          long page_bytes = P * tok_stride; /* slot_layer */
+          int layer = (int)(first / (npg * page_bytes));
+          long in_layer = first % (npg * page_bytes);
+          int page = (int)(in_layer / page_bytes);
+          long in_page = in_layer % page_bytes;
+          int tok = (int)(in_page / tok_stride), off = (int)(in_page % tok_stride);
+          printf("[kvq] G21 dump: %ld/%ld bytes differ; first @L%d page%d tok%d off%d: "
+                 "%02x vs %02x\n",
+                 ndiff, dsz, layer, page, tok, off, d1[first], d2[first]);
+        }
+        sgl_xfree(d1); sgl_xfree(d2);
+      }
     }
     int gm = sgl_sample_greedy(lm, V), gf = sgl_sample_greedy(lf, V);
     /* G20 的正确性基准 = copy 路径（G6 语义）与分块重算（上面已证三者一致）。

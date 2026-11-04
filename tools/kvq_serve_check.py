@@ -95,13 +95,17 @@ def main():
             if a1 != a2:
                 fails.append("(2) prefix-reused output differs from first")
         else:
-            # kvq（4-bit 量化池）：命中=分块等价路径，与一次算全的偏差是 G21
-            # （pre-existing kvq 分块不自洽，copy_kv 路径同样偏差，与本改动无关）。
-            print(f"(2) kvq reuse output: {len(a1)} vs {len(a2)} chars "
-                  f"({'identical' if a1 == a2 else 'NOTE: differs -> G21 (one-shot vs chunked)'})")
-            if a1 != a2:
-                print("    NOTE: G21 = kvq chunked prefill != one-shot prefill "
-                      "(measured 3.5 logits maxerr at backend level, f32 pool: 1.4e-05)")
+            # kvq（4-bit 量化池）：根因已定位（G21，docs/NOTES_g20.md）：M=576 与
+            # M=64 的 GEMM 行级 fp 差被尾块量化跳档固化放大——「命中」与「未命中」
+            # 是不同执行路径，不保证逐位（上游对量化 KV + prefix cache 亦然）。
+            # 服务语义真正要保证的是【同路径一致】：a2/a3 都命中同一租让 →
+            # 执行路径相同 → 输出必须逐字一致。
+            a3 = req("/v1/completions", p1)["choices"][0]["text"]
+            print(f"(2) kvq: fresh {len(a1)} vs hit1 {len(a2)} vs hit2 {len(a3)} chars; "
+                  f"hit==hit: {'YES' if a2 == a3 else 'NO'}"
+                  f"{' (fresh differs: G21 quantized-KV numerics, documented)' if a1 != a2 else ''}")
+            if a2 != a3:
+                fails.append("(2) same-path (both prefix-hit) outputs differ")
 
         # (3)+(5) /health：命中 + 挂页计数 + 页回收
         time.sleep(1)

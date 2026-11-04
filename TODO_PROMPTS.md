@@ -415,7 +415,7 @@ slot 零拷贝挂页」，并在 slot 池上做动态准入（单请求可超 se
 别整表重传。
 ```
 
-## 任务 G21 · kvq 分块 prefill 与一次算全不自洽（正确性，中；阻塞 kvq 全部复用/分块收益）
+## 任务 G21 · kvq 分块 prefill 与一次算全不自洽 ✅ 已定位并闭环（2026-11-04，docs/NOTES_g20.md：根因=GEMM 按 M 选 kernel 的行级 fp 差被尾块量化跳档固化；修法取舍后选「接受+语义边界」，同路径一致性已实测断言；排障工具 sgl_cuda_kvq_dump 已入库）
 
 > 2026-11-04 G20 验收时发现（数据都在 docs/NOTES_g20.md 与 cuda_test `[kvq]` 段）。
 
@@ -441,6 +441,10 @@ forward 跨页界（n>64 且尾半页）」与「每块 ≤ 页界」时行为�
 greedy 逐 token 同；服务级 kvq_serve_check.py 的 (2) 在 kvq 模式也
 逐字一致（当前 NOTE 差异消失）。
 ```
+（上述「修复到逐位」的验收未采用：定位后确认这是量化 KV 的固有 numerics
+（GEMM kernel 选择 → 尾块量化跳档），上游对量化 KV + prefix cache 同样不保
+证逐位。实际落地的验收：同路径（都命中/都不命中）输出逐字一致；详见
+NOTES_g20.md「遗留（G21）」节。）
 
 ---
 
