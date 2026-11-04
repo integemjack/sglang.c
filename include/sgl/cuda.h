@@ -160,6 +160,11 @@ int sgl_cuda_mtp_fill_kv(sgl_cuda_model *m, const int *toks, int n, int pos0,
 const float *sgl_cuda_mtp_hprev(const sgl_cuda_model *m);
 /* 当前草稿输入 hidden（device [E]，= 最后落定位置的主模型 hidden）*/
 const float *sgl_cuda_mtp_hlast(const sgl_cuda_model *m);
+/* G22b：hlast 的每请求保存/恢复（混跑投机用，host 缓冲至少 E 个 float）*/
+int sgl_cuda_mtp_hlast_save(sgl_cuda_model *m, float *host);
+int sgl_cuda_mtp_hlast_restore(sgl_cuda_model *m, const float *host);
+/* 隐藏维 E（hsnap 缓冲大小依据；<0 = 无效）*/
+int sgl_cuda_hidden(const sgl_cuda_model *m);
 
 /* 一次验证：对 toks[0..n-1]（= [t0, 草稿...]）在 pos0 处做带因果掩码的前向，
  * 每行一份 logits（host，[n][V]），同时开启逐行状态快照。

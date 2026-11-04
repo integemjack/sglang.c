@@ -22,6 +22,10 @@ sgl_st_ctx *sgl_st_open(const char *path);
  * 分片模式下 sgl_st_get 按 weight_map 在对应分片里查，不需要把整个模型拼成一个文件。 */
 sgl_st_ctx *sgl_st_open_dir(const char *dir);
 
+/* 模型目录（单文件模式也有；NULL = 未知）。G22b：mtp.safetensors 在单文件
+ * 模式下不会被散分片扫描打开，mtp_load 用它自己拼 <dir>/mtp.safetensors */
+const char *sgl_st_dir(const sgl_st_ctx *c);
+
 void sgl_st_close(sgl_st_ctx *c);
 
 /* 按名字取张量（F32 直接零拷贝；F16/BF16 转成 fp32 的 owned 缓冲）

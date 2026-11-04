@@ -632,6 +632,22 @@ sgl_st_ctx *sgl_st_open(const char *path) {
     return NULL;
   }
   c->n_sh = 1;
+  /* G22b：从文件路径推目录（单文件模式的 ctx 也要有 dir，否则
+   * <dir>/mtp.safetensors 这类散件找不到）*/
+  {
+    const char *sl = strrchr(path, '/');
+    const char *bs = strrchr(path, '\\');
+    const char *sep = bs > sl ? bs : sl;
+    if (sep && sep > path) {
+      char d[1024];
+      size_t n = (size_t)(sep - path);
+      if (n < sizeof(d)) {
+        memcpy(d, path, n);
+        d[n] = 0;
+        c->dir = xstrdup_(d);
+      }
+    }
+  }
   return c;
 }
 
@@ -976,6 +992,8 @@ int sgl_st_shard_count(const sgl_st_ctx *c) {
   if (!c) return 0;
   return c->gg ? 1 : c->n_sh;
 }
+
+const char *sgl_st_dir(const sgl_st_ctx *c) { return c ? c->dir : NULL; }
 
 int sgl_st_get_raw(sgl_st_ctx *c, const char *name, const char **dtype, int *ndim,
                    int64_t *dims, const void **bytes, size_t *nbytes) {

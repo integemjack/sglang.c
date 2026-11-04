@@ -85,6 +85,13 @@ static int cu_spec_commit(sgl_accel *m, int slot, int k) {
 static int cu_mtp_accept_test(sgl_accel *m, const int *p, int np, int ng, double *acc, int *nok) {
   return sgl_cuda_mtp_accept_test(CU(m), p, np, ng, acc, nok);
 }
+static int cu_mtp_hlast_save(sgl_accel *m, float *host) {
+  return sgl_cuda_mtp_hlast_save(CU(m), host);
+}
+static int cu_mtp_hlast_restore(sgl_accel *m, const float *host) {
+  return sgl_cuda_mtp_hlast_restore(CU(m), host);
+}
+static int cu_hidden(const sgl_accel *m) { return sgl_cuda_hidden(CUC(m)); }
 
 /* ---- DeepSeek（MLA + MoE）：sgl_cuda_ds 是另一套结构，不经 sgl_accel 句柄 ---- */
 static void *cu_ds_load(const void *ds_cpu) { return (void *)sgl_cuda_ds_from(ds_cpu); }
@@ -134,6 +141,9 @@ static const sgl_accel_api CUDA_API = {
     .spec_verify = cu_spec_verify,
     .spec_commit = cu_spec_commit,
     .mtp_accept_test = cu_mtp_accept_test,
+    .mtp_hlast_save = cu_mtp_hlast_save,
+    .mtp_hlast_restore = cu_mtp_hlast_restore,
+    .hidden = cu_hidden,
 
     /* ---- DeepSeek（MLA + MoE）：cuda_deepseek.cu 的独立结构 ---- */
     .ds_load = cu_ds_load,

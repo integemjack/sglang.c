@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 /* 表结构版本：字段增删就 +1，防止半新半旧的后端与服务层错配 */
-#define SGL_ACCEL_ABI 3
+#define SGL_ACCEL_ABI 4
 
 typedef struct sgl_accel sgl_accel; /* 后端实例（CUDA 侧即 sgl_cuda_model）*/
 
@@ -104,6 +104,12 @@ typedef struct sgl_accel_api {
   int (*spec_commit)(sgl_accel *m, int slot, int k);
   int (*mtp_accept_test)(sgl_accel *m, const int *prompt, int np, int ngen, double *acc,
                          int *n_ok);
+  /* G22b（ABI 4）：混跑投机——hlast 是全局单缓冲，多个投机请求交替会互踩；
+   * 服务层在批量 decode 后按行快照（save），投机前恢复（restore）。
+   * hidden 返回隐藏维 E（hsnap 缓冲的大小依据；<=0 = 未知/不支持）*/
+  int (*mtp_hlast_save)(sgl_accel *m, float *host);
+  int (*mtp_hlast_restore)(sgl_accel *m, const float *host);
+  int (*hidden)(const sgl_accel *m);
 
   /* ---- 可选：MLA + MoE 模型（DeepSeek-V2/V3 系）----
    * 与 llama 那张表正交：KV 行是 [latent | k_pe]，每头的 q 是 [qk_nope + qk_rope]。

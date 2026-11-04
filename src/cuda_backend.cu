@@ -91,6 +91,7 @@ typedef struct {
   float *d_p;                 /* [1] device：草稿 token 的 softmax 概率 */
   float last_p;               /* 最近一次 mtp_draft 的草稿概率（host；want_p=0 时不算）*/
   int want_p;                 /* 1 = mtp_draft 要算草稿概率（阈值或统计要用；默认路径不多付这一趟）*/
+  sgl_st_ctx *stmtp;          /* G22b：主 ctx 单文件模式时不走散分片扫描，惰性自开 <dir>/mtp.safetensors */
 } sgl_mtp;
 
 /* ================= M3: 投机解码的 GDN 状态快照 =================
@@ -4405,33 +4406,65 @@ fail:
  * 128x128 块 + <name>_scale_inv 解成 f32，这里再量化成 int8（与主模型同一
  * 口径：per-row absmax），因为 M=1 的 GEMV 走 int8 dp4a。*/
 
-static int mtp_get_1d(sgl_cuda_model *g, const char *name, int n, float **dst) {
+/* G22b：主 ctx 里没有时，惰性打开 <dir>/mtp.safetensors 再试一次
+ *（单文件 model.safetensors 模式不会把散分片扫进来；多分片/散扫模式主 ctx已含）。
+ * 命中的 ctx 经 *used 返回，调用方用它 drop。*/
+static sgl_tensor mtp_get_any(sgl_cuda_model *g, const char *name, int nd,
+                              const int64_t *sh, sgl_st_ctx **used) {
   sgl_st_ctx *st = (sgl_st_ctx *)g->st;
+  sgl_tensor t = sgl_st_get(st, name, nd, sh);
+  if (!sgl_tensor_is_null(t)) {
+    *used = st;
+    return t;
+  }
+  if (!g->mtp.stmtp) {
+    const char *dir = sgl_st_dir(st);
+    if (dir) {
+      char p[1024];
+      snprintf(p, sizeof(p), "%s/mtp.safetensors", dir);
+      g->mtp.stmtp = sgl_st_open(p);
+      if (g->mtp.stmtp)
+        fprintf(stderr, "[mtp] loose mtp.safetensors opened: %s\n", p);
+      else
+        fprintf(stderr, "[mtp] mtp.safetensors open FAILED: %s (dir=%s)\n", p, dir);
+    } else {
+      fprintf(stderr, "[mtp] ctx has no dir; cannot locate mtp.safetensors\n");
+    }
+  }
+  if (g->mtp.stmtp) {
+    t = sgl_st_get(g->mtp.stmtp, name, nd, sh);
+    if (!sgl_tensor_is_null(t)) *used = g->mtp.stmtp;
+  }
+  return t;
+}
+
+static int mtp_get_1d(sgl_cuda_model *g, const char *name, int n, float **dst) {
   int64_t sh[1] = {n};
-  sgl_tensor t = sgl_st_get(st, name, 1, sh);
+  sgl_st_ctx *used = NULL;
+  sgl_tensor t = mtp_get_any(g, name, 1, sh, &used);
   if (sgl_tensor_is_null(t)) {
     fprintf(stderr, "[mtp] missing tensor %s\n", name);
     return -1;
   }
   if (cudaMalloc((void **)dst, sizeof(float) * (size_t)n) != cudaSuccess) {
-    sgl_st_drop(st, &t);
+    sgl_st_drop(used, &t);
     return -1;
   }
   cudaMemcpy(*dst, t.data, sizeof(float) * (size_t)n, cudaMemcpyHostToDevice);
-  sgl_st_drop(st, &t);
+  sgl_st_drop(used, &t);
   return 0;
 }
 
 static int mtp_get_w8(sgl_cuda_model *g, const char *name, int N, int K, sgl_w8w *out) {
-  sgl_st_ctx *st = (sgl_st_ctx *)g->st;
   int64_t sh[2] = {N, K};
-  sgl_tensor t = sgl_st_get(st, name, 2, sh);
+  sgl_st_ctx *used = NULL;
+  sgl_tensor t = mtp_get_any(g, name, 2, sh, &used);
   if (sgl_tensor_is_null(t)) {
     fprintf(stderr, "[mtp] missing tensor %s\n", name);
     return -1;
   }
   int rc = dev_copy_w8(t.data, N, K, out);
-  sgl_st_drop(st, &t);
+  sgl_st_drop(used, &t);
   return rc;
 }
 
@@ -4525,6 +4558,20 @@ fail:
 int sgl_cuda_mtp_ready(const sgl_cuda_model *g) { return g ? g->mtp.ok : 0; }
 const float *sgl_cuda_mtp_hprev(const sgl_cuda_model *g) { return g ? g->mtp.hprev : NULL; }
 const float *sgl_cuda_mtp_hlast(const sgl_cuda_model *g) { return g ? g->mtp.hlast : NULL; }
+
+/* G22b：hlast 的每请求保存/恢复（混跑投机：hlast 是全局单缓冲，交替投机
+ * 的请求会互踩；服务层在批量 decode 后按行快照、投机前恢复）*/
+int sgl_cuda_mtp_hlast_save(sgl_cuda_model *g, float *host) {
+  if (!g || !g->mtp.ok || !g->mtp.hlast || !host) return -1;
+  return cudaMemcpy(host, g->mtp.hlast, sizeof(float) * (size_t)g->E,
+                    cudaMemcpyDeviceToHost) == cudaSuccess ? 0 : -1;
+}
+int sgl_cuda_mtp_hlast_restore(sgl_cuda_model *g, const float *host) {
+  if (!g || !g->mtp.ok || !g->mtp.hlast || !host) return -1;
+  return cudaMemcpy(g->mtp.hlast, host, sizeof(float) * (size_t)g->E,
+                    cudaMemcpyHostToDevice) == cudaSuccess ? 0 : -1;
+}
+int sgl_cuda_hidden(const sgl_cuda_model *g) { return g ? g->E : -1; }
 
 /* 一步草稿：给定位置 pos 的 hidden（device [E] 单行）与该位置的 token，
  * 预测 pos+1 的 token。

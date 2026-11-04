@@ -2,6 +2,24 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] — G22b：混跑投机（MTP 多请求共存 + hlast 按行快照）（2026-11-05）
+
+以前投机解码只在「单请求 + 贪心」时触发（nb==1 的门槛）：一旦有第二个请求在跑，
+投机就整体退化为逐 token。现在 nb>1 时也能投机：
+
+- **后端**（ABI 4）：`sgl_cuda_mtp_hlast_save/restore`（hlast 是全局单缓冲，多投机
+  请求交替会互踩）+ `sgl_cuda_hidden`（hsnap 缓冲大小依据）。
+- **服务**：批量 decode 后把每个资格请求的 hlast 按行快照（`set_hidden(b)` 取本行
+  → D2H 存档），每轮轮转一个资格请求投机（先 H2D 恢复自己的快照，投机行从
+  decode 批剔除，其余请求照常批量前进）。
+- **修复（被 G22b 验证暴露的旧问题）**：单文件 model.safetensors 模式的 st ctx
+  没有目录信息，`<dir>/mtp.safetensors` 永远找不到（多分片模型才碰巧能用）。
+  `sgl_st_open` 现在从路径推目录 + `mtp_get` 惰性自开散件。
+- **验收**（随机 MTP 头，接受率≈0：拒绝采样必须拒掉一切烂草稿）：单发/4 并发混跑
+  （含非资格采样请求）输出全部 == 不投机基线；STATS 实证投机真实交错在跑
+  （pos 交错、k=0）。工具：tests/gen_mtp_head.py + tools/spec_serve_check.py；
+  回归全绿（kvq_serve_check、conformance 双栈、cuda_test spec 段）。
+
 ## [Unreleased] — GPU 服务语义对齐（stop 字符串/include_usage）+ 对拍套件双引擎（2026-11-05）
 
 `apps/accel_http.c`（cuda_http/sglc --device cuda 共用的服务层）补齐与 CPU 版/上游的差距：

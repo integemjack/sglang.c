@@ -223,6 +223,16 @@ static int acc_mtp_accept_test(sgl_accel *m, const int *p, int np, int ng, doubl
   ACC_OPT(mtp_accept_test, -1);
   return A->mtp_accept_test(m, p, np, ng, acc, nok);
 }
+/* G22b：混跑投机 */
+static int acc_mtp_hlast_save(sgl_accel *m, float *host) {
+  ACC_OPT(mtp_hlast_save, -1);
+  return A->mtp_hlast_save(m, host);
+}
+static int acc_mtp_hlast_restore(sgl_accel *m, const float *host) {
+  ACC_OPT(mtp_hlast_restore, -1);
+  return A->mtp_hlast_restore(m, host);
+}
+static int acc_hidden(const sgl_accel *m) { return A->hidden ? A->hidden(m) : -1; }
 /* ================= W1：后端入口结束 ================= */
 
 /* M0: 从 8 提到 32 —— batch GDN 已经把 hybrid 模型的 B>1 decode 真正并行化
@@ -277,6 +287,8 @@ typedef struct request {
   int incl_usage;          /* stream_options.include_usage */
   int prio;            /* W2: 优先级（大的先跑；同优先级 FIFO）*/
   int spec_ready;      /* M3: 已把 prefill 末位 hidden 存进 mtp.hlast，可开投机 */
+  float *hsnap;        /* G22b: 本请求的 hlast 快照（混跑投机；E floats）*/
+  int hsnap_valid;
   struct request *next_done;
   struct request *next_q; /* t5: wait-queue link */
 } request;
@@ -597,6 +609,7 @@ static void req_free(request *r) {
   sgl_grammar_free(r->gram);
   free(r->logits);
   free(r->sacc); /* G22 */
+  free(r->hsnap); /* G22b */
   sgl_xfree(r->text_out); /* decode_gen 返回 sgl_xmalloc（对齐）——绝不能 free() */
   free(r);
 }
@@ -1103,10 +1116,13 @@ SGL_THREAD_SIG(worker) {
         nb++;
       }
       if (nb > 0) {
-        /* M3：单请求 + 贪心 → 投机解码。其它情况走原路（批量/采样都不受影响）。*/
-        int did_spec = 0;
+        /* M3/G22b：投机解码。单请求走原路（set_hidden(-1)）；nb>1 混跑时改为：
+         * 批量 decode 后按行快照各资格请求的 hlast（save），每轮轮转一个
+         * 资格请求投机（先 restore 自己的快照）。资格 = 贪心 + 无 grammar/
+         * logprobs + n_gen>0 + MTP 就绪；其余请求照常批量 decode，互不影响。*/
+        int spec_done_idx = -1; /* G22b：本轮投机成功的行（从 decode 批剔除）*/
         {
-          static int spec_on = -1, spec_W = 0;
+          static int spec_on = -1, spec_W = 0, spec_rr = 0, hid = -1;
           if (spec_on < 0) {
             const char *sw = getenv("SGL_SPEC_W");
             spec_W = sw ? atoi(sw) : 0;
@@ -1117,14 +1133,41 @@ SGL_THREAD_SIG(worker) {
             } else spec_W = 0;
             if (spec_W > 0) fprintf(stderr, "[spec] W=%d chain=%s\n", spec_W,
                                     getenv("SGL_MTP_CHAIN") ? getenv("SGL_MTP_CHAIN") : "post");
+            hid = spec_on ? acc_hidden(E.gpu) : -1; /* G22b：hsnap 大小 */
           }
           request *r0 = br[0];
-          if (spec_on && nb == 1 && acc_mtp_ready(E.gpu) &&
+          if (spec_on && acc_mtp_ready(E.gpu) &&
               r0->sp.temperature <= 0.0f && r0->sp.top_k <= 1 && !r0->gram &&
-              !r0->want_lp && r0->n_gen > 0)
-            did_spec = spec_try_step(r0, spec_W);
+              !r0->want_lp && r0->n_gen > 0 && nb == 1) {
+            if (spec_try_step(r0, spec_W)) spec_done_idx = 0; /* 原路：上次前向必是本请求 */
+          } else if (spec_on && acc_mtp_ready(E.gpu) && nb > 1 && hid > 0) {
+            /* G22b 混跑：轮转挑一个有快照的资格请求投机，其余照常 decode。
+             * spec_try_step 失败也会作废快照（下轮 decode 后重拍）。*/
+            for (int q = 0; q < nb && spec_done_idx < 0; q++) {
+              request *rq = br[(spec_rr + q) % nb];
+              if (!(rq->state == R_RUN && rq->sp.temperature <= 0.0f &&
+                    rq->sp.top_k <= 1 && !rq->gram && !rq->want_lp && rq->n_gen > 0))
+                continue;
+              if (!rq->hsnap_valid) continue; /* 本轮先 decode，下轮快照后投机 */
+              if (acc_mtp_hlast_restore(E.gpu, rq->hsnap) != 0) continue;
+              rq->spec_ready = 1; /* 跳过 set_hidden(-1)：hlast 已按行恢复 */
+              if (spec_try_step(rq, spec_W)) {
+                spec_done_idx = (spec_rr + q) % nb;
+                spec_rr = (spec_rr + q + 1) % nb;
+                break;
+              }
+            }
+          }
         }
-        if (!did_spec) {
+        if (!(spec_done_idx >= 0 && nb == 1)) {
+        if (spec_done_idx >= 0) {
+          /* G22b：剔除投机行，其余照常批量 decode（投机请求本轮已推进 k+1 token）*/
+          for (int q2 = spec_done_idx; q2 < nb - 1; q2++) {
+            bt[q2] = bt[q2 + 1]; bb[q2] = bb[q2 + 1]; bl[q2] = bl[q2 + 1];
+            bs[q2] = bs[q2 + 1]; br[q2] = br[q2 + 1];
+          }
+          nb--;
+        }
         acc_set_decode_slots(E.gpu, bs, nb);
         if (getenv("SGL_HTTP_DBG")) {
           fprintf(stderr, "[dec] nb=%d", nb);
@@ -1160,8 +1203,33 @@ SGL_THREAD_SIG(worker) {
                    sizeof(float) * E.vocab);
             br[b]->has_logits = 1;
           }
+          /* G22b：混跑投机——decode_batch 的隐藏输出按行，给每个资格请求按行
+           * 快照 hlast（set_hidden(b) 把第 b 行存进 hlast，再 D2H 存档）*/
+          {
+            static int spec2_on = -1, hid2 = -1;
+            if (spec2_on < 0) {
+              const char *sw = getenv("SGL_SPEC_W");
+              spec2_on = (sw && atoi(sw) > 0 && atoi(sw) <= 8) ? 1 : 0;
+              hid2 = spec2_on ? acc_hidden(E.gpu) : -1;
+            }
+            if (nb > 1 && spec2_on && acc_mtp_ready(E.gpu) && hid2 > 0) {
+              for (int b = 0; b < nb; b++) {
+                request *rq = br[b];
+                if (!(rq->state == R_RUN && rq->sp.temperature <= 0.0f &&
+                      rq->sp.top_k <= 1 && !rq->gram && !rq->want_lp &&
+                      rq->n_gen > 0))
+                  continue;
+                if (!rq->hsnap)
+                  rq->hsnap = (float *)malloc(sizeof(float) * (size_t)hid2);
+                if (!rq->hsnap) break;
+                if (acc_mtp_set_hidden(E.gpu, b) == 0 &&
+                    acc_mtp_hlast_save(E.gpu, rq->hsnap) == 0)
+                  rq->hsnap_valid = 1;
+              }
+            }
+          }
         }
-        } /* !did_spec */
+        } /* spec_done_idx 处理完：单请求投机成功则整轮无 decode */
       }
       WakeAllConditionVariable(&E.cv_step);
     } else if (any) {
@@ -1209,6 +1277,7 @@ static int spec_try_step(request *r, int W) {
   int i, k = 0, nd, room, pos, stop_at = -1;
   int drafts[16], toks[16];
   if (!r || r->n_gen <= 0 || !r->logits) return 0;
+  r->hsnap_valid = 0; /* G22b：任何投机尝试后快照即失效（hlast 已被本步改写）*/
   if (!r->spec_ready) {
     if (acc_mtp_set_hidden(E.gpu, -1) != 0) return 0;
     r->spec_ready = 1;
