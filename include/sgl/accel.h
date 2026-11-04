@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 /* 表结构版本：字段增删就 +1，防止半新半旧的后端与服务层错配 */
-#define SGL_ACCEL_ABI 2
+#define SGL_ACCEL_ABI 3
 
 typedef struct sgl_accel sgl_accel; /* 后端实例（CUDA 侧即 sgl_cuda_model）*/
 
@@ -67,6 +67,17 @@ typedef struct sgl_accel_api {
 
   /* ---- 可选：前缀缓存的 KV 搬运（[src,src+len) → [dst,dst+len)，所有层 k+v）---- */
   int (*copy_kv)(sgl_accel *m, int src, int dst, int len);
+
+  /* ---- 可选：页级零拷贝前缀复用（G20；仅 kvq 恒等页表后端支持）----
+   * page_size <= 0 = 不支持，服务层回落 copy_kv / 重算。语义见各后端头文件
+   * （CUDA：include/sgl/cuda.h 的 sgl_cuda_pages_map 注释，权威）。
+   * pages_map：把 dst 起npages 页的页表项改指 src 同位置页的 slot（零 D2D；
+   * MTP f32 段照拷）。映射页不得再被写；源段要被写前必须 pages_unmap(cow=1)。
+   * pages_unmap：还原恒等。cow=1 先把共享页数据拷回本段（写时复制落地），
+   * cow=0 直接弃（数据作废）。 */
+  int (*page_size)(const sgl_accel *m);
+  int (*pages_map)(sgl_accel *m, int dst_base, int src_base, int npages);
+  int (*pages_unmap)(sgl_accel *m, int base, int npages, int cow);
 
   /* ---- 可选：预热（CUDA = 撑工作区 + 捕获 decode graph；MLX = mx::compile）----
    * 返回完成量，<0 = 失败/不支持。 */

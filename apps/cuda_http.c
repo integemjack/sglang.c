@@ -41,6 +41,13 @@ static int cu_decode_batch(sgl_accel *m, const int *t, const int *bp, const int 
 static int cu_copy_kv(sgl_accel *m, int s, int d, int n) {
   return sgl_cuda_copy_kv(CU(m), s, d, n);
 }
+static int cu_page_size(const sgl_accel *m) { return sgl_cuda_kvq_page_size(CUC(m)); }
+static int cu_pages_map(sgl_accel *m, int dst, int src, int npg) {
+  return sgl_cuda_pages_map(CU(m), dst, src, npg);
+}
+static int cu_pages_unmap(sgl_accel *m, int base, int npg, int cow) {
+  return sgl_cuda_pages_unmap(CU(m), base, npg, cow);
+}
 /* 「设备内存」在 CUDA 上就是 VRAM */
 static long cu_estimate_mem_mb(const void *m, int ctx, int rows) {
   return sgl_cuda_estimate_vram_mb(m, ctx, rows);
@@ -108,6 +115,9 @@ static const sgl_accel_api CUDA_API = {
     .forward_seg_emb = cu_forward_seg_emb,
     .from_gpt2 = cu_from_gpt2,
     .copy_kv = cu_copy_kv,
+    .page_size = cu_page_size,
+    .pages_map = cu_pages_map,
+    .pages_unmap = cu_pages_unmap,
     .prewarm = cu_prewarm,
     .lin_slots = cu_lin_slots,
     .set_lin_slot = cu_set_lin_slot,

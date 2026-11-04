@@ -73,6 +73,23 @@ int sgl_cuda_prewarm(sgl_cuda_model *m, int rows, int max_b);
  * 成功 0；越界/拷贝失败 -1；src==dst 或 len<=0 直接算成功。 */
 int sgl_cuda_copy_kv(sgl_cuda_model *m, int src, int dst, int len);
 
+/* ============ G20: 页级零拷贝前缀复用（SGL_KVQ=1 恒等页表模式）============
+ * 量化分页 KV 的页表 pt[页]=slot 本来是恒等映射（M2：n_slots==n_pages）。
+ * pages_map 把 [dst_base, dst_base+npages*P) 的页表项改成指向
+ * [src_base, ...) 的 slot——KV 页共享，零 D2D 拷贝（MTP 自有 f32 段照 copy_kv
+ * 逐行拷，单层量小，草稿质量语义与 copy_kv 一致）。
+ * 写保护责任在调用方：映射页绝不能再被 forward/decode 写（kernel 直接写
+ * pt 命中的 slot，会污染共享者）；源段要被写之前必须先 pages_unmap(cow=1)。
+ * sgl_cuda_kvq_page_size：返回页大小 P；0 = 该实例不支持（f32 池 / M6 换页
+ * 模式 n_slots<n_pages / host 权威副本模式），调用方应回落 copy_kv。
+ * pages_unmap(base, npages, cow)：把映射页还原成恒等。cow=1 先把共享 slot
+ * 的数据拷回本段恒等 slot（「写时复制」落地，之后源段怎么写都不影响本段）；
+ * cow=0 直接弃（本段数据作废——用于请求已死、数据没人要的路径）。
+ * 全部只动 host 页表 + 受影响页段的 H2D（一次 cudaMemcpyAsync），不动数据。 */
+int sgl_cuda_kvq_page_size(const sgl_cuda_model *m);
+int sgl_cuda_pages_map(sgl_cuda_model *m, int dst_base, int src_base, int npages);
+int sgl_cuda_pages_unmap(sgl_cuda_model *m, int base, int npages, int cow);
+
 /* G5: 上传前的显存估算（MB）。按与 sgl_cuda_from_llama 相同的分配口径算：
  * 权重（fp32/fp16/int8 按当前环境变量开关）+ KV 池(ctx) + 激活工作区(rows) +
  * logits 设备镜像 + cublas workspace。llama_model 为 sgl_llama*。 */

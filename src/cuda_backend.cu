@@ -5460,6 +5460,88 @@ int sgl_cuda_copy_kv(sgl_cuda_model *g, int src_base, int dst_base, int len) {
   return cudaStreamSynchronize(g->stream) == cudaSuccess ? 0 : -1;
 }
 
+/* ================= G20: 页级零拷贝前缀复用（见 cuda.h 注释） ================= */
+int sgl_cuda_kvq_page_size(const sgl_cuda_model *m) {
+  if (!m || !m->kvq.on) return 0;
+  if (m->kvq.n_slots != m->kvq.n_pages) return 0; /* M6 换页模式：resolve 会赶共享页 */
+  if (m->kvq.host_slots) return 0;                /* host 权威副本模式：写侧另有主见 */
+  return m->kvq.P;
+}
+
+static int kvq_pt_upload(sgl_kvq *q, int pg0, int np, cudaStream_t st) {
+  return cudaMemcpyAsync(q->d_pt + pg0, q->h_pt + pg0, sizeof(int) * (size_t)np,
+                         cudaMemcpyHostToDevice, st) == cudaSuccess ? 0 : -1;
+}
+
+int sgl_cuda_pages_map(sgl_cuda_model *m, int dst_base, int src_base, int npages) {
+  if (!m || npages <= 0) return -1;
+  sgl_kvq *q = &m->kvq;
+  if (!sgl_cuda_kvq_page_size(m)) return -1;
+  int P = q->P;
+  if (dst_base < 0 || src_base < 0 || src_base == dst_base) return -1;
+  if ((dst_base % P) != 0 || (src_base % P) != 0) return -1;
+  long dp0 = dst_base / P, sp0 = src_base / P;
+  if (sp0 + npages > q->n_pages || dp0 + npages > q->n_pages) return -1;
+  /* 先验后写：任何一页源未驻留就整体放弃（调用方回落 copy_kv / 重算），
+   * 不留半改的页表。*/
+  for (int i = 0; i < npages; i++)
+    if (q->h_pt[sp0 + i] < 0) return -1;
+  /* MTP 自有 KV 是 f32 段布局，不随 kvq 分页：照 copy_kv 逐行拷（单层，量小）。*/
+  if (m->mtp.ok && m->mtp.kc) {
+    int len = npages * P;
+    if (src_base + len <= m->mtp.ctx && dst_base + len <= m->mtp.ctx) {
+      size_t mb = (size_t)len * m->KD * sizeof(float);
+      if (cudaMemcpyAsync(m->mtp.kc + (size_t)dst_base * m->KD,
+                          m->mtp.kc + (size_t)src_base * m->KD,
+                          mb, cudaMemcpyDeviceToDevice, m->stream) != cudaSuccess ||
+          cudaMemcpyAsync(m->mtp.vc + (size_t)dst_base * m->KD,
+                          m->mtp.vc + (size_t)src_base * m->KD,
+                          mb, cudaMemcpyDeviceToDevice, m->stream) != cudaSuccess)
+        return -1;
+    }
+  }
+  for (int i = 0; i < npages; i++)
+    q->h_pt[dp0 + i] = q->h_pt[sp0 + i]; /* 目标原恒等 slot 被孤儿化：M2 下无碍 */
+  if (kvq_pt_upload(q, (int)dp0, npages, m->stream) != 0) return -1;
+  return cudaStreamSynchronize(m->stream) == cudaSuccess ? 0 : -1;
+}
+
+int sgl_cuda_pages_unmap(sgl_cuda_model *m, int base, int npages, int cow) {
+  if (!m || npages <= 0) return 0; /* 无映射 = 成功的 no-op */
+  sgl_kvq *q = &m->kvq;
+  if (!sgl_cuda_kvq_page_size(m)) return -1;
+  int P = q->P;
+  if (base < 0 || (base % P) != 0) return -1;
+  long p0 = base / P;
+  if (p0 + npages > q->n_pages) return -1;
+  int any = 0;
+  for (int i = 0; i < npages; i++) {
+    long pg = p0 + i;
+    int cur = q->h_pt[pg];
+    int ident = (pg < q->n_slots) ? (int)pg : -1;
+    if (cur == ident) continue; /* 本来就没映射 */
+    if (cow) {
+      /* COW 落地：把共享 slot 的页数据拷回本页恒等 slot（对照 copy_kv 逐页拷）*/
+      if (ident < 0) return -1;
+      for (int l = 0; l < m->L; l++) {
+        int ll = m->kvo[l];
+        if (ll < 0) continue;
+        unsigned char *pb = q->d_pool + (long)ll * q->layer_slots;
+        if (cudaMemcpyAsync(pb + (long)ident * q->slot_layer,
+                            pb + (long)cur * q->slot_layer,
+                            (size_t)q->slot_layer, cudaMemcpyDeviceToDevice,
+                            m->stream) != cudaSuccess)
+          return -1;
+      }
+    }
+    q->h_pt[pg] = ident;
+    any = 1;
+  }
+  if (!any) return 0;
+  if (kvq_pt_upload(q, (int)p0, npages, m->stream) != 0) return -1;
+  return cudaStreamSynchronize(m->stream) == cudaSuccess ? 0 : -1;
+}
+
 /* ---- G5: 上传前的显存预检 ----
  * 口径与 sgl_cuda_from_llama 的分配一致（同一个环境变量开关决定权重位宽）：
  *   权重   embed V*E + (不 tied 时 lm_head V*E)
@@ -6193,7 +6275,13 @@ void sgl_cuda_set_decode_slots(sgl_cuda_model *m, const int *slots, int B) {
   }
 }
 
-int sgl_cuda_lin_slots(const sgl_cuda_model *m) { return m ? m->lin_slots : 0; }
+int sgl_cuda_lin_slots(const sgl_cuda_model *m) {
+  /* W1 语义对齐：这个值被服务层当「模型有无线性注意力」用（pfx_ok = lin_slots<=0），
+   * 而 lin_slots 字段本体是【槽数配置】（dense 默认 8）。dense（lin_n==0）必须
+   * 返回 0，否则 CUDA 服务的前缀缓存会被永远关掉（2026-11-04 G20 服务级验收
+   * 实测发现：pfx_ok=0、hits 恒 0）。hybrid（lin_n>0）返回槽数，行为不变。*/
+  return (m && m->lin_n > 0) ? m->lin_slots : 0;
+}
 
 static int decode_step_launch(sgl_cuda_model *g, int B, int maxu) {
   int E = g->E, H = g->H, HK = g->HK, D = g->D, KD = g->KD;

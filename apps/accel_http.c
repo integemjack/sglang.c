@@ -247,7 +247,11 @@ typedef struct request {
   sgl_sampling_params sp;
   uint64_t rng;
   int seg;             /* kv segment index, -1 until assigned */
-  int seg_len;         /* segment capacity in positions */
+  int seg_len;         /* segment capacity in positions（G20 pagemap：=本请求页区间行数）*/
+  int base;            /* G20：本请求 KV 基址（非 pagemap：seg*seg_len；pagemap：pg0*P）*/
+  int pg0, npg;        /* G20：分配到的页区间 [pg0, pg0+npg)；非 pagemap 无效 */
+  int map_npg;         /* G20：开头映射共享的页数（0=无）；源见 map_src */
+  int map_src;         /* G20：映射源的租让基址 */
   int reached_run;     /* G6: prefill 跑成功过（才能登记前缀租让） */
   float *logits;       /* host buffer vocab floats (last step) */
   int has_logits;
@@ -275,6 +279,9 @@ typedef struct {
   int vocab;
   int eos;
   int seg_len; /* ctx / MAX_CONC */
+  int pagemap;  /* G20：1 = 页级 KV（kvq 恒等页表 + 页区间分配器 + 零拷贝挂页）*/
+  int page_sz;  /* G20：页大小 P（0 = 后端不支持，回落静态段 + copy_kv）*/
+  int pool_rows;/* G20：KV 池总行数（= ctx），准入上限 */
   sgl_clip *clip;      /* t10: vision tower, NULL when model dir has no clip_config.json */
   sgl_jinja *jinja;    /* P0-2: 模型自带 chat_template（NULL = 回退 ChatML）*/
   char model_name[256];/* 响应体里的 model 字段 */
@@ -366,16 +373,71 @@ static void sched_vocab_ensure(void) {
  * 带图的请求只登记 text 部分（视觉行依赖图片，位置在 text 之后，后续谁都能接）。*/
 typedef struct {
   int used;
-  int seg;    /* 租让的 KV 段号（base = seg * seg_len） */
+  int seg;    /* 租让的 KV 段号（非 pagemap：base = seg * seg_len）*/
+  int base;   /* G20：租让的 KV 基址（pagemap：页区间起点；非 pagemap：seg*seg_len）*/
+  int npg;    /* G20：租让持有的页数（仅 pagemap；驱逐时归还页池）*/
   int len;    /* 有效行数：prompt（+ 生成 token，非视觉时） */
   int *toks;  /* 与 [0,len) 行一一对应的 token 副本（精确比对，不靠 hash） */
   unsigned long long use; /* LRU 时钟 */
 } pfx_slot;
 static pfx_slot g_pfx[PFX_MAX];
-static int g_pfx_of[MAX_CONC];             /* 段 -> 表项下标+1；0 = 未租让 */
+static int g_pfx_of[MAX_CONC];             /* 段 -> 表项下标+1；0 = 未租让（非 pagemap 用）*/
 static unsigned long long g_pfx_clock;
 static long g_pfx_hits, g_pfx_misses, g_pfx_hit_rows, g_pfx_leased_rows;
 static long g_pfx_flushes;
+/* G20：pagemap 模式的统计（/health 与验收用）*/
+static long g_pfx_map_pages, g_pfx_cow_pages, g_pgm_allocs, g_pgm_fails;
+
+/* ================= G20：页区间分配器（仅 E.pagemap）=================
+ * KV 池按页（P=64 行）划分，页状态：0=free / 1=active（请求占用）/
+ * 2=leased（租让持有）。请求拿到【连续】逻辑页区间 [pg0, pg0+npg)，
+ * base = pg0*P；物理 slot 由设备页表决定（恒等），连续性只约束逻辑 gpos
+ * （kernel 的 gpos = kv_base+p 连续递增）。
+ * 分配：first-fit。两级：先要 prompt+max_new 全量，拿不到退到
+ * prompt+1（生成提前 length 截断，但请求能活）。
+ * 释放：reap 时归还；登记租让的页转 leased（不再 free），驱逐时归还。*/
+static unsigned char *g_pg; /* [g_pg_n] 页状态 */
+static int g_pg_n;
+
+static int pgm_alloc(int need_rows, int *out_npg) {
+  int P = E.page_sz;
+  int npg = (need_rows + P - 1) / P;
+  int best_run = 0, best_at = -1, run = 0;
+  for (int p = 0; p < g_pg_n; p++) {
+    if (g_pg[p] == 0) {
+      if (++run > best_run) { best_run = run; best_at = p - run + 1; }
+      if (run >= npg) break; /* 首个满足长度的窗口 */
+    } else run = 0;
+  }
+  /* best_run >= npg：拿到整段；否则 best_run 是最大连续窗口，交给调用方降级 */
+  if (best_run < npg) { *out_npg = best_run; return -1; }
+  for (int p = best_at; p < best_at + npg; p++) g_pg[p] = 1;
+  *out_npg = npg;
+  g_pgm_allocs++;
+  return best_at;
+}
+
+static void pgm_release(int pg0, int npg, int lease) {
+  if (!g_pg || pg0 < 0 || npg <= 0 || pg0 + npg > g_pg_n) return;
+  for (int p = pg0; p < pg0 + npg; p++) g_pg[p] = lease ? 2 : 0;
+}
+
+/* G20：把还在映射 src_base 起那组页的活跃请求 COW 落地（租让要被驱逐/覆盖前调）。
+ * COW 后数据在本段恒等 slot 里自洽，源页随便写。*/
+static void pfx_cow_mappings(int src_base, int npg) {
+  if (!E.pagemap) return;
+  for (int i = 0; i < MAX_CONC; i++) {
+    request *r = E.reqs[i];
+    if (!r || r->map_npg <= 0 || r->map_src != src_base) continue;
+    if (A && A->pages_unmap && A->pages_unmap(E.gpu, r->base, r->map_npg, 1) == 0) {
+      g_pfx_cow_pages += r->map_npg;
+      r->map_npg = 0; /* 已落地：本段自洽 */
+    }
+    /* unmap 失败（设备错误）也清零：页表已被回收语义接管，不能留在共享态 */
+    else r->map_npg = 0;
+  }
+}
+
 /* G15(b): 运维杆 —— SGL_PFX_MAX=0 彻底关掉前缀缓存（显存/排错极端情况用），
  * 也可以给小值限住租让表。*/ 
 static int PFX_MAX_EFF = PFX_MAX;
@@ -393,33 +455,45 @@ static void pfx_flush_all(void) {
 
 static void pfx_drop(int idx) {
   if (idx < 0 || idx >= PFX_MAX || !g_pfx[idx].used) return;
+  /* G20（pagemap）：驱逐 = 这组页即将可被分配/写。还在映射它的活跃请求
+   * 先 COW 落地（数据保住），再把页归还 free 池。*/
+  if (E.pagemap && g_pfx[idx].npg > 0) {
+    pfx_cow_mappings(g_pfx[idx].base, g_pfx[idx].npg);
+    pgm_release(g_pfx[idx].base / E.page_sz, g_pfx[idx].npg, 0);
+  }
   g_pfx_of[g_pfx[idx].seg] = 0;
   g_pfx_leased_rows -= g_pfx[idx].len; /* 这是 gauge（当前可复用行数），不是累计 */
   free(g_pfx[idx].toks);
   memset(&g_pfx[idx], 0, sizeof(g_pfx[idx]));
 }
 
-/* 最长公共前缀：返回长度（< PFX_MIN 视为没命中），*out_seg 给出来源段 */
-static int pfx_match(const int *toks, int n, int *out_seg) {
-  int best = 0, bseg = -1;
+/* G20：pfx_match 改给表项下标（pagemap 要的是 base/npg，不再是段号）。
+ * LRU touch 按【同一租让页组】（pagemap：base；静态：seg）也一并刷新。 */
+static int pfx_match(const int *toks, int n, int *out_idx) {
+  int best = 0, bidx = -1;
   for (int i = 0; i < PFX_MAX_EFF; i++) {
     if (!g_pfx[i].used) continue;
     int m = g_pfx[i].len < n ? g_pfx[i].len : n;
     int l = 0;
     while (l < m && g_pfx[i].toks[l] == toks[l]) l++;
-    if (l > best) { best = l; bseg = g_pfx[i].seg; }
+    if (l > best) { best = l; bidx = i; }
   }
-  if (best < PFX_MIN) { *out_seg = -1; return 0; }
-  *out_seg = bseg;
+  if (best < PFX_MIN) { *out_idx = -1; return 0; }
+  *out_idx = bidx;
+  int owner = g_pfx[bidx].seg;
+  int obase = g_pfx[bidx].base;
   for (int i = 0; i < PFX_MAX_EFF; i++)
-    if (g_pfx[i].used && g_pfx[i].seg == bseg) g_pfx[i].use = ++g_pfx_clock;
+    if (g_pfx[i].used && (E.pagemap ? g_pfx[i].base == obase : g_pfx[i].seg == owner))
+      g_pfx[i].use = ++g_pfx_clock;
   return best;
 }
 
 /* 请求结束后把它的段登记为前缀租让。
  * toks/n_tok：这个段 [0,n_tok) 行对应的 token（非视觉时为 prompt+生成，
- * 视觉时为 prompt 文本部分）；slot.len 就是 n_tok。 */
-static void pfx_register(int seg, const int *toks, int n_tok) {
+ * 视觉时为 prompt 文本部分）；slot.len 就是 n_tok。
+ * G20 pagemap：npg 由调用方在登记后按实际行数补写（页的租让态切换也在
+ * 调用方统一做）；非 pagemap 恒 0（静态段语义，租让不额外占显存）。 */
+static void pfx_register(int seg, int base, const int *toks, int n_tok) {
   int len = n_tok;
   if (PFX_MAX_EFF <= 0) return;
   if (len < PFX_MIN || seg < 0 || seg >= MAX_CONC) return;
@@ -427,21 +501,30 @@ static void pfx_register(int seg, const int *toks, int n_tok) {
   unsigned long long oldest = ~0ull;
   for (int i = 0; i < PFX_MAX_EFF; i++) {
     if (!g_pfx[i].used) { slot = i; break; }
-    if (g_pfx[i].seg == seg) { slot = i; break; } /* 同段直接覆盖旧登记 */
+    if (E.pagemap ? (g_pfx[i].npg > 0 && g_pfx[i].base == base)
+                  : g_pfx[i].seg == seg) { slot = i; break; } /* 同区间/段：覆盖旧登记 */
     if (g_pfx[i].use < oldest) { oldest = g_pfx[i].use; lru = i; }
   }
-  if (slot < 0) { pfx_drop(lru); slot = lru; } /* 表满：LRU 驱逐（那个段从此可被复用） */
+  if (slot < 0) { pfx_drop(lru); slot = lru; } /* 表满：LRU 驱逐（页归还/COW 在 drop 里）*/
   int *cp = (int *)malloc(sizeof(int) * (size_t)len);
   if (!cp) return;
   memcpy(cp, toks, sizeof(int) * (size_t)len);
+  /* 覆盖旧登记时：pagemap 下旧登记若持有别组页，先还页（同区间覆盖无页变动）*/
+  if (g_pfx[slot].used && E.pagemap && g_pfx[slot].npg > 0 && g_pfx[slot].base != base)
+    pgm_release(g_pfx[slot].base / E.page_sz, g_pfx[slot].npg, 0);
   free(g_pfx[slot].toks);
   g_pfx[slot].toks = cp;
   g_pfx[slot].used = 1;
   g_pfx[slot].seg = seg;
+  g_pfx[slot].base = base;
+  g_pfx[slot].npg = 0; /* 调用方（reap）拿到登记行数后补写 */
   g_pfx[slot].len = len;
   g_pfx[slot].use = ++g_pfx_clock;
   g_pfx_of[seg] = slot + 1;
   g_pfx_leased_rows += len;
+  if (getenv("SGL_HTTP_DBG"))
+    fprintf(stderr, "[pfx] registered seg=%d base=%d len=%d lease_npg=%d (pagemap=%d)\n",
+            seg, base, len, g_pfx[slot].npg, E.pagemap);
 }
 
 /* G15：把一次已完成请求能租让的行拼出来。
@@ -450,20 +533,26 @@ static void pfx_register(int seg, const int *toks, int n_tok) {
  *   n_gen-1 行）。
  * 视觉：只到 prompt 末（后面的视觉行依赖图片，不归这段文本管）。
  * 返回实际登记的行数（0 = 不登记）。 */
-static int pfx_register_req(int seg, const request *r) {
+static int pfx_register_req(int seg, int base, const request *r) {
   if (!r || r->n_gen < 0) return -1;
   if (r->n_img > 0) {
-    pfx_register(seg, r->prompt, r->n_prompt);
+    pfx_register(seg, base, r->prompt, r->n_prompt);
     return r->n_prompt;
   }
   int n_gen_ok = r->n_gen > 0 ? r->n_gen - 1 : 0;
   int total = r->n_prompt + n_gen_ok;
-  if (n_gen_ok == 0) { pfx_register(seg, r->prompt, r->n_prompt); return r->n_prompt; }
+  if (n_gen_ok == 0) {
+    pfx_register(seg, base, r->prompt, r->n_prompt);
+    return r->n_prompt;
+  }
   int *buf = (int *)malloc(sizeof(int) * (size_t)total);
-  if (!buf) { pfx_register(seg, r->prompt, r->n_prompt); return r->n_prompt; }
+  if (!buf) {
+    pfx_register(seg, base, r->prompt, r->n_prompt);
+    return r->n_prompt;
+  }
   memcpy(buf, r->prompt, sizeof(int) * (size_t)r->n_prompt);
   memcpy(buf + r->n_prompt, r->gen, sizeof(int) * (size_t)n_gen_ok);
-  pfx_register(seg, buf, total);
+  pfx_register(seg, base, buf, total);
   free(buf);
   return total;
 }
@@ -581,7 +670,12 @@ static int submit2(const char *text, int max_new, const sgl_sampling_params *sp,
   if (!r) { LeaveCriticalSection(&E.lock); sgl_xfree(img_feats); return -1; }
   /* P1: 单段容量检查——prompt 比一个 KV 段还长时永远算不出来，以前会让请求进 R_FAIL，
    * 调用方只看到 “generation failed”。这里提前拒掉，并让 route 给明确提示。*/
-  if (E.seg_len > 0 && r->n_prompt + n_img > E.seg_len) {
+  /* P1: 容量检查——pagemap 时只拒物理不可能（超过整个 KV 池），页池余量
+   * 由分配器在 worker 里裁决（可能排队后仍失败，那走 R_FAIL/503 文案）。
+   * 非 pagemap：prompt 比一个静态段还长时永远算不出来，提前拒。*/
+  int over = E.pagemap ? (r->n_prompt + n_img + 1 > E.pool_rows)
+                       : (E.seg_len > 0 && r->n_prompt + n_img > E.seg_len);
+  if (over) {
     int need = r->n_prompt + n_img;
     LeaveCriticalSection(&E.lock);
     sgl_xfree(img_feats);
@@ -658,9 +752,39 @@ SGL_THREAD_SIG(worker) {
         /* G6/G15: 跑过 prefill 的请求，把它的段登记为前缀租让（后面的请求就能复用）。
          * G15: ① 行数不再只算 prompt，而是「这个段里确实有有效 KV 的行」（含生成 token，
          * 多轮对话/续写直接受益）；② 带图的请求也登记了（只登到 text 末：视觉行依赖
-         * 图片，位置在 text 之后，不归这段登记管）。*/
-        if (E.gpu && E.pfx_ok && r->reached_run && r->seg == i && r->n_prompt >= PFX_MIN)
-          pfx_register_req(i, r);
+         * 图片，位置在 text 之后，不归这段登记管）。
+         * G20 pagemap：登记前先把映射页 COW 落地（租让行的 KV 必须在本区间自洽，
+         * 不能还指在别人的共享 slot 上）；登记的页转租让态、其余归还 free 池。*/
+        int lease_len = 0;
+        int can_lease = E.gpu && E.pfx_ok && r->reached_run &&
+                        r->n_prompt >= PFX_MIN && (!E.pagemap || r->pg0 >= 0) &&
+                        (!E.pagemap || r->seg == i);
+        if (can_lease) {
+          if (E.pagemap && r->map_npg > 0) {
+            if (A && A->pages_unmap)
+              A->pages_unmap(E.gpu, r->base, r->map_npg, 1); /* COW：数据落地本段 */
+            g_pfx_cow_pages += r->map_npg;
+            r->map_npg = 0;
+          }
+          lease_len = pfx_register_req(i, r->base, r);
+        } else if (E.pagemap && r->map_npg > 0) {
+          if (A && A->pages_unmap)
+            A->pages_unmap(E.gpu, r->base, r->map_npg, 0); /* 弃映射：数据没人要 */
+          r->map_npg = 0;
+        }
+        if (E.pagemap && r->pg0 >= 0 && r->npg > 0) {
+          int lp = lease_len > 0 ? (lease_len + E.page_sz - 1) / E.page_sz : 0;
+          if (lp > r->npg) lp = r->npg;
+          if (lp > 0) {
+            for (int p = r->pg0; p < r->pg0 + lp; p++) g_pg[p] = 2;      /* 转租让 */
+            for (int p = r->pg0 + lp; p < r->pg0 + r->npg; p++) g_pg[p] = 0;
+            int li = g_pfx_of[i] - 1; /* 刚登记的表项：补上它持有的页数 */
+            if (li >= 0 && li < PFX_MAX && g_pfx[li].base == r->base)
+              g_pfx[li].npg = lp;
+          } else {
+            pgm_release(r->pg0, r->npg, 0);
+          }
+        }
         req_free(r);
         E.reqs[i] = NULL;
         E.n_active--;
@@ -715,8 +839,42 @@ SGL_THREAD_SIG(worker) {
       request *r = E.reqs[i];
       if (!r || r->state != R_WAIT) continue;
       r->seg = i;
-      r->seg_len = E.seg_len;
-      int base = i * E.seg_len;
+      /* G20 pagemap：KV 区间不再静态划分，从页池 first-fit 拿连续 npg 页。
+       * 两级尝试：先 prompt+图+max_new 全量；拿不到退到 prompt+图+1
+       * （decode 到容量顶提前 length 截断，但请求能活）。再不行才失败。
+       * 非 pagemap：静态段（原语义）。*/
+      int base;
+      if (E.pagemap) {
+        int need = r->n_prompt + r->n_img + r->max_new + 1;
+        int npg = 0;
+        int pg0 = pgm_alloc(need, &npg);
+        if (pg0 < 0) {
+          int need2 = r->n_prompt + r->n_img + 1;
+          int npg2 = (need2 + E.page_sz - 1) / E.page_sz;
+          if (npg2 <= npg) { /* 刚才的最大连续窗口够降级档 */
+            int npg2b = 0;
+            pg0 = pgm_alloc(need2, &npg2b);
+            npg = npg2b;
+          }
+        }
+        if (pg0 < 0) {
+          g_pgm_fails++;
+          E.last_prompt_tokens = r->n_prompt + r->n_img;
+          r->state = R_FAIL; /* 页池耗尽：直接失败（http 线程收 503 文案）*/
+          any = 1;
+          continue; /* 仍持锁，下一轮迭代 */
+        }
+        r->pg0 = pg0;
+        r->npg = npg;
+        base = pg0 * E.page_sz;
+        r->seg_len = npg * E.page_sz;
+      } else {
+        r->seg_len = E.seg_len;
+        base = i * E.seg_len;
+      }
+      r->base = base;
+      r->map_npg = 0;
+      r->map_src = -1;
       LeaveCriticalSection(&E.lock);
       int rc;
       /* G6/G15: 前缀命中 -> 把租让段里的 KV 行搬进本段，prefill 从命中处起。
@@ -724,15 +882,34 @@ SGL_THREAD_SIG(worker) {
        * 不到 logits。带图的请求也参与（能命中 text 部分，视觉行照旧算）。*/
       int off = 0;
       if (E.gpu && r->n_prompt >= PFX_MIN && E.pfx_ok) {
-        int src_seg = -1;
-        int hit = pfx_match(r->prompt, r->n_prompt, &src_seg);
+        int li = -1;
+        int hit = pfx_match(r->prompt, r->n_prompt, &li);
         if (hit >= r->n_prompt) hit = r->n_prompt - 1;
+        if (E.pagemap) {
+          /* G20：命中截到页对齐（hit_p），那几页零拷贝挂到本区间（只改
+           * 页表不搬数据），prefill 从 hit_p 重算（尾半页丢弃，损失 ≤P-1 行）。
+           * 映射页本请求不再写：prefill 从 hit_p 起，decode 只往后追加。*/
+          int hit_p = (hit / E.page_sz) * E.page_sz;
+          if (li >= 0 && hit_p >= PFX_MIN) {
+            int mp = hit_p / E.page_sz;
+            if (A && A->pages_map &&
+                A->pages_map(E.gpu, base, g_pfx[li].base, mp) == 0) {
+              r->map_npg = mp;
+              r->map_src = g_pfx[li].base;
+              g_pfx_hits++;
+              g_pfx_hit_rows += hit_p;
+              g_pfx_map_pages += mp;
+              off = hit_p;
+            } else g_pfx_misses++;
+          } else g_pfx_misses++;
+        } else {
+        int src_seg = li >= 0 ? g_pfx[li].seg : -1;
         /* 本段自己如果持有租让：新请求要写它的 KV 行了。除非这段租让恰好就是
          * 我们要原样保留的那段（src==本段 且 hit==租让长度），否则必须撕掉这条租让，
          * 不然下一个请求会匹配到已被覆盖的垃圾 KV。 */
         if (hit > 0 && g_pfx_of[i]) {
-          int li = g_pfx_of[i] - 1;
-          if (!(src_seg == i && hit == g_pfx[li].len)) pfx_drop(li);
+          int own = g_pfx_of[i] - 1;
+          if (!(src_seg == i && hit == g_pfx[own].len)) pfx_drop(own);
         }
         if (hit > 0) {
           if (src_seg != i) {
@@ -742,6 +919,7 @@ SGL_THREAD_SIG(worker) {
           if (hit > 0) { g_pfx_hits++; g_pfx_hit_rows += hit; off = hit; }
           else g_pfx_misses++;
         }
+        } /* 非 pagemap（静态段）分支结束 */
       } else if (E.gpu) {
         g_pfx_misses++;
       }
@@ -888,7 +1066,7 @@ SGL_THREAD_SIG(worker) {
           continue;
         }
         bt[nb] = r->gen[r->n_gen - 1];
-        bb[nb] = r->seg * E.seg_len;
+        bb[nb] = r->base; /* G20：pagemap = 页区间基址；静态 = seg*seg_len */
         bl[nb] = r->n_prompt + r->n_img + r->n_gen - 1;
         bs[nb] = r->seg;   /* t11：本行的线性注意力状态槽 */
         br[nb] = r;
@@ -1035,7 +1213,7 @@ static int spec_try_step(request *r, int W) {
     spec_minp = getenv("SGL_SPEC_MINP") ? (float)atof(getenv("SGL_SPEC_MINP")) : 0.0f;
   }
   /* 并发时别的请求的 prefill 会改 MTP 段基址，每步按本请求的段重设 */
-  acc_mtp_set_base(E.gpu, r->seg * E.seg_len);
+  acc_mtp_set_base(E.gpu, r->base); /* G20 */
   toks[0] = r->gen[r->n_gen - 1];
   t_d0 = spec_stats ? sgl_now_us() : 0.0;
   nd = acc_mtp_drafts(E.gpu, toks[0], pos, W, spec_minp, drafts, spec_stats ? probs : NULL);
@@ -1046,7 +1224,7 @@ static int spec_try_step(request *r, int W) {
     drafts[c] = (drafts[c] + 1) % E.vocab;
   }
   for (i = 0; i < nd; i++) toks[i + 1] = drafts[i];
-  if (acc_spec_verify(E.gpu, toks, nd + 1, pos, r->seg * E.seg_len, rows, &k) != 0)
+  if (acc_spec_verify(E.gpu, toks, nd + 1, pos, r->base, rows, &k) != 0)
     return 0;
   t_v1 = spec_stats ? sgl_now_us() : 0.0;
   if (k > nd) k = nd;
@@ -1453,13 +1631,20 @@ static char *build_chatml(const sgl_json *j, char **img_url_out) {
   return s;
 }
 
-/* P1: 单段容量不足的明确提示（以前只会看到 "generation failed"）*/
+/* P1: 单段容量不足的明确提示（以前只会看到 "generation failed"）。
+ * G20 pagemap：语义变为「页池当下拿不下」——提示并发/池大小。*/
 static const char *seg_full_msg(void) {
   static char msg[256];
-  snprintf(msg, sizeof(msg),
-           "prompt is %d tokens but one KV segment holds %d (SGL_CUDA_CTX / concurrency): "
-           "raise SGL_CUDA_CTX or lower SGL_HTTP_CONC",
-           E.last_prompt_tokens, E.seg_len);
+  if (E.pagemap)
+    snprintf(msg, sizeof(msg),
+             "prompt is %d tokens but the paged KV pool (%d rows) has no contiguous "
+             "window for it: lower SGL_HTTP_CONC or raise SGL_CUDA_CTX",
+             E.last_prompt_tokens, E.pool_rows);
+  else
+    snprintf(msg, sizeof(msg),
+             "prompt is %d tokens but one KV segment holds %d (SGL_CUDA_CTX / concurrency): "
+             "raise SGL_CUDA_CTX or lower SGL_HTTP_CONC",
+             E.last_prompt_tokens, E.seg_len);
   return msg;
 }
 
@@ -2680,11 +2865,22 @@ static int route(SOCKET fd, const http_req *req) {
       /* G15: 命中率 / 省下的 prefill 行数一起暴露（命中率的分母是参与前缀比对的请求数，
        * 即命中+未命中；短于 PFX_MIN 的请求不计入，否则短的聊天请求会把命中率拉低）。*/
       long tot = g_pfx_hits + g_pfx_misses;
+      /* G20: pagemap 模式的页统计（map=零拷贝挂的页数，cow=驱逐/登记时落地的页数）*/
+      int free_pg = 0, lease_pg = 0;
+      if (E.pagemap)
+        for (int p = 0; p < g_pg_n; p++) {
+          if (g_pg[p] == 0) free_pg++;
+          else if (g_pg[p] == 2) lease_pg++;
+        }
       snprintf(body, sizeof(body),
                "{\"ok\":true,\"gpu\":true,\"ctx\":%d,\"seg\":%d,\"conc\":%d,"
+               "\"pagemap\":%s,\"pages\":{\"size\":%d,\"total\":%d,\"free\":%d,"
+               "\"leased\":%d,\"mapped\":%ld,\"cow\":%ld,\"allocs\":%ld,\"fails\":%ld},"
                "\"prefix\":{\"slots\":%d,\"hits\":%ld,\"misses\":%ld,\"hit_rate\":%.3f,"
                "\"hit_rows\":%ld,\"leased_rows\":%ld,\"flushes\":%ld}}",
                acc_ctx(E.gpu), E.seg_len, ACTIVE_CONC,
+               E.pagemap ? "true" : "false", E.page_sz, g_pg_n, free_pg, lease_pg,
+               g_pfx_map_pages, g_pfx_cow_pages, g_pgm_allocs, g_pgm_fails,
                PFX_MAX_EFF, g_pfx_hits, g_pfx_misses,
                tot ? (double)g_pfx_hits / (double)tot : 0.0,
                g_pfx_hit_rows, g_pfx_leased_rows, g_pfx_flushes);
@@ -3289,6 +3485,24 @@ int sgl_accel_http_serve(const sgl_accel_api *api, const char *dir, int port, co
     }
   }
   E.seg_len = E.gpu ? acc_ctx(E.gpu) / ACTIVE_CONC : 0;
+  /* G20：探测页级模式（kvq 恒等页表后端）。开启后：KV 区间从页池动态分配
+   * （单请求可超过静态 seg_len，上限是整池）、前缀命中零拷贝挂页。
+   * 后端不支持（f32 池 / M6 换页 / host 副本）时维持静态段 + copy_kv。*/
+  E.pool_rows = E.gpu ? acc_ctx(E.gpu) : 0;
+  E.page_sz = (E.gpu && A && A->page_size) ? A->page_size(E.gpu) : 0;
+  E.pagemap = E.page_sz > 0 ? 1 : 0;
+  if (E.pagemap) {
+    g_pg_n = E.pool_rows / E.page_sz;
+    g_pg = (unsigned char *)calloc((size_t)g_pg_n, 1);
+    if (!g_pg) { /* 内存不足：退回静态段模式 */
+      E.pagemap = 0;
+      E.page_sz = 0;
+    } else {
+      printf("[engine] G20 pagemap KV ON: %d pages x %d rows (pool %d rows, "
+             "dynamic admission, zero-copy prefix)\n",
+             g_pg_n, E.page_sz, E.pool_rows);
+    }
+  }
   /* G15(b): 运维杆 SGL_PFX_MAX —— 0 = 关掉前缀缓存，1..16 = 限租让表大小。 */
   {
     const char *pm = getenv("SGL_PFX_MAX");
@@ -3321,9 +3535,10 @@ int sgl_accel_http_serve(const sgl_accel_api *api, const char *dir, int port, co
     printf("[engine] prewarm: ws rows=%d (seg=%d chunk=%d), decode graphs %d/%d\n",
            warm_rows, E.seg_len, pch, warmed, ACTIVE_CONC);
   }
-  printf("[engine] loaded in %.1fs; ctx=%d seg=%d conc=%d eos=%d%s\n",
+  printf("[engine] loaded in %.1fs; ctx=%d seg=%d conc=%d eos=%d pfx_ok=%d lin_slots=%d%s\n",
          (double)clock() / CLOCKS_PER_SEC - t0, E.gpu ? acc_ctx(E.gpu) : 0,
-         E.seg_len, ACTIVE_CONC, E.eos, E.degraded ? " [DEGRADED]" : "");
+         E.seg_len, ACTIVE_CONC, E.eos, E.pfx_ok,
+         E.gpu ? acc_lin_slots(E.gpu) : -1, E.degraded ? " [DEGRADED]" : "");
   fflush(stdout);
   /* M3 自验证：SGL_MTP_TEST=1 时跑一遍 teacher-forced 接受率然后退出。
    * 这是判断 MTP 实现对不对的唯一判据（对：0.6–0.85，错：0–0.05）。*/

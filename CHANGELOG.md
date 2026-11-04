@@ -18,6 +18,27 @@
 - cuda_test 新增 `SGL_CUDA_ONLY_SPEC=1`：显存被桌面挤占时全量会在 gemm-bench 后
   pure-decode 段 AV（HEAD 亦然，与本改动无关），该开关可单独验证 spec 段。
 
+## [Unreleased] — G20：GPU 页级 KV（零拷贝前缀 + 页池动态准入）（2026-11-04）
+
+- **后端**（仅 kvq 恒等页表模式）：`sgl_cuda_pages_map/unmap` ——前缀复用从逐页
+  D2D 拷贝（copy_kv）变为【只改页表】的零拷贝挂页（实测快 190-1296×），
+  COW 用 `unmap(cow=1)` 落地；`sgl_cuda_kvq_page_size` 按能力暴露（f32 池/
+  M6 换页不支持，返回 0/-2）。
+- **服务**（`accel_http.c`，accel ABI 2→3 可选成员）：请求 KV 区间从页池
+  first-fit 动态分配（单请求可超过静态段，验收 ~3600 tok >> 静态 1024 跑通），
+  租让表页粒度（驱逐时 COW 还在映射的活跃请求），`/health` 暴露页池/挂页/COW
+  计数。非 kvq 模式行为不变（静态段 + copy_kv）。
+- **验收**：map vs copy **逐位一致**（maxerr=0）+ 与分块重算等价 + COW 写坏源
+  段 6 步续算不污染；服务级 f32 对照输出逐字一致、kvq 动态准入/页回收零泄漏。
+  详见 [docs/NOTES_g20.md](docs/NOTES_g20.md)；测试：cuda_test `[kvq]` 段
+  （SGL_KVQ_TEST=1）+ tools/kvq_serve_check.py（KVQ_F32=1 跑对照）。
+- **修复 pre-existing**：`sgl_cuda_lin_slots` 语义错位（返回槽数配置而非模型有
+  无线性层）——CUDA 服务的前缀缓存自 t11 起 silently 关闭。dense 返回 0 修正
+  后 copy 复用恢复（hits=1、输出逐字一致）。
+- **发现 pre-existing（未修，G21）**：kvq 分块 prefill 与一次算全不自洽
+  （maxerr ~3.5 vs f32 池 1.4e-05），copy/map 同样偏差；挡住 kvq 模式一切
+  复用/分块的质量验收。详见 TODO_PROMPTS.md G21。
+
 ### MLX 后端 T1 + T2（fp16 + 量化）（2026-11-04）
 
 Apple Silicon 上多一个后端：`-DSGL_MLX=ON` 产出 `mlx_test` / `mlx_q4_test` / `mlx_http`，

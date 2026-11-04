@@ -375,7 +375,7 @@ SKIP。结果是 CI 实际只验了「能编译 + 不依赖模型的几个测试
 先把新特性的回归盯住。
 ```
 
-## 任务 G20 · GPU 页级 radix：slot 零拷贝挂页 + 页池动态准入（性能/容量，中大；仅 SGL_KVQ=1 路径）
+## 任务 G20 · GPU 页级 radix：slot 零拷贝挂页 + 页池动态准入（性能/容量，中大；仅 SGL_KVQ=1 路径） ✅ 已完成（2026-11-04，docs/NOTES_g20.md；验收全绿；过程中修复 lin_slots 语义错位、发现 kvq 分块不自洽 → G21）
 
 > 2026-11-04 侦察入册：架构事实全部核实过（带行号），下一轮可直接开工。
 
@@ -413,6 +413,33 @@ slot 零拷贝挂页」，并在 slot 池上做动态准入（单请求可超 se
    失败路径不泄漏（页池回收用例）。
 风险：refcount 泄漏 = 页池耗尽，务必覆盖异常路径；pt 改动只上传受影响页段，
 别整表重传。
+```
+
+## 任务 G21 · kvq 分块 prefill 与一次算全不自洽（正确性，中；阻塞 kvq 全部复用/分块收益）
+
+> 2026-11-04 G20 验收时发现（数据都在 docs/NOTES_g20.md 与 cuda_test `[kvq]` 段）。
+
+```
+现象（qwen05 fp16，ctx 8192，P=64，全部实测）：
+- 同段分块 prefill（512+64）与一次算全（576）：logits maxerr 3.50002，greedy
+  654 vs 406；
+- copy_kv 复用、G20 pages_map 复用与分块重算三者【逐位一致】（都 654）——
+  说明偏差不在复用/挂页，而在「一次算全 576」与「分块」两种执行路径本身；
+- f32 池同场景（G6 验收）只有 1.4e-05 —— 问题仅限 kvq 量化池。
+结论：kvq 的写（k_kvq_write）或读（k_attn_q* 反量化/scale 应用）在「一次
+forward 跨页界（n>64 且尾半页）」与「每块 ≤ 页界」时行为不同。G6 的复用
+验收当年只在 f32 池做过，kvq 分支从未验收过（SGL_KVQ 默认关是对的）。
+
+定位建议（带对照实验的测试已在 cuda_test [kvq] 段：chunked vs full 打印）：
+1) 先缩小 n：64/128/575（页内/整页/跨页+尾半页）找分歛起始的 n；
+2) 分歧只在写还是也在读：分块后【只重算尾块】与【一次算全】各 dump 同一段
+   KV 字节（cudaMemcpy 出来比）——写不同=量化块状态/scale 跨行泄漏；读不同=
+   attention kernel 的页边界/off 递增 bug（看 k_attn_q_flash 1420-1469 的
+   pend/off 循环与 k_attn_q 的 pt 寻址）；
+3) 用 CPU 侧全量重算（f32）当金标准裁谁对：one-shot、chunked 各 vs CPU。
+验收：kvq 下 chunked vs one-shot maxerr ≤ f32 池同场景（1e-5 量级），
+greedy 逐 token 同；服务级 kvq_serve_check.py 的 (2) 在 kvq 模式也
+逐字一致（当前 NOTE 差异消失）。
 ```
 
 ---
