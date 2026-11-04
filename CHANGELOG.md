@@ -2,6 +2,14 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [v0.5.0] · 与 HF 参考实现的端到端生成对拍（双栈 4/4）（2026-11-05）
+
+- **`tools/hf_ref_check.py`**：qwen3-06 贪心 24 token，CPU/GPU 双栈的服务输出 vs
+  HF transformers（CPU fp32）参考实现，4/4 提示词文本逐字一致（此前从未与任何
+  参考实现对过生成结果，cuda_test 里「ref 不可用」一直跳过）。
+- 与原版 sglang 服务的直接 A/B 在本机不可行（Linux-only 依赖栈 + torch CPU 版），
+  已记入 GAP §5 第 7 项；脚本引擎无关，有 Linux+CUDA 环境时可直接补。
+
 ## [v0.5.0] · G22c：cuda_test 历次 AV 崩溃根因修复（gemm-bench 越界写）+ 显存护栏（2026-11-05）
 
 **根因（WER 偏移 + map + 反汇编实证）**：`sgl_cuda_gemm_bench` 的 `Af_h` 声明为

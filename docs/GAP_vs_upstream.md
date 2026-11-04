@@ -210,6 +210,13 @@ prefill delayer、`min_free_slots_delayer`、请求分池（上游 `schedule_pol
 `docs/BENCH.md` 里所有性能数字都是**自己 vs 自己**的 A/B，没有一条与原版 sglang / vLLM 的端到端对照；
 `docs/DESIGN_1M_32C.md` 的 264 tok/s 是带宽模型推算的预测值。
 
+**2026-11-05 补**：与参考实现的**端到端生成对拍**已补（`tools/hf_ref_check.py`：qwen3-06
+贪心 24 token，CPU/GPU 双栈 vs HF transformers CPU fp32，4/4 提示词文本逐字一致）；
+HTTP 语义对拍见 `tests/conformance_upstream.py`（tokenizer/模板/stop/流式/usage vs 上游语义，
+双引擎全绿）。**与原版 sglang 服务的直接 A/B 在本机不可行**：原版是 Linux-only 依赖栈
+（triton/flashinfer 等），Windows 装不了，且本机 torch 为 CPU 版；待有 Linux+CUDA 环境时
+可用同一套 `hf_ref_check`/`conformance` 脚本补性能对照（脚本已引擎无关）。
+
 ### D. 工程与验证
 
 - CI **不跑 CUDA、不跑真实大权重**（README 明写）；44 个 ctest 全在 CPU 侧，GPU 只靠本地脚本。
@@ -252,7 +259,7 @@ prefill delayer、`min_free_slots_delayer`、请求分池（上游 `schedule_pol
 | 4 | `/pause_generation` `/continue_generation`、`/start_profile` `/stop_profile`、`/release_memory_occupation`、运行时 LoRA 增删 | 运维与 RL 集成的必备开关 | S–M |
 | 5 | **GPU 页级 radix + 动态并发**（去掉 32 段租约） | 解除并发上限与段长耦合，长 prompt + 高并发下的利用率 | M–L |
 | 6 | TP（≥2 卡）+ NCCL | 70B 级模型的唯一出路；成本最高，放最后 | L |
-| 7 | conformance 对拍套件 + CI GPU smoke + 与原版/vLLM 的端到端基准 | 之后每加一项能力都要靠它兜底；也是现在最缺的「证据」 | M |
+| 7 | ~~conformance 对拍套件~~（已做：`tests/conformance_upstream.py` 双引擎 + `tools/hf_ref_check.py` 生成对拍 4/4）；剩 CI GPU smoke 与 Linux 机上的原版性能 A/B | 每加一项能力都要靠它兜底 | M |
 
 ---
 
