@@ -211,6 +211,79 @@ static void spec_real_check(const char *dir) {
       printf("[spec] tinyllama+llama-160m: 接受率 %.1f%% (%d/%d), %d tok / %.2fs, == 非 spec greedy %s\n",
              dr7 ? 100.0 * ac7 / dr7 : 0.0, ac7, dr7, ns7, tsd,
              same7 ? "✓" : "✗");
+
+      /* ---- 修正采样（temperature>0，sgl_cuda_spec_sample_generate）----
+       * A. T=0 退化：输出必须与上面 greedy spec 逐 token 相同（同一条退化路径）。
+       * B. draft==target（同实例两段 0/512）：q̃≈p̃ ⇒ 接受率 ≈100%（数学不变量；
+       *    GPU 批量/单 token kernel 有 fp 噪声级差异，留 98% 余量）。
+       * C. 分布对拍：T=1 一号 token 经验分布 vs 直接抽样，TV ≤ 自校准噪声底
+       *    （两组独立直接抽样之间的 TV）× 1.6 + 0.02。 */
+      {
+        sgl_sampling_params sp0, sp1;
+        memset(&sp0, 0, sizeof(sp0));
+        memset(&sp1, 0, sizeof(sp1));
+        sp0.temperature = 0.0f;
+        sp1.temperature = 1.0f;
+        int *o0 = NULL;
+        uint64_t r0 = 42;
+        int n0 = sgl_cuda_spec_sample_generate(tg, 0, dg, 0, ids, np, 24, 4, -1,
+                                               &sp0, &r0, &o0, NULL, NULL);
+        CHECK(n0 == ns7, "spec A(T=0) n=%d != greedy %d", n0, ns7);
+        int same0 = n0 == ns7;
+        for (int i = 0; same0 && i < ns7 && i < n0; i++)
+          if (o0[i] != out7[i]) {
+            printf("  [spec] A 首个分歧 @%d: %d vs %d\n", i, o0[i], out7[i]);
+            same0 = 0;
+          }
+        CHECK(same0, "spec A: T=0 退化输出 != greedy spec");
+        printf("[spec] A T=0 退化 == greedy spec %s\n", same0 ? "✓" : "✗");
+        sgl_xfree(o0);
+
+        int *o1 = NULL, d1 = 0, a1 = 0;
+        uint64_t r1 = 777;
+        int n1 = sgl_cuda_spec_sample_generate(tg, 0, tg, 512, ids, np, 24, 4, -1,
+                                               &sp1, &r1, &o1, &d1, &a1);
+        CHECK(n1 > 0, "spec B(sample) n=%d", n1);
+        CHECK(d1 > 0 && a1 >= d1 * 98 / 100,
+              "spec B(sample): 接受率应 ≈100%%（%d/%d）", a1, d1);
+        printf("[spec] B draft==target 接受率 %.1f%% (%d/%d) %s\n",
+               d1 ? 100.0 * a1 / d1 : 0.0, a1, d1,
+               d1 > 0 && a1 >= d1 * 98 / 100 ? "✓" : "✗");
+        sgl_xfree(o1);
+
+        int n_tv = 400;
+        CHECK(sgl_cuda_forward_seg(tg, ids, np, 0, 0, l7) == 0, "spec C prefill");
+        int *ha = (int *)calloc((size_t)V7, sizeof(int));
+        int *hb = (int *)calloc((size_t)V7, sizeof(int));
+        int *hs = (int *)calloc((size_t)V7, sizeof(int));
+        for (int s = 0; s < n_tv; s++) {
+          uint64_t ra = 0xABCD0000u + (uint64_t)s, rb = 0x12340000u + (uint64_t)s;
+          ha[sgl_sample_ex(l7, V7, &sp1, &ra, NULL, 0, NULL)]++;
+          hb[sgl_sample_ex(l7, V7, &sp1, &rb, NULL, 0, NULL)]++;
+        }
+        for (int s = 0; s < n_tv; s++) {
+          uint64_t rs = 0x5EED0000u + (uint64_t)s;
+          int *so = NULL;
+          int no = sgl_cuda_spec_sample_generate(tg, 0, dg, 0, ids, np, 1, 4, -1,
+                                                 &sp1, &rs, &so, NULL, NULL);
+          if (no > 0) hs[so[0]]++;
+          else CHECK(0, "spec C run %d 失败", s);
+          sgl_xfree(so);
+        }
+        double tv_ab = 0, tv_sa = 0;
+        for (int i = 0; i < V7; i++) {
+          tv_ab += fabs((double)ha[i] - hb[i]);
+          tv_sa += fabs((double)ha[i] - hs[i]);
+        }
+        tv_ab /= 2.0 * n_tv;
+        tv_sa /= 2.0 * n_tv;
+        double lim = 1.6 * tv_ab + 0.02;
+        printf("[spec] C 分布对拍 N=%d TV(spec,plain)=%.3f ≤ 1.6×TV(A,B)+0.02=%.3f %s\n",
+               n_tv, tv_sa, lim, tv_sa <= lim ? "✓" : "✗");
+        CHECK(tv_sa <= lim, "spec C: TV=%.3f 超噪声底 %.3f", tv_sa, lim);
+        free(ha); free(hb); free(hs);
+      }
+
       sgl_xfree(out7); sgl_xfree(ids); sgl_xfree(l7);
       sgl_tokenizer_free(tk);
     }
@@ -237,6 +310,20 @@ int main(int argc, char **argv) {
   snprintf(p, sizeof(p), "%s/model.safetensors", dir);
   if (fopen_s(&f, p, "rb") != 0 || !f) { printf("SKIP: no model\n"); return 0; }
   fclose(f);
+
+  /* SGL_CUDA_ONLY_SPEC=1：只跑文末的真实组合投机段（greedy + 修正采样）。
+   * 全量 cuda_test 在显存被桌面/其他进程挤占时，会在 gemm-bench 之后的
+   * pure-decode 段 AV 崩溃（HEAD 亦然，非 spec 改动引起）；这个开关让
+   * spec 段的验证不依赖前面的段落。 */
+  {
+    const char *os = getenv("SGL_CUDA_ONLY_SPEC");
+    if (os && atoi(os)) {
+      spec_real_check(dir);
+      if (FAILURES) { printf("test_cuda: %d FAILURES\n", FAILURES); return 1; }
+      printf("test_cuda(spec-only): all OK\n");
+      return 0;
+    }
+  }
 
   sgl_llama *cpu = sgl_llama_load(dir);
   CHECK(cpu, "cpu load");

@@ -1,4 +1,4 @@
-﻿/* sgl sampling 实现 */
+/* sgl sampling 实现 */
 #include "sgl/sampling.h"
 
 #include <math.h>
@@ -14,6 +14,10 @@ uint64_t sgl_rng_next(uint64_t *state) {
   x ^= x >> 27;
   *state = x;
   return x * 0x2545F4914F6CDD1DULL;
+}
+
+double sgl_rng_uniform(uint64_t *state) {
+  return (double)(sgl_rng_next(state) >> 11) / 9007199254740992.0; /* [0,1) */
 }
 
 int sgl_sample_greedy(const float *logits, int n) {
@@ -95,30 +99,42 @@ static int cmp_desc(const void *a, const void *b) {
   return (x < y) - (x > y);
 }
 
-int sgl_sample_ex(const float *logits, int n, const sgl_sampling_params *p, uint64_t *rng,
-                  const int *history, int n_history, float *out_logprob) {
-  float *tmp = NULL;
-  const float *lg = logits;
-  if (p && (p->repetition_penalty > 0.0f && p->repetition_penalty != 1.0f ||
-            p->frequency_penalty != 0.0f || p->presence_penalty != 0.0f) &&
-      n_history > 0 && history) {
-    tmp = (float *)malloc(sizeof(float) * (size_t)n);
-    if (tmp) {
-      apply_penalties(logits, n, p, history, n_history, tmp);
-      lg = tmp;
-    }
-  }
+/* penalty 开启且带历史时，返回改写后的 logits（写进 *tmp_out，调用方 free）；
+ * 否则原样返回。malloc 失败退回原始 logits（与旧版内联写法一致）。*/
+static const float *penalized(const float *logits, int n, const sgl_sampling_params *p,
+                              const int *history, int n_history, float **tmp_out) {
+  *tmp_out = NULL;
+  if (!p || !(p->repetition_penalty > 0.0f && p->repetition_penalty != 1.0f ||
+              p->frequency_penalty != 0.0f || p->presence_penalty != 0.0f) ||
+      n_history <= 0 || !history)
+    return logits;
+  float *tmp = (float *)malloc(sizeof(float) * (size_t)n);
+  if (!tmp) return logits;
+  apply_penalties(logits, n, p, history, n_history, tmp);
+  *tmp_out = tmp;
+  return tmp;
+}
 
+/* 候选构建（单一来源）：softmax(logits/T) → min_p → top_k → top_p 截断。
+ * 温度路径：*cs_out = 按概率降序的候选数组（调用方 sgl_xfree），*m_out = 保留数，
+ *   *renorm_out = 保留集概率和；greedy（temperature<=0）：cs=NULL、m=0、
+ *   renorm=1，返回 argmax。out_probs 非 NULL 时写完整抽样分布（保留位 =
+ *   p/renorm，其余 0；greedy 写 one-hot）。抽牌不在这里——分布与谁怎么抽
+ *   无关，这正是修正采样（spec.c/cuda_spec.c）能复用它的原因。*/
+static int build_cands(const float *lg, int n, const sgl_sampling_params *p,
+                       cand **cs_out, int *m_out, double *renorm_out, float *out_probs) {
+  int max_i = sgl_sample_greedy(lg, n);
+  *cs_out = NULL;
+  *m_out = 0;
+  *renorm_out = 1.0;
+  if (out_probs) memset(out_probs, 0, sizeof(float) * (size_t)n);
   if (!p || p->temperature <= 0.0f) {
-    int pick = sgl_sample_greedy(lg, n);
-    if (out_logprob) *out_logprob = log_softmax_at(lg, n, pick);
-    free(tmp);
-    return pick;
+    if (out_probs) out_probs[max_i] = 1.0f;
+    return max_i;
   }
 
   /* softmax(logits/T) */
   float *probs = (float *)sgl_xmalloc(sizeof(float) * (size_t)n);
-  int max_i = sgl_sample_greedy(lg, n);
   double T = p->temperature;
   double sum = 0;
   for (int i = 0; i < n; i++) {
@@ -155,24 +171,58 @@ int sgl_sample_ex(const float *logits, int n, const sgl_sampling_params *p, uint
 
   double renorm = 0;
   for (int i = 0; i < m; i++) renorm += cs[i].p;
-  double r = (double)(sgl_rng_next(rng) >> 11) / 9007199254740992.0; /* [0,1) */
-  double acc = 0;
-  int pick = cs[0].idx;
-  for (int i = 0; i < m; i++) {
-    acc += cs[i].p / renorm;
-    if (r < acc) {
-      pick = cs[i].idx;
-      break;
+  if (out_probs)
+    for (int i = 0; i < m; i++) out_probs[cs[i].idx] = (float)(cs[i].p / renorm);
+  sgl_xfree(probs);
+  *cs_out = cs;
+  *m_out = m;
+  *renorm_out = renorm;
+  return max_i;
+}
+
+int sgl_sample_ex(const float *logits, int n, const sgl_sampling_params *p, uint64_t *rng,
+                  const int *history, int n_history, float *out_logprob) {
+  float *tmp = NULL;
+  const float *lg = penalized(logits, n, p, history, n_history, &tmp);
+  cand *cs = NULL;
+  int m = 0;
+  double renorm = 1;
+  int max_i = build_cands(lg, n, p, &cs, &m, &renorm, NULL);
+  int pick;
+  if (!cs) {
+    pick = max_i; /* greedy */
+  } else {
+    double r = sgl_rng_uniform(rng); /* [0,1) */
+    double acc = 0;
+    pick = cs[0].idx;
+    for (int i = 0; i < m; i++) {
+      acc += cs[i].p / renorm;
+      if (r < acc) {
+        pick = cs[i].idx;
+        break;
+      }
     }
   }
   if (out_logprob) {
     /* 选中的 token 若被截断掉，返回它的真实 logprob（与 HF 一致：报告模型分布下的值）*/
     *out_logprob = log_softmax_at(lg, n, pick);
   }
-  sgl_xfree(probs);
   sgl_xfree(cs);
   free(tmp);
   return pick;
+}
+
+void sgl_dist_transform(const float *logits, int n, const sgl_sampling_params *p,
+                        const int *history, int n_history, float *out_probs) {
+  if (!out_probs || n <= 0) return;
+  float *tmp = NULL;
+  const float *lg = penalized(logits, n, p, history, n_history, &tmp);
+  cand *cs = NULL;
+  int m = 0;
+  double renorm = 1;
+  build_cands(lg, n, p, &cs, &m, &renorm, out_probs);
+  sgl_xfree(cs);
+  free(tmp);
 }
 
 int sgl_sample(const float *logits, int n, const sgl_sampling_params *p, uint64_t *rng) {

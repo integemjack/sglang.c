@@ -1,4 +1,4 @@
-﻿/* sgl/sampling.h — 采样（对应 sglang srt/sampling/sampling_batch_info.py 的单条路径）*/
+/* sgl/sampling.h — 采样（对应 sglang srt/sampling/sampling_batch_info.py 的单条路径）*/
 #ifndef SGL_SAMPLING_H
 #define SGL_SAMPLING_H
 
@@ -39,5 +39,17 @@ int sgl_sample(const float *logits, int n, const sgl_sampling_params *p, uint64_
 
 /* token = stop_ids 里的一员？ */
 int sgl_sampling_is_stop(const sgl_sampling_params *p, int token);
+
+/* [0,1) 均匀随机数——sgl_sample_ex 内部同一口径；投机采样的接受/重采样
+ * 检验也用它，保证两处对 RNG 的消费方式一致。*/
+double sgl_rng_uniform(uint64_t *state);
+
+/* 只做分布变换、不抽牌：把 logits 按 p 的 penalty → temperature → min_p →
+ * top_k → top_p 规则变成「实际抽样分布」写入 out_probs[n]（被截断的位置为
+ * 0；temperature<=0 退化为 argmax 的 one-hot）。sgl_sample_ex 抽的就是这个
+ * 分布（同一构建代码）。投机采样（spec.c/cuda_spec.c）用它拿 target/draft
+ * 两边的 p̃、q̃ 做接受检验与修正重采样。*/
+void sgl_dist_transform(const float *logits, int n, const sgl_sampling_params *p,
+                         const int *history, int n_history, float *out_probs);
 
 #endif

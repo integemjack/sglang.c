@@ -98,3 +98,34 @@ plain 基线 82.4–82.8 tok/s（decode B=1 图步 11.4 ms/token）。
 方向 2（cuda_http 批量 spec）和方向 3（temperature>0 修正采样）本轮未做：前者需要动
 
 调度器（batch 里混 spec/非 spec 请求），后者的价值是功能而不是速度。
+
+---
+
+## 补记 II：方向 3「temperature>0 修正采样」落地（2026-11-04）
+
+`sampling.c` 抽出单一来源的分布构建（`sgl_dist_transform`：penalty → T → min_p
+→ top_k → top_p；`sgl_sample_ex` 抽的就是它，行为逐位不变），`spec.c` /
+`cuda_spec.c` 在原 greedy 轮次结构上加标准拒绝采样：draft 从 q̃ 抽 K 候选 →
+target 逐位 `u < min(1, p̃(x)/q̃(x))` 检验 → 拒绝处从 norm((p̃−q̃)₊) 重采样 →
+全接受再从末位 p̃ 直抽 bonus。数学保证：产出 token 的边缘分布 == 直接从
+target 同参数抽样，与 draft 好坏无关（draft 只决定接受率/速度）。
+
+验收（全部是测试内断言，不是目测）：
+
+| 检验 | CPU（tinyllama 1.1B，test_spec） | GPU（tinyllama+llama-160m fp16，cuda_test） |
+| --- | --- | --- |
+| T=0 退化 == greedy spec（逐 token） | ✓ | ✓ |
+| draft==target 接受率（q̃==p̃ ⇒ 应 100%） | **100.0%（20/20）** | **100.0%（20/20）** |
+| 一号 token 分布对拍 TV(spec,plain) ≤ 1.6×TV(plainA,plainB)+0.02 | N=96：**0.385 ≤ 0.737** ✓ | N=400：**0.292 ≤ 0.508** ✓ |
+
+关键点：两处的 draft 都很弱（GPU 组合接受率 13.3%；CPU C 段接受率 0%——几乎
+每个 token 都从 (p̃−q̃)₊ 修正重采样产生），分布仍然精确重合——这正是修正
+数学的不变量在起作用，不是「草稿准」造成的巧合。服务层（cuda_http 的 MTP、
+sglc CLI）尚未接采样版，仍 greedy；库层 API 已可用
+（sgl_spec_sample_generate / sgl_cuda_spec_sample_generate，penalty 的 history
+与非投机路径一致；stop_ids 仍由服务层检查）。
+
+另记：全量 cuda_test 在桌面占 ~1GB 显存时，会在 gemm-bench 之后的 pure-decode
+段 AV 崩溃（stash 掉本次改动后在 HEAD 上同样复现，非本次改动引起；显存空闲
+时全量可过）。为此给 cuda_test 加了 `SGL_CUDA_ONLY_SPEC=1` 开关，显存紧张时
+仍可单独验证 spec 段。

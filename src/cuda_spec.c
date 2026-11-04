@@ -1,4 +1,4 @@
-﻿/* sgl CUDA 侧投机解码 v1（G7）— draft-verify，与 CPU 版 src/spec.c 逐 token
+/* sgl CUDA 侧投机解码 v1（G7）— draft-verify，与 CPU 版 src/spec.c 逐 token
  * 等价：每轮 draft 连出 K 候选（decode_batch B=1 图快路径，写 draft 自己的
  * KV 段）→ target 一次 n-token 批量前向（sgl_cuda_forward_seg_rows，lm_head
  * 一张 M=n 的 GEMM）拿全部候选位 logits → 逐步用【上一位置分布】比对
@@ -8,7 +8,7 @@
  * （批量/单 token kernel 归约顺序不同的 fp 噪声级 tie 翻转除外）。
  * KV 段隔离：target 用 [t_base, ...)，draft 用 [d_base, ...)，互不覆盖；
  * draft==target（同实例两段）时接受率应为 100%，用作正确性哨兵。
- * temperature>0 的修正采样未实现（同 CPU 版）。 */
+ * temperature>0 的修正采样见文末 sgl_cuda_spec_sample_generate。 */
 #define _CRT_SECURE_NO_WARNINGS
 #include "sgl/cuda_spec.h"
 
@@ -19,6 +19,7 @@
 
 #include "sgl/alloc.h"
 #include "sgl/log.h"
+#include "sgl/sampling.h"
 
 /* G14 诊断：SGL_SPEC_PROF=1 时累计各阶段耗时（draft 图步 / verify / 两侧补齐），
  * 结束时打一行到 stderr —— 这是“该往哪个方向优化”的唯一可靠依据（WDDM 下
@@ -219,5 +220,176 @@ int sgl_cuda_spec_generate(sgl_cuda_model *target, int t_base,
 
 done:
   sgl_xfree(seq); sgl_xfree(dl); sgl_xfree(tl); sgl_xfree(vl);
+  return rc;
+}
+
+/* ===================== temperature>0：修正采样（speculative sampling） ====================
+ *
+ * 与上面 greedy 版同一套 G14 流水线（预填 np-1、pending 由 verify 首行吞、
+ * 末 token 留作下轮 pending），只换「草稿怎么出、验证怎么判」——数学与
+ * CPU 版 sgl_spec_sample_generate 一致：draft 从 q̃ 抽、逐位 u<min(1,p̃/q̃)
+ * 检验、拒绝处从 norm((p̃-q̃)₊) 重采样 ⇒ 产出分布 == 直接从 target 同参数
+ * 抽样（验收看 cuda_test 的 TV 自校准对拍）。penalty 的 history：候选先写进
+ * seq 草稿区，各位置用「已确认 + 到该位为止的候选」，与非投机路径一致。 */
+static int draw_from_dist(const float *d, int n, uint64_t *rng) {
+  double mass = 0;
+  for (int i = 0; i < n; i++)
+    if (d[i] > 0) mass += d[i];
+  if (mass <= 0) return argmax_v(d, n);
+  double r = sgl_rng_uniform(rng) * mass, acc = 0;
+  for (int i = 0; i < n; i++) {
+    if (d[i] <= 0) continue;
+    acc += d[i];
+    if (r < acc) return i;
+  }
+  return argmax_v(d, n); /* 浮点舍入見底 */
+}
+
+int sgl_cuda_spec_sample_generate(sgl_cuda_model *target, int t_base,
+                                  sgl_cuda_model *draft, int d_base,
+                                  const int *prompt, int n_prompt, int max_new,
+                                  int k_spec, int eos_id,
+                                  const sgl_sampling_params *sp, uint64_t *rng,
+                                  int **out_ids, int *out_drafted, int *out_accepted) {
+  if (out_drafted) *out_drafted = -1;
+  if (out_accepted) *out_accepted = -1;
+  if (!sp || sp->temperature <= 0.0f)
+    return sgl_cuda_spec_generate(target, t_base, draft, d_base, prompt,
+                                  n_prompt, max_new, k_spec, eos_id, out_ids,
+                                  out_drafted, out_accepted);
+  if (!target || !draft || !prompt || !out_ids || !rng) return -1;
+  if (n_prompt <= 0 || max_new <= 0) return -1;
+  int V = sgl_cuda_vocab(target);
+  if (V != sgl_cuda_vocab(draft)) {
+    SGL_ERROR("cuda_spec: draft vocab=%d != target %d（需同词表）",
+              sgl_cuda_vocab(draft), V);
+    return -1;
+  }
+  int K = k_spec < 1 ? 1 : k_spec > 8 ? 8 : k_spec;
+  int cap = n_prompt + max_new + K + 8;
+  if (t_base + cap > sgl_cuda_ctx(target) ||
+      d_base + cap > sgl_cuda_ctx(draft)) {
+    SGL_ERROR("cuda_spec: segment overflow (cap=%d t_ctx=%d d_ctx=%d)", cap,
+              sgl_cuda_ctx(target), sgl_cuda_ctx(draft));
+    return -1;
+  }
+  int rc = -1;
+  int *seq = (int *)sgl_xmalloc(sizeof(int) * (size_t)cap);
+  float *dl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+  float *tl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);
+  float *vl = (float *)sgl_xmalloc(sizeof(float) * (size_t)V * (size_t)(K + 1));
+  float *qd = (float *)sgl_xmalloc(sizeof(float) * (size_t)V * (size_t)K); /* q̃ 逐候选 [K][V] */
+  float *pd = (float *)sgl_xmalloc(sizeof(float) * (size_t)V);              /* p̃ 当前位 [V] */
+  if (!seq || !dl || !tl || !vl || !qd || !pd) goto done;
+  memcpy(seq, prompt, sizeof(int) * (size_t)n_prompt);
+  int len = n_prompt, t_kv = 0, d_kv = 0;
+  int produced = 0, n_accepts = 0, n_drafted = 0;
+
+  int npf = n_prompt > 1 ? n_prompt - 1 : n_prompt;
+  if (npf > 0) {
+    if (kv_catch_up_gpu(target, t_base, seq, npf, &t_kv, tl, NULL) != 0) goto done;
+    if (kv_catch_up_gpu(draft, d_base, seq, npf, &d_kv, dl, NULL) != 0) goto done;
+  }
+
+  while (produced < max_new) {
+    int npend = len - t_kv;
+    if (npend > 1) npend = 1;
+    /* 1) draft：先吞 pending，再从 q̃ 连抽 K 候选（候选同时写 seq 草稿区） */
+    int cand[8], nk = 0;
+    if (npend == 1) {
+      int p = seq[len - 1];
+      if (sgl_cuda_decode_batch(draft, &p, &d_base, &d_kv, 1, dl) != 0) goto done;
+      d_kv++;
+    }
+    for (int i = 0; i < K && produced + nk < max_new; i++) {
+      float *q = qd + (size_t)nk * V;
+      sgl_dist_transform(dl, V, sp, seq + n_prompt, len - n_prompt + nk, q);
+      int t = draw_from_dist(q, V, rng);
+      cand[nk] = t;
+      seq[len + nk] = t;
+      nk++;
+      if (sgl_cuda_decode_batch(draft, &t, &d_base, &d_kv, 1, dl) != 0) goto done;
+      d_kv++;
+    }
+    n_drafted += nk;
+    if (nk == 0) break;
+
+    /* 2) target 一次前向验证固定 n = npend + nk 行（行语义同 greedy 版） */
+    int vt[9];
+    int vn = 0;
+    if (npend == 1) vt[vn++] = seq[len - 1];
+    for (int i = 0; i < nk; i++) vt[vn++] = cand[i];
+    int pos0 = len - npend;
+    if ((long)pos0 + vn > sgl_cuda_ctx(target) ||
+        (long)d_base + len + nk > sgl_cuda_ctx(draft))
+      break;
+    int accepted = 0, reject_tok = -1;
+    if (sgl_cuda_forward_seg_rows(target, vt, vn, pos0, t_base, vl) != 0) goto done;
+    t_kv = pos0 + vn;
+    for (int i = 0; i < nk; i++) {
+      int ridx = npend - 1 + i;
+      const float *prow = ridx >= 0 ? vl + (size_t)ridx * V : tl;
+      sgl_dist_transform(prow, V, sp, seq + n_prompt, len - n_prompt + i, pd);
+      const float *q = qd + (size_t)i * V;
+      int x = cand[i];
+      double u = sgl_rng_uniform(rng);
+      if (pd[x] > 0.0f && u * (double)q[x] < (double)pd[x]) {
+        accepted++;
+        n_accepts++;
+      } else {
+        for (int j = 0; j < V; j++) {
+          float d = pd[j] - q[j];
+          pd[j] = d > 0.0f ? d : 0.0f;
+        }
+        reject_tok = draw_from_dist(pd, V, rng);
+        break;
+      }
+    }
+
+    /* 3) 写入确认 token（拒绝采纳重采样；全接受 bonus=末位 p̃ 直抽） */
+    for (int i = 0; i < accepted; i++) seq[len + i] = cand[i];
+    int n_new = accepted;
+    if (reject_tok >= 0) {
+      seq[len + accepted] = reject_tok;
+      n_new++;
+    } else if (produced + nk < max_new) {
+      sgl_dist_transform(vl + (size_t)(vn - 1) * V, V, sp,
+                         seq + n_prompt, len - n_prompt + nk, pd);
+      seq[len + nk] = draw_from_dist(pd, V, rng);
+      n_new++;
+    }
+    len += n_new;
+    produced += n_new;
+
+    /* 4) 流水线推进：末 token 成为下轮 pending（同 greedy 版） */
+    t_kv = len - 1;
+    d_kv = len - 1;
+
+    /* 5) eos：截去其后的本轮 token（同 greedy 版） */
+    if (eos_id >= 0) {
+      for (int i = len - n_new; i < len; i++) {
+        if (seq[i] == eos_id) {
+          int new_len = i + 1;
+          produced -= (len - new_len);
+          len = new_len;
+          produced = max_new;
+          t_kv = len;
+          d_kv = len;
+          break;
+        }
+      }
+    }
+  }
+
+  *out_ids = (int *)sgl_xmalloc(sizeof(int) * (size_t)(len - n_prompt));
+  if (!*out_ids) goto done;
+  memcpy(*out_ids, seq + n_prompt, sizeof(int) * (size_t)(len - n_prompt));
+  if (out_drafted) *out_drafted = n_drafted;
+  if (out_accepted) *out_accepted = n_accepts;
+  rc = len - n_prompt;
+
+done:
+  sgl_xfree(seq); sgl_xfree(dl); sgl_xfree(tl); sgl_xfree(vl);
+  sgl_xfree(qd); sgl_xfree(pd);
   return rc;
 }

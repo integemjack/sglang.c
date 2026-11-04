@@ -2,7 +2,23 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
-## [Unreleased] — MLX 后端 T1 + T2（fp16 + 量化）（2026-11-04）
+## [Unreleased] — 投机解码补上 temperature>0 的修正采样（2026-11-04）
+
+- **`sgl_spec_sample_generate`（CPU）/ `sgl_cuda_spec_sample_generate`（GPU）**：
+  标准拒绝采样（`u<min(1,p̃/q̃)`，拒绝处从 norm((p̃−q̃)₊) 重采样），产出分布
+  与直接从 target 同参数采样**数学上严格相等**；temperature/top_k/top_p/min_p/
+  penalty 全支持（penalty 的 history 与非投机路径一致）。temperature<=0 自动
+  退化为 greedy 版（逐 token 相同）。
+- `sampling.c`：分布构建抽出单一来源 `sgl_dist_transform` + `sgl_rng_uniform`；
+  `sgl_sample_ex` 行为逐位不变（回归 beam/dp/http/scheduler/tinyllama 全绿）。
+- 验收（test_spec / cuda_test 新增断言，非目测）：T=0 退化逐 token == greedy；
+  draft==target 接受率 100%（CPU 20/20、GPU 20/20）；一号 token 分布对拍
+  TV ≤ 自校准噪声底（CPU N=96：0.385≤0.737；GPU N=400：0.292≤0.508——弱草稿
+  13.3%/0% 接受下分布仍精确）。详见 [docs/NOTES_t7.md](docs/NOTES_t7.md) 补记 II。
+- cuda_test 新增 `SGL_CUDA_ONLY_SPEC=1`：显存被桌面挤占时全量会在 gemm-bench 后
+  pure-decode 段 AV（HEAD 亦然，与本改动无关），该开关可单独验证 spec 段。
+
+### MLX 后端 T1 + T2（fp16 + 量化）（2026-11-04）
 
 Apple Silicon 上多一个后端：`-DSGL_MLX=ON` 产出 `mlx_test` / `mlx_q4_test` / `mlx_http`，
 llama 系模型走 Metal。详见 [docs/PROGRESS_mlx.md](docs/PROGRESS_mlx.md)、

@@ -198,7 +198,7 @@ CPU 调度器现在有优先级：`sgl_sched_submit_prio`（HTTP body 的 `prior
 
 | 项 | 上游 | C 版 |
 | --- | --- | --- |
-| spec | EAGLE/EAGLE3、Medusa、MTP(nextn)、ngram、DP draft、DFlash、Uno…（67 文件） | **模型自带 MTP 头（GPU，W=4，3.16 token/步、1.5×，只对单请求贪心）** + 朴素 draft/verify（K≤8，接受率 13%–39%，仍是净减速） |
+| spec | EAGLE/EAGLE3、Medusa、MTP(nextn)、ngram、DP draft、DFlash、Uno…（67 文件） | **模型自带 MTP 头（GPU，W=4，3.16 token/步、1.5×，只对单请求贪心）** + 朴素 draft/verify（K≤8；greedy 与 temperature>0 修正采样两版，后者的产出分布与非投机采样数学上严格相等；无蒸馏 draft 仍是净减速） |
 | 图/编译 | torch.compile + piecewise/full CUDA graph + TBO | decode CUDA graph（B=1..conc）；无 prefill graph、无编译层 |
 | batch-invariant ops | 有（`batch_invariant_ops/`） | 无需专门实现：每行前向独立、chunked prefill 逐 token 叠 KV。`tests/batch_invariant.py` 4/4 实测（单独 vs 并发 vs 重发 vs 分块混批，逐字节一致） |
 | 量化算子 | fp8 per-tensor/token/block、W4A16、Marlin、DeepGEMM、MXFP4/NVFP4、块状 int8（111 文件） | W8A16（CPU）、W8A8 dp4a/IMMA（CUDA）、int8 KV（CPU）、fp16 权重、NVFP4 风格 int4（默认关）、K4V3 KV（默认关）；**落盘格式已支持 AWQ/GPTQ(v1+v2)/CT-W4A16/MXFP4/GGUF/FP8，以及 marlin ABI（4bit 与 8bit）** |

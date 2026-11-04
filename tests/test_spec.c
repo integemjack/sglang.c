@@ -1,7 +1,8 @@
-﻿/* test_spec.c — speculative decoding 验证
+/* test_spec.c — speculative decoding 验证
  * 不变量：greedy 下 spec（draft+target）输出与 target-only greedy 逐 token 全等
  * （每步最终 token 都是 target argmax 的数学保证）。另报接受率与加速。 */
 #define _CRT_SECURE_NO_WARNINGS
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,7 @@
 #include "sgl/alloc.h"
 #include "sgl/bpe.h"
 #include "sgl/llama.h"
+#include "sgl/sampling.h"
 #include "sgl/spec.h"
 
 static int FAILURES = 0;
@@ -122,8 +124,107 @@ int main(int argc, char **argv) {
     printf("[spec==greedy ✓] %.60s\n", txt);
     sgl_xfree(txt);
   }
+  sgl_xfree(spec_ids);
 
-  sgl_xfree(spec_ids); sgl_xfree(ref_ids); sgl_xfree(pids);
+  /* ================= temperature>0：修正采样（speculative sampling） =================
+   *
+   * A. T=0 退化：sgl_spec_sample_generate(temperature=0) 必须与 greedy 版
+   *    逐 token 相同（走同一条退化路径）。
+   * B. draft==target：q̃==p̃ ⇒ 接受率必须 ≈100%（数学不变量）。
+   * C. 分布对拍：弱草稿（截层）+ T=1，一号 token 的经验分布 vs 直接从 target
+   *    抽样的经验分布，TV 距离 ≤ 自校准噪声底（两组独立同分布抽样之间的
+   *    TV）× 1.6 + 0.02。若修正数学有错（拒绝重采样不按 (p̃-q̃)₊），分布
+   *    会系统性偏离，远超噪声底。SGL_TEST_SPEC_TV_N 可调样本数（默认 96）。
+   */
+  {
+    /* A. T=0 退化与 greedy 版逐 token 相同 */
+    sgl_sampling_params sp0;
+    memset(&sp0, 0, sizeof(sp0));
+    sp0.temperature = 0.0f;
+    uint64_t rng0 = 12345;
+    int *s0 = NULL;
+    int n0 = sgl_spec_sample_generate(target, draft, pids, np, max_new, 4, eos,
+                                      &sp0, &rng0, &s0, NULL, NULL);
+    CHECK(n0 == nr, "A: T=0 长度 n0=%d ref=%d", n0, nr);
+    int same0 = n0 == nr;
+    for (int i = 0; same0 && i < nr && i < n0; i++)
+      if (s0[i] != ref_ids[i]) {
+        printf("  A 首个分歧 @%d: %d vs %d\n", i, s0[i], ref_ids[i]);
+        same0 = 0;
+      }
+    CHECK(same0, "A: T=0 退化输出 != greedy spec");
+    if (same0) printf("[A T=0 退化 == greedy spec ✓]\n");
+    sgl_xfree(s0);
+
+    /* B. draft==target：接受率 ≈100%（CPU 批量/单 token 前向数值逐位一致，
+     *    理论上严格 100%；留 99% 余量容 fp 实现） */
+    sgl_sampling_params sp1;
+    memset(&sp1, 0, sizeof(sp1));
+    sp1.temperature = 1.0f;
+    uint64_t rng1 = 777;
+    int *s1 = NULL, dr1 = 0, ac1 = 0;
+    int n1 = sgl_spec_sample_generate(target, target, pids, np, max_new, 4, eos,
+                                      &sp1, &rng1, &s1, &dr1, &ac1);
+    CHECK(n1 > 0, "B: draft==target n=%d", n1);
+    CHECK(dr1 > 0 && ac1 >= dr1 * 99 / 100,
+          "B: 接受率应 ≈100%%（%d/%d）", ac1, dr1);
+    if (n1 > 0) {
+      int ok1 = 1;
+      for (int i = 0; i < n1; i++)
+        if (s1[i] < 0 || s1[i] >= target->vocab) ok1 = 0;
+      CHECK(ok1, "B: 输出含非法 token id");
+    }
+    printf("[B draft==target 接受率 %.1f%% (%d/%d) ✓]\n",
+           dr1 ? 100.0 * ac1 / dr1 : 0.0, ac1, dr1);
+    sgl_xfree(s1);
+
+    /* C. 分布对拍（TV 自校准）*/
+    {
+      int VN = target->vocab;
+      int *ha = (int *)calloc((size_t)VN, sizeof(int)); /* 直接抽样 A */
+      int *hb = (int *)calloc((size_t)VN, sizeof(int)); /* 直接抽样 B（噪声底） */
+      int *hs = (int *)calloc((size_t)VN, sizeof(int)); /* spec 采样 */
+      int n_tv = getenv("SGL_TEST_SPEC_TV_N") ? atoi(getenv("SGL_TEST_SPEC_TV_N")) : 96;
+      if (n_tv < 32) n_tv = 32;
+      /* 直接抽样：一次 prefill 后反复抽（一号 token 分布 == p̃）*/
+      float *lg = (float *)sgl_xmalloc(sizeof(float) * (size_t)VN);
+      int *pg = (int *)sgl_xmalloc(sizeof(int) * (size_t)(np + 4));
+      CHECK(sgl_llama_pages_alloc(target, pg, np + 4) == 0, "C: pages");
+      CHECK(sgl_llama_forward(target, pids, np, 0, pg, lg) == 0, "C: prefill");
+      for (int s = 0; s < n_tv; s++) {
+        uint64_t ra = 0xABCD0000u + (uint64_t)s, rb = 0x12340000u + (uint64_t)s;
+        ha[sgl_sample_ex(lg, VN, &sp1, &ra, NULL, 0, NULL)]++;
+        hb[sgl_sample_ex(lg, VN, &sp1, &rb, NULL, 0, NULL)]++;
+      }
+      sgl_llama_pages_unref(target, pg, np + 4);
+      sgl_xfree(pg);
+      sgl_xfree(lg);
+      /* spec：每 seed 一轮（max_new=1 → 一号 token）*/
+      for (int s = 0; s < n_tv; s++) {
+        uint64_t rs = 0x5EED0000u + (uint64_t)s;
+        int *so = NULL;
+        int no = sgl_spec_sample_generate(target, draft, pids, np, 1, 4, eos,
+                                          &sp1, &rs, &so, NULL, NULL);
+        if (no > 0) hs[so[0]]++;
+        else CHECK(0, "C: spec run %d 失败", s);
+        sgl_xfree(so);
+      }
+      double tv_ab = 0, tv_sa = 0;
+      for (int i = 0; i < VN; i++) {
+        tv_ab += fabs((double)ha[i] - hb[i]);
+        tv_sa += fabs((double)ha[i] - hs[i]);
+      }
+      tv_ab /= 2.0 * n_tv;
+      tv_sa /= 2.0 * n_tv;
+      double lim = 1.6 * tv_ab + 0.02;
+      printf("[C 分布对拍] N=%d TV(spec,plain)=%.3f ≤ 1.6×TV(plainA,plainB)+0.02=%.3f %s\n",
+             n_tv, tv_sa, lim, tv_sa <= lim ? "✓" : "✗");
+      CHECK(tv_sa <= lim, "C: TV(spec,plain)=%.3f 超噪声底 %.3f", tv_sa, lim);
+      free(ha); free(hb); free(hs);
+    }
+  }
+
+  sgl_xfree(ref_ids); sgl_xfree(pids);
   sgl_tokenizer_free(tok);
   sgl_llama_free(draft);
   sgl_llama_free(target);
