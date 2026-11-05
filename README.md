@@ -130,7 +130,7 @@ cannot run on the GPU-less runners, so they are smoke-checked instead (binaries 
 architecture and dependencies, `sglc` usage exit code) and left to be run on real hardware. All nine targets
 are green as of v0.4.0 (run
 [40456249230](https://github.com/integemjack/sglang.c/actions/runs/40456249230));
-v0.5.0 is verified on real hardware (Windows x64 CPU + CUDA stacks, see
+v0.5.1 is verified on real hardware (Windows x64 CPU + CUDA stacks, see
 [CHANGELOG](CHANGELOG.md)); its CI matrix run was triggered by the release push —
 check [Actions](https://github.com/integemjack/sglang.c/actions) for status.
 

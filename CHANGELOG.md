@@ -2,6 +2,21 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [v0.5.1] · 第四轮差距复核：对齐上游 2026-11-05（802 提交）（2026-11-05）
+
+本版无代码变更（文档 + 版本号），发版触发全平台打包 CI。
+
+- 对照仓库 fast-forward 到 `169c88be`（sgl-project/sglang，2026-11-05）。上游 10-25..11-05
+  共 **802 提交**（262 Fix / 183 Perf / 105 Feat / 79 Refactor / 70 CI），srt 下 1021 文件
+  改动（+86k/−28k 行）：python 1,687,095 行、srt 869,115、models 259（EntryClass 233）、
+  mem_cache 229、HTTP 静态路由 79（装饰器 87）。上游主线：DeepSeek-V4/V4.1（Engram /
+  MegaAttention / DSpark）、diffusion 子系统、mem_cache +41 文件、Kimi-K3.1 等 6+ 新模型。
+- **docs/GAP_vs_upstream.md 第四轮**：两头全部重数；G20/G21/G22a/b、conformance 套件、
+  hf_ref_check 从「缺」挪到「已补」；GPU KV 语义一节改写为「G20 后剩的尾巴」；
+  推进顺序重排（ds41 收尾 → TP/NCCL → 并发去顶 → Linux A/B）。
+- 本仓侧基线：src+include+apps 77 文件 36,453 行、ctest 51、CPU/加速侧各 ≈46 个实现端点
+  （501 表 33+31）。
+
 ## [v0.5.0] · CI 修复：五处根因，9 目标全绿（2026-11-05）
 
 CI 自 10-28 起全红（发版后首次完整盯完才发现），五层根因逐个修掉：
