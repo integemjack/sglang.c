@@ -2,6 +2,36 @@
 
 本项目所有重要变更。里程碑详情见 [ROADMAP.md](ROADMAP.md)；性能快照见 [docs/BENCH.md](docs/BENCH.md)。
 
+## [Unreleased] · ds41 真权重 NaN 根因修复：转换器 affine4 打包不是 MLX 语义（2026-11-05）
+
+DeepSeek-V4.1-Flash 真权重（IQ2_XXS 249GB + Engram 110GB + IQ1_M 118GB，iMac）在 MLX 后端
+自 11-01 起 NaN：40 层残差流爆炸 → f16 inf → NaN，生成全 0。
+
+**定位链（全部实证，非推测）**：
+1. 逐层 trace：L12 h=inf；L13 起 NaN。L1+ 每层 MoE 输出恒 ~8694，而 L0 正常（7.65）。
+2. 探针拆分（DS41_MOEDBG）：路由专家健康（0.10），**共享专家 sh=8694**，sh_g/sh_u 双双
+   顶死 clamp=10。
+3. 同一 y2 输入：y2@gate_inp^T=1.8 但 y2@gate_shexp^T=28.18（应 ~2）—— 65σ 不可能事件。
+4. python 裁决（y2 落盘 + mlx 复算）：与 C++ 完全一致，权重所蕴含的就是 28。
+5. 权重统计对比：转换后 shexp rms=0.047、mean=+0.028（DC！），而 GGUF 原版 Q5_K
+   反量化 rms=0.019、mean=+0.000001 —— 转换器注入了 2.4× 膨胀 + 直流。
+6. **根因**：`ds41_conv.cpp` 自写 affine4 打包与 MLX 原生语义不符——逐 u32 相同率 0%，
+   MLX scales 可为负（拟合式）而我们是 min/max；两者不是同一格式。
+
+**修复**：`tools/dsv41_ref/conv3_dsv41.py` —— Q5_K 反量化用独立验证过的实现，
+打包一律 `mx.quantize` 原生；写后自校验（blk.1 shexp mean/rms/max 与 GGUF 原版
+对齐到量化噪声级）。补充 `add_token_map.py`（GGUF KV 里的 engram_token_map 老转换器
+会额外写入，v3 补齐）与引擎侧 `hc_*_fn` 1 维→[24, hc·D] 重排。
+
+**验证（iMac，M1 16GB）**：40 层 × 8 步全程无 NaN、exit 0、token 多样
+（69242 101111 95301 …）；共享专家输出 8694 → 0.30，与路由专家同量级。
+已知未修：Engram 查表路径仍退化（需对照 engram.py 哈希语义），`SGL_NOENG=1` 仍必需。
+
+新增：`src/mlx_ds41_model.cpp`（真权重前向 + 调试探针 DS41_MAXL/DS41_MOEDBG/DS41_HCDBG
++y2 落盘）、`src/mlx_ds41.cpp`（mini 金标准对拍 1.2e-7）、`include/sgl/ds41.h`、
+`src/ds41_iq_tables.h`、`tests/mlx_ds41_test.c`、`tools/dsv41_ref/` 全套
+（官方参考 model.py/engram.py/kernel.py、转换器三代、forensics 链、调试脚本）。
+
 ## [v0.5.1] · 第四轮差距复核：对齐上游 2026-11-05（802 提交）（2026-11-05）
 
 本版无代码变更（文档 + 版本号），发版触发全平台打包 CI。
